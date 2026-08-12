@@ -74,11 +74,13 @@ import contextlib
 import json
 import logging
 import math
+import os
 import signal
 import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Deque, Iterable, Sequence
 
 import aiohttp
@@ -91,7 +93,14 @@ except ImportError:  # pragma: no cover - older websockets
 from websockets.exceptions import ConnectionClosed
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BookParams
+from py_clob_client.clob_types import (
+    ApiCreds,
+    BookParams,
+    OrderArgs,
+    OrderType,
+    PartialCreateOrderOptions,
+)
+from py_clob_client.order_builder.constants import BUY
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -135,6 +144,13 @@ SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
 #: Polymarket prices live on a 1c grid; probabilities are clamped inside this
 #: band before any Phi^-1 call so the inverse CDF cannot blow up.
 PROB_EPS = 0.01
+
+#: Signature schemes accepted by the CLOB. 0 = the private key itself holds the
+#: funds; 1/2 = a Polymarket proxy wallet holds them and `funder` must name it.
+SIG_TYPE_EOA = 0
+SIG_TYPE_EMAIL_PROXY = 1
+SIG_TYPE_BROWSER_PROXY = 2
+PROXY_SIG_TYPES = (SIG_TYPE_EMAIL_PROXY, SIG_TYPE_BROWSER_PROXY)
 
 #: Rolling short-dated BTC series on Gamma. Window-open epoch is embedded in
 #: the slug, which lets us address the live market directly instead of paging.
@@ -428,6 +444,7 @@ class TrackedMarket:
     twap_lookback: float
     tick_size: float
     accepting_orders: bool
+    neg_risk: bool = False
     books: Deque["BookSnapshot"] = field(default_factory=lambda: deque(maxlen=64))
     last_signal: dict[str, float] = field(default_factory=dict)
 
@@ -435,9 +452,33 @@ class TrackedMarket:
         return self.window_close - (now if now is not None else time.time())
 
     def effective_tau(self, now: float | None = None) -> float:
-        """Time-to-expiry with the TWAP variance haircut applied (seconds)."""
-        tau = self.seconds_remaining(now)
-        return max(tau - (2.0 * self.twap_lookback / 3.0), 1.0)
+        """Effective time-to-expiry, defined so that z_shift = d / (sigma*sqrt(tau_eff)).
+
+        The contract settles on the mean price over the final L seconds, so the
+        haircut is piecewise in how much of that averaging window is still in
+        the future:
+
+        * ``tau >= L`` - the whole window is ahead. Var[mean] = sigma^2*(tau - 2L/3),
+          and a spot move of d shifts the expected mean by the full d.
+          => tau_eff = tau - 2L/3
+
+        * ``tau < L``  - part of the window has already been realized and is
+          locked in. Only the remaining stub is random:
+          Var[mean] = sigma^2 * tau^3/(3L^2)  (Monte-Carlo verified), while a
+          spot move of d now shifts the expected mean by only d*(tau/L).
+          The L cancels between numerator and denominator:
+          => tau_eff = tau/3
+
+        The two branches agree at tau == L (both give L/3), so the curve is
+        continuous. Getting this wrong matters: naively extending the first
+        branch below tau == L drives the haircut negative, and clamping that to
+        a floor pins fair value at ~1.0 in the closing seconds of every window.
+        """
+        tau = max(self.seconds_remaining(now), 1e-3)
+        lookback = self.twap_lookback
+        if lookback <= 0.0 or tau >= lookback:
+            return max(tau - (2.0 * lookback / 3.0), 1e-3)
+        return tau / 3.0
 
     def is_live(self, now: float | None = None) -> bool:
         now = now if now is not None else time.time()
@@ -623,6 +664,9 @@ class MarketDiscovery:
             twap_lookback=twap,
             tick_size=float(market.get("orderPriceMinTickSize") or 0.01),
             accepting_orders=bool(market.get("acceptingOrders", True)),
+            # Carried so orders can be signed without an extra round-trip to
+            # resolve neg_risk / tick size at execution time.
+            neg_risk=bool(market.get("negRisk", False)),
         )
 
 
@@ -681,6 +725,430 @@ class BookFeed:
 
 
 # --------------------------------------------------------------------------- #
+# Execution
+# --------------------------------------------------------------------------- #
+
+
+def load_dotenv(path: str | Path = ".env") -> None:
+    """Populate os.environ from a .env file without clobbering real env vars.
+
+    python-dotenv arrives as a py-clob-client dependency, but this falls back to
+    a minimal parser so a missing optional package can never be the reason a
+    live trading bot silently starts up unauthenticated.
+    """
+    try:
+        from dotenv import load_dotenv as _load  # type: ignore[import-not-found]
+
+        _load(path, override=False)
+        return
+    except ImportError:
+        pass
+
+    env_path = Path(path)
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        value = value.strip().strip("'\"")
+        os.environ.setdefault(key, value)
+
+
+@dataclass(slots=True)
+class Credentials:
+    """Polymarket auth material, sourced from the environment."""
+
+    private_key: str | None = None
+    api_key: str | None = None
+    api_secret: str | None = None
+    api_passphrase: str | None = None
+    signature_type: int = SIG_TYPE_EOA
+    funder: str | None = None
+
+    @classmethod
+    def from_env(cls) -> "Credentials":
+        raw_sig = os.getenv("POLYMARKET_SIGNATURE_TYPE", "").strip()
+        try:
+            sig_type = int(raw_sig) if raw_sig else SIG_TYPE_EOA
+        except ValueError:
+            log.warning("POLYMARKET_SIGNATURE_TYPE=%r is not an int; using 0 (EOA)", raw_sig)
+            sig_type = SIG_TYPE_EOA
+
+        return cls(
+            private_key=_env("POLYMARKET_PK"),
+            api_key=_env("POLYMARKET_API_KEY"),
+            api_secret=_env("POLYMARKET_SECRET"),
+            api_passphrase=_env("POLYMARKET_PASSPHRASE"),
+            signature_type=sig_type,
+            funder=_env("POLYMARKET_FUNDER"),
+        )
+
+    @property
+    def has_l1(self) -> bool:
+        """Level 1 auth: a private key, enough to sign orders and derive creds."""
+        return bool(self.private_key)
+
+    @property
+    def has_l2(self) -> bool:
+        """Level 2 auth: the full API credential triplet for posting orders."""
+        return bool(self.api_key and self.api_secret and self.api_passphrase)
+
+    def problems(self) -> list[str]:
+        """Blocking issues that make live trading impossible or unsafe."""
+        issues: list[str] = []
+        if not self.has_l1:
+            issues.append("POLYMARKET_PK is not set (required to sign orders)")
+        if self.signature_type in PROXY_SIG_TYPES and not self.funder:
+            issues.append(
+                f"POLYMARKET_SIGNATURE_TYPE={self.signature_type} is a proxy-wallet scheme, "
+                "so POLYMARKET_FUNDER must name the address holding the USDC"
+            )
+        if self.signature_type not in (SIG_TYPE_EOA, *PROXY_SIG_TYPES):
+            issues.append(f"unsupported POLYMARKET_SIGNATURE_TYPE={self.signature_type}")
+        return issues
+
+    def describe(self) -> str:
+        return (
+            f"sig_type={self.signature_type} "
+            f"pk={'set' if self.has_l1 else 'MISSING'} "
+            f"api_creds={'set' if self.has_l2 else 'will-derive'} "
+            f"funder={self.funder or '-'}"
+        )
+
+
+def _env(name: str) -> str | None:
+    value = os.getenv(name)
+    value = value.strip() if value else ""
+    return value or None
+
+
+@dataclass(slots=True)
+class ExecutionSettings:
+    dry_run: bool = True
+    order_size: float = 20.0  # contracts per leg
+    max_notional: float = 50.0  # hard USDC cap per leg
+    slippage_ticks: int = 0  # ticks of price improvement offered to cross
+    max_consecutive_errors: int = 3  # trip the breaker after this many
+
+
+@dataclass(slots=True)
+class ExecutionResult:
+    ok: bool
+    dry_run: bool
+    token_id: str
+    side: str
+    price: float
+    size: float
+    filled_size: float = 0.0
+    order_id: str | None = None
+    status: str = ""
+    error: str | None = None
+
+    @property
+    def notional(self) -> float:
+        return self.filled_size * self.price
+
+    def summary(self) -> str:
+        tag = "SIMULATED" if self.dry_run else "LIVE"
+        if not self.ok:
+            return f"{tag} {self.side} REJECTED: {self.error}"
+        return (
+            f"{tag} {self.side} {self.filled_size:g} @ {self.price:.3f} "
+            f"(${self.notional:.2f}) status={self.status or 'filled'}"
+            + (f" id={self.order_id}" if self.order_id else "")
+        )
+
+
+def quantize_price(price: float, tick: float, side: str) -> float:
+    """Snap a price onto the venue's tick grid.
+
+    The CLOB rejects off-grid prices outright. Buys round *up* and sells round
+    *down* so float error can never push a marketable order to the passive side
+    of the spread, where it would rest instead of crossing.
+    """
+    tick = tick if tick > 0 else 0.01
+    steps = price / tick
+    # Nudge before rounding so a price already on-grid is not bumped a full
+    # tick by binary representation error (0.45/0.01 == 44.99999...).
+    rounded = math.ceil(steps - 1e-9) if side == BUY else math.floor(steps + 1e-9)
+    snapped = rounded * tick
+    decimals = max(0, round(-math.log10(tick)))
+    return min(max(round(snapped, decimals), tick), round(1.0 - tick, decimals))
+
+
+class Executor:
+    """Order submission with a dry-run mode, a position gate and a breaker.
+
+    Every venue call is dispatched through `asyncio.to_thread`: py-clob-client
+    is synchronous, and a blocking HTTP round-trip on the event loop would stall
+    the Binance tape - which is the one thing this whole system cannot afford.
+    """
+
+    def __init__(self, settings: ExecutionSettings, creds: Credentials | None = None) -> None:
+        self._settings = settings
+        self._creds = creds or Credentials()
+        self._client: ClobClient | None = None
+        #: Market slugs currently holding an open trade. The position gate.
+        self.active_positions: set[str] = set()
+        self._gate_lock = asyncio.Lock()
+        self._consecutive_errors = 0
+        self._halted = False
+        self.orders_sent = 0
+        self.orders_filled = 0
+        self.expected_pnl = 0.0
+
+    # -- lifecycle ---------------------------------------------------------- #
+
+    @property
+    def dry_run(self) -> bool:
+        return self._settings.dry_run
+
+    @property
+    def halted(self) -> bool:
+        return self._halted
+
+    @property
+    def order_size(self) -> float:
+        return self._settings.order_size
+
+    @property
+    def slippage_ticks(self) -> int:
+        return self._settings.slippage_ticks
+
+    async def connect(self) -> bool:
+        """Build the signing client. Returns False if live trading can't start."""
+        if self._settings.dry_run:
+            log.info("DRY RUN: simulating fills, no orders will be submitted")
+            # Still surface credential problems so the first live run is not the
+            # first time anyone discovers the wallet is misconfigured.
+            for issue in self._creds.problems():
+                log.info("  (live mode would fail: %s)", issue)
+            return True
+
+        problems = self._creds.problems()
+        if problems:
+            for issue in problems:
+                log.error("Cannot trade live: %s", issue)
+            return False
+
+        try:
+            self._client = await asyncio.to_thread(self._build_client)
+        except Exception as exc:  # noqa: BLE001 - auth failures must be loud
+            log.error("Failed to initialize signing CLOB client: %s", exc)
+            return False
+
+        log.warning(
+            "LIVE TRADING ARMED | %s | size=%g max_notional=$%.2f",
+            self._creds.describe(),
+            self._settings.order_size,
+            self._settings.max_notional,
+        )
+        return True
+
+    def _build_client(self) -> ClobClient:
+        """Synchronous client construction; runs in a worker thread."""
+        kwargs: dict = {
+            "chain_id": POLYGON_CHAIN_ID,
+            "key": self._creds.private_key,
+            "signature_type": self._creds.signature_type,
+        }
+        if self._creds.funder:
+            kwargs["funder"] = self._creds.funder
+
+        client = ClobClient(CLOB_HOST, **kwargs)
+
+        if self._creds.has_l2:
+            creds = ApiCreds(
+                api_key=self._creds.api_key,
+                api_secret=self._creds.api_secret,
+                api_passphrase=self._creds.api_passphrase,
+            )
+            log.info("Using API credentials from the environment")
+        else:
+            # L1 (the private key) is enough to mint or recover the L2 triplet.
+            creds = client.create_or_derive_api_creds()
+            log.info("Derived API credentials from POLYMARKET_PK (api_key=%s)", creds.api_key)
+
+        client.set_api_creds(creds)
+        return client
+
+    # -- position gate ------------------------------------------------------ #
+
+    async def acquire_market(self, market_key: str) -> bool:
+        """Claim the one trade slot for a market window. False if already held.
+
+        This is what stops a single spike - which stays above threshold for many
+        consecutive 10 Hz ticks - from being bet on over and over.
+        """
+        async with self._gate_lock:
+            if market_key in self.active_positions:
+                return False
+            self.active_positions.add(market_key)
+            return True
+
+    def release_market(self, market_key: str) -> None:
+        """Free the slot: the order never filled, so no position was taken.
+
+        Unconditional and idempotent, so unlike `acquire_market` it needs no
+        mutual exclusion - which lets the synchronous market-retirement path
+        call it directly.
+        """
+        self.active_positions.discard(market_key)
+
+    def holds(self, market_key: str) -> bool:
+        return market_key in self.active_positions
+
+    # -- execution ---------------------------------------------------------- #
+
+    async def execute_arb_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        order_type: str = "FOK",
+        *,
+        tick_size: float = 0.01,
+        neg_risk: bool = False,
+    ) -> ExecutionResult:
+        """Submit one order leg. Never raises; always returns a result.
+
+        FOK is the right default here: the edge is a stale resting ask, so the
+        order must either take that ask in full right now or die. A partial or
+        resting remainder converts a latency arb into an unhedged directional
+        bet at exactly the moment the book is repricing against us.
+        """
+        price = quantize_price(price, tick_size, side)
+        notional = price * size
+
+        result = ExecutionResult(
+            ok=False,
+            dry_run=self._settings.dry_run,
+            token_id=token_id,
+            side=side,
+            price=price,
+            size=size,
+        )
+
+        if self._halted:
+            result.error = "execution halted by circuit breaker"
+            return result
+
+        if notional > self._settings.max_notional:
+            result.error = (
+                f"notional ${notional:.2f} exceeds --max-notional "
+                f"${self._settings.max_notional:.2f}"
+            )
+            log.error("Order blocked: %s", result.error)
+            return result
+
+        if self._settings.dry_run:
+            # Assume the resting liquidity we just measured is still there. The
+            # caller only reaches this path when our limit crosses the ask.
+            result.ok = True
+            result.filled_size = size
+            result.status = "simulated-fill"
+            self.orders_sent += 1
+            self.orders_filled += 1
+            return result
+
+        if self._client is None:
+            result.error = "signing client not initialized"
+            return result
+
+        try:
+            self.orders_sent += 1
+            response = await asyncio.to_thread(
+                self._submit, token_id, side, price, size, order_type, tick_size, neg_risk
+            )
+        except Exception as exc:  # noqa: BLE001 - venue errors are routine
+            self._note_error()
+            result.error = f"{type(exc).__name__}: {exc}"
+            log.error("Order submission failed (%s %s @ %.3f): %s", side, token_id[:12], price, exc)
+            return result
+
+        self._consecutive_errors = 0
+        result.order_id = str(response.get("orderID") or response.get("orderId") or "") or None
+        result.status = str(response.get("status") or "")
+        # `success` is the transport-level ack; `status` carries the fill state.
+        accepted = bool(response.get("success", True)) and result.status.lower() not in {
+            "unmatched",
+            "delayed",
+            "cancelled",
+            "canceled",
+        }
+
+        if accepted:
+            result.ok = True
+            result.filled_size = _filled_size(response, size)
+            self.orders_filled += 1
+        else:
+            result.error = str(response.get("errorMsg") or response.get("error") or result.status)
+
+        return result
+
+    def _submit(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        order_type: str,
+        tick_size: float,
+        neg_risk: bool,
+    ) -> dict:
+        """Blocking sign-and-post. Runs in a worker thread."""
+        assert self._client is not None
+        options = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=neg_risk)
+        signed = self._client.create_order(
+            OrderArgs(token_id=token_id, price=price, size=size, side=side),
+            options,
+        )
+        resolved = getattr(OrderType, order_type.upper(), OrderType.FOK)
+        response = self._client.post_order(signed, resolved)
+        return response if isinstance(response, dict) else {"success": True, "raw": str(response)}
+
+    def _note_error(self) -> None:
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= self._settings.max_consecutive_errors and not self._halted:
+            self._halted = True
+            log.error(
+                "CIRCUIT BREAKER TRIPPED after %d consecutive execution errors; "
+                "no further orders will be submitted this session",
+                self._consecutive_errors,
+            )
+
+    # -- accounting --------------------------------------------------------- #
+
+    def record_expected_pnl(self, amount: float) -> None:
+        self.expected_pnl += amount
+
+    def stats(self) -> str:
+        return (
+            f"orders={self.orders_filled}/{self.orders_sent} "
+            f"exp_pnl=${self.expected_pnl:+.2f} "
+            f"open={len(self.active_positions)}"
+            + (" HALTED" if self._halted else "")
+        )
+
+
+def _filled_size(response: dict, requested: float) -> float:
+    """Best-effort fill size across the shapes the CLOB returns."""
+    for key in ("sizeMatched", "size_matched", "matchedAmount", "makingAmount"):
+        if key in response:
+            try:
+                return float(response[key])
+            except (TypeError, ValueError):
+                continue
+    return requested
+
+
+# --------------------------------------------------------------------------- #
 # Signal engine
 # --------------------------------------------------------------------------- #
 
@@ -698,15 +1166,27 @@ class Config:
     min_seconds_left: float = 8.0  # ignore markets about to settle
     enforce_ask_ceiling: bool = True
     ws_endpoints: tuple[str, ...] = BINANCE_WS_FALLBACKS
+    execution: ExecutionSettings = field(default_factory=ExecutionSettings)
 
 
 class SignalEngine:
-    def __init__(self, buffer: PriceBuffer, books: BookFeed, cfg: Config) -> None:
+    def __init__(
+        self,
+        buffer: PriceBuffer,
+        books: BookFeed,
+        cfg: Config,
+        executor: Executor | None = None,
+    ) -> None:
         self._buffer = buffer
         self._books = books
         self._cfg = cfg
+        self._executor = executor
         self._markets: dict[str, TrackedMarket] = {}
         self._last_forced_fetch = 0.0
+
+    @property
+    def executor(self) -> Executor | None:
+        return self._executor
 
     # -- market registry ---------------------------------------------------- #
 
@@ -735,6 +1215,10 @@ class SignalEngine:
         for slug in [s for s, m in self._markets.items() if not m.is_live(now)]:
             log.info("Retiring %s (window closed)", slug)
             self._markets.pop(slug, None)
+            # The window is over, so any position in it has settled. Free the
+            # gate slot or the set would grow without bound across a long run.
+            if self._executor is not None:
+                self._executor.release_market(slug)
 
     def active_markets(self) -> list[TrackedMarket]:
         now = time.time()
@@ -799,9 +1283,9 @@ class SignalEngine:
 
         sigma = self._buffer.sigma_per_sqrt_second()
         for market in self.active_markets():
-            self._evaluate_market(market, move, sigma)
+            await self._evaluate_market(market, move, sigma)
 
-    def _evaluate_market(self, market: TrackedMarket, move: Move, sigma: float) -> None:
+    async def _evaluate_market(self, market: TrackedMarket, move: Move, sigma: float) -> None:
         if len(market.books) < 2:
             return
 
@@ -833,18 +1317,18 @@ class SignalEngine:
         p_fair_up = clamp_prob(norm_cdf(z1))
         p_fair_down = 1.0 - p_fair_up
 
-        self._check_cross_book(market, current, move)
+        await self._check_cross_book(market, current, move)
 
         if move.delta_log > 0:
-            self._check_leg(
+            await self._check_leg(
                 market, move, sigma, "UP", "YES", current.up_ask, p_fair_up, p0, tau_eff
             )
         else:
-            self._check_leg(
+            await self._check_leg(
                 market, move, sigma, "DOWN", "NO", current.down_ask, p_fair_down, 1.0 - p0, tau_eff
             )
 
-    def _check_leg(
+    async def _check_leg(
         self,
         market: TrackedMarket,
         move: Move,
@@ -904,7 +1388,63 @@ class SignalEngine:
         )
         market.last_signal[side] = time.monotonic()
 
-    def _check_cross_book(self, market: TrackedMarket, book: BookSnapshot, move: Move) -> None:
+        token_id = market.up_token if side == "UP" else market.down_token
+        await self._execute_model_signal(market, token_id, token_label, ask, p_fair)
+
+    async def _execute_model_signal(
+        self,
+        market: TrackedMarket,
+        token_id: str,
+        token_label: str,
+        ask: float,
+        p_fair: float,
+    ) -> None:
+        """Single-leg take of a stale ask, behind the position gate."""
+        executor = self._executor
+        if executor is None:
+            return
+
+        if not await executor.acquire_market(market.slug):
+            log.info(
+                "Position gate: already holding %s, skipping duplicate %s entry",
+                market.slug,
+                token_label,
+            )
+            return
+
+        size = executor.order_size
+        limit = ask + executor.slippage_ticks * market.tick_size
+
+        result = await executor.execute_arb_order(
+            token_id,
+            BUY,
+            limit,
+            size,
+            order_type="FOK",
+            tick_size=market.tick_size,
+            neg_risk=market.neg_risk,
+        )
+
+        if result.ok:
+            expected = result.filled_size * (p_fair - result.price)
+            executor.record_expected_pnl(expected)
+            log.warning(
+                " execution   : %s | %s | expected PnL %+.2f USDC (fair %.3f - paid %.3f)",
+                market.slug,
+                result.summary(),
+                expected,
+                p_fair,
+                result.price,
+            )
+        else:
+            # Nothing was taken, so the slot must go back or this market is
+            # locked out for the rest of its window on a single failed attempt.
+            executor.release_market(market.slug)
+            log.warning(" execution   : %s | %s", market.slug, result.summary())
+
+    async def _check_cross_book(
+        self, market: TrackedMarket, book: BookSnapshot, move: Move
+    ) -> None:
         """Model-free leg: both asks summing below $1 is a locked profit."""
         if book.up_ask is None or book.down_ask is None:
             return
@@ -932,6 +1472,82 @@ class SignalEngine:
             move.elapsed,
         )
         market.last_signal["CROSS"] = time.monotonic()
+        await self._execute_cross_book(market, book.up_ask, book.down_ask)
+
+    async def _execute_cross_book(
+        self, market: TrackedMarket, up_ask: float, down_ask: float
+    ) -> None:
+        """Lift both legs at once. The pair is the position, not either leg."""
+        executor = self._executor
+        if executor is None:
+            return
+
+        if not await executor.acquire_market(market.slug):
+            log.info(
+                "Position gate: already holding %s, skipping duplicate cross-book entry",
+                market.slug,
+            )
+            return
+
+        size = executor.order_size
+        slip = executor.slippage_ticks * market.tick_size
+
+        # Both legs are submitted concurrently. Sequencing them would leave the
+        # second leg exposed to the book moving between the two round-trips,
+        # which is precisely the risk this trade is supposed to avoid.
+        up_result, down_result = await asyncio.gather(
+            executor.execute_arb_order(
+                market.up_token,
+                BUY,
+                up_ask + slip,
+                size,
+                order_type="FOK",
+                tick_size=market.tick_size,
+                neg_risk=market.neg_risk,
+            ),
+            executor.execute_arb_order(
+                market.down_token,
+                BUY,
+                down_ask + slip,
+                size,
+                order_type="FOK",
+                tick_size=market.tick_size,
+                neg_risk=market.neg_risk,
+            ),
+        )
+
+        log.warning(" execution   : %s | UP  leg | %s", market.slug, up_result.summary())
+        log.warning(" execution   : %s | DOWN leg | %s", market.slug, down_result.summary())
+
+        if up_result.ok and down_result.ok:
+            paired = min(up_result.filled_size, down_result.filled_size)
+            locked = paired * (1.0 - (up_result.price + down_result.price))
+            executor.record_expected_pnl(locked)
+            log.warning(
+                " execution   : %s | PAIRED %g x (1.000 - %.3f) = %+.2f USDC locked",
+                market.slug,
+                paired,
+                up_result.price + down_result.price,
+                locked,
+            )
+        elif up_result.ok or down_result.ok:
+            # One leg filled and the other did not. The hedge is gone and what
+            # is left is a naked directional bet - the single worst outcome of
+            # this trade, so it is surfaced at ERROR rather than buried.
+            filled = up_result if up_result.ok else down_result
+            missed = down_result if up_result.ok else up_result
+            log.error(
+                "LEG RISK on %s: %s leg filled (%g @ %.3f) but %s leg did not (%s). "
+                "Position is now UNHEDGED and directional - manual intervention required.",
+                market.slug,
+                "UP" if up_result.ok else "DOWN",
+                filled.filled_size,
+                filled.price,
+                "DOWN" if up_result.ok else "UP",
+                missed.error,
+            )
+        else:
+            executor.release_market(market.slug)
 
     def _cooldown_ok(self, market: TrackedMarket, key: str) -> bool:
         last = market.last_signal.get(key, 0.0)
@@ -953,9 +1569,14 @@ class Scanner:
         self._buffer = PriceBuffer()
         self._stream = BinanceTradeStream(self._buffer, cfg.ws_endpoints)
         self._books = BookFeed()
-        self._engine = SignalEngine(self._buffer, self._books, cfg)
+        self._executor = Executor(cfg.execution, Credentials.from_env())
+        self._engine = SignalEngine(self._buffer, self._books, cfg, self._executor)
 
     async def run(self) -> None:
+        if not await self._executor.connect():
+            log.error("Execution layer failed to arm; aborting before any market data is consumed")
+            return
+
         async with aiohttp.ClientSession(
             headers={"User-Agent": "btc-polymarket-arb/1.0"}
         ) as session:
@@ -1016,13 +1637,16 @@ class Scanner:
             markets = self._engine.active_markets()
             move = self._buffer.largest_move(self._cfg.spike_lookback)
             log.info(
-                "hb | spot=%s | sigma=%.2f bps/s | ws=%s lat=%.0fms ticks=%d | 3s move=%+.1f bps | markets=%s",
+                "hb | %s | spot=%s | sigma=%.2f bps/s | ws=%s lat=%.0fms ticks=%d "
+                "| 3s move=%+.1f bps | %s | markets=%s",
+                "DRY" if self._executor.dry_run else "LIVE",
                 f"{last.price:,.2f}" if last else "n/a",
                 self._buffer.sigma_per_sqrt_second() * 10_000.0,
                 "up" if self._stream.connected else "DOWN",
                 self._buffer.latency_ms,
                 self._buffer.tick_count,
                 move.bps if move else 0.0,
+                self._executor.stats(),
                 ", ".join(
                     f"{m.horizon}:{_quote(m)}@{m.seconds_remaining():.0f}s" for m in markets
                 )
@@ -1075,6 +1699,34 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             "Binance returns HTTP 451 in your region)."
         ),
     )
+    execution = parser.add_argument_group("execution")
+    execution.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "ARM LIVE TRADING and submit real orders with real funds. "
+            "Omitted by default: the bot runs dry, simulating fills and logging "
+            "expected PnL without ever touching the order API."
+        ),
+    )
+    execution.add_argument(
+        "--size", type=float, default=20.0, help="contracts per order leg"
+    )
+    execution.add_argument(
+        "--max-notional",
+        type=float,
+        default=50.0,
+        help="hard USDC cap per leg; orders above this are blocked outright",
+    )
+    execution.add_argument(
+        "--slippage-ticks",
+        type=int,
+        default=0,
+        help="extra ticks above the ask offered to guarantee the cross",
+    )
+    execution.add_argument(
+        "--env-file", default=".env", help="path to the dotenv file holding credentials"
+    )
     parser.add_argument("--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -1084,6 +1736,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         datefmt="%H:%M:%S",
     )
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    load_dotenv(args.env_file)
 
     return Config(
         spike_bps=args.spike_bps,
@@ -1094,6 +1747,12 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         book_poll_interval=args.book_interval,
         enforce_ask_ceiling=not args.no_ask_ceiling,
         ws_endpoints=tuple(args.ws_url) if args.ws_url else BINANCE_WS_FALLBACKS,
+        execution=ExecutionSettings(
+            dry_run=not args.live,
+            order_size=args.size,
+            max_notional=args.max_notional,
+            slippage_ticks=args.slippage_ticks,
+        ),
     )
 
 
@@ -1122,7 +1781,8 @@ async def amain(cfg: Config) -> None:
 def main() -> None:
     cfg = parse_args()
     log.info(
-        "Starting scanner | spike>%.0fbps/%.0fs | ask gate %.2f | min edge %.3f",
+        "Starting scanner | %s | spike>%gbps/%gs | ask gate %.2f | min edge %.3f",
+        "DRY RUN" if cfg.execution.dry_run else "*** LIVE TRADING ***",
         cfg.spike_bps,
         cfg.spike_lookback,
         cfg.max_yes_ask,
