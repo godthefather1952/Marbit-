@@ -1,3 +1,7 @@
 aiohttp>=3.9
 websockets>=13.0
 py-clob-client>=0.34
+
+# Performance (optional but strongly recommended)
+orjson>=3.9          # ~2.7x faster tick deserialization than stdlib json
+coincurve>=18.0      # libsecp256k1 backend for eth-keys: order signing 7.4ms -> 0.8ms

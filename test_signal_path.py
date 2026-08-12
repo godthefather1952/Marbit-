@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
+import json as _stdlib_json
 import logging
 import math
 import time
@@ -23,6 +23,8 @@ import time
 from websockets.asyncio.server import serve
 
 from btc_polymarket_arb import (
+    JSON_BACKEND,
+    LatencyProfiler,
     BinanceTradeStream,
     BookFeed,
     Config,
@@ -37,7 +39,9 @@ from btc_polymarket_arb import (
     SignalEngine,
     TrackedMarket,
     _scale_usdc,
+    _tick_str,
     _usdc,
+    json_loads,
     is_retryable,
     quantize_price,
     retry_async,
@@ -91,7 +95,7 @@ async def mock_binance(ws, spike_bps: float) -> None:
 
 
 def _trade(price: float) -> str:
-    return json.dumps(
+    return _stdlib_json.dumps(
         {
             "e": "trade",
             "s": "BTCUSDT",
@@ -906,6 +910,378 @@ async def test_reconnect_resilience() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Latency optimizations
+# --------------------------------------------------------------------------- #
+
+
+async def test_fast_json() -> None:
+    print("\n--- fast serialization ---")
+
+    check(
+        "a JSON backend is selected at import",
+        JSON_BACKEND in {"orjson", "ujson", "json"},
+        f"backend={JSON_BACKEND}",
+    )
+
+    payload = {"e": "trade", "s": "BTCUSDT", "p": "63630.89", "q": "0.01", "T": 1786517666170}
+    encoded = _stdlib_json.dumps(payload)
+    check("fast backend parses a str frame", json_loads(encoded)["p"] == "63630.89")
+    check("fast backend parses a bytes frame", json_loads(encoded.encode())["p"] == "63630.89")
+
+    # Every backend must raise a ValueError subclass so callers can catch one type.
+    for bad in ("{not json", "", "[1,"):
+        try:
+            json_loads(bad)
+            raised = False
+        except ValueError:
+            raised = True
+        except Exception:
+            raised = False
+        if not raised:
+            break
+    check("malformed input raises ValueError on every backend", raised)
+
+    # The tape must survive a corrupt frame rather than dying on it.
+    buf = PriceBuffer()
+    stream = BinanceTradeStream(buf, ["ws://unused"])
+    for junk in (b"{bad", b"{}", b'{"p":"not-a-number"}', b'{"p":"0"}', b"[]"):
+        stream._on_message(junk)
+    check("corrupt frames are dropped, not fatal", buf.tick_count == 0)
+    stream._on_message(encoded.encode())
+    check("a valid frame after corruption is still ingested", buf.tick_count == 1)
+
+    tick = buf.last()
+    check(
+        "each tick carries a perf_counter_ns T1 stamp",
+        tick is not None and tick.perf_ns > 0,
+        f"perf_ns={tick.perf_ns if tick else 0}",
+    )
+
+    # Deserialization must be fast enough to be irrelevant next to the network.
+    n = 20_000
+    t0 = time.perf_counter_ns()
+    for _ in range(n):
+        json_loads(encoded)
+    per_op_us = (time.perf_counter_ns() - t0) / n / 1e3
+    check(
+        "tick deserialization stays well under 10us",
+        per_op_us < 10.0,
+        f"{per_op_us:.2f} us/op with {JSON_BACKEND}",
+    )
+
+
+async def test_order_caching() -> None:
+    print("\n--- order payload pre-caching ---")
+
+    ex = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk()))
+    m1 = make_market("btc-updown-5m-AAA")
+    m2 = make_market("btc-updown-5m-BBB")
+    m2.up_token, m2.down_token = "UP_B", "DOWN_B"
+    m2.tick_size, m2.neg_risk = 0.001, True
+
+    t1 = ex.template_for(m1.up_token, m1)
+    t2 = ex.template_for(m2.up_token, m2)
+
+    check(
+        "each market gets its own template",
+        t1 is not t2 and t1.token_id != t2.token_id,
+        f"{t1.token_id} vs {t2.token_id}",
+    )
+    check(
+        "a second market does not pollute the first's tick size",
+        t1.tick_size == 0.01 and t2.tick_size == 0.001,
+        f"{t1.tick_size} / {t2.tick_size}",
+    )
+    check(
+        "neg_risk stays per-market",
+        t1.neg_risk is False and t2.neg_risk is True,
+    )
+    check(
+        "options carry the venue-formatted tick string",
+        t1.options.tick_size == "0.01" and t2.options.tick_size == "0.001",
+        f"{t1.options.tick_size!r} / {t2.options.tick_size!r}",
+    )
+    check(
+        "templates are cached, not rebuilt per call",
+        ex.template_for(m1.up_token, m1) is t1,
+    )
+
+    # A tightened tick from the live book must rebuild the options object,
+    # or the signed order would be quantized onto a grid the venue rejects.
+    m1.tick_size = 0.001
+    t1b = ex.template_for(m1.up_token, m1)
+    check(
+        "a tightened live tick rebuilds the cached options",
+        t1b is t1 and t1.options.tick_size == "0.001",
+        f"tick_size now {t1.options.tick_size!r}",
+    )
+
+    check("templates are held for both markets", ex.templates_cached == 2)
+    ex.forget_market(m1.slug, (m1.up_token, m1.down_token))
+    check(
+        "retiring a market evicts only its own templates",
+        ex.templates_cached == 1 and ex.template_for(m2.up_token, m2) is t2,
+        f"{ex.templates_cached} cached",
+    )
+
+    # Templates key off token id, so a stale one can never be served to a market
+    # that minted fresh tokens.
+    m3 = make_market("btc-updown-5m-CCC")
+    m3.up_token = "UP_C"
+    check(
+        "a new market's token gets a fresh template",
+        ex.template_for(m3.up_token, m3).token_id == "UP_C",
+    )
+
+    check("tick strings render for the venue", _tick_str(0.01) == "0.01" and _tick_str(0.1) == "0.1")
+
+
+async def test_latency_profiler() -> None:
+    print("\n--- latency profiling ---")
+
+    prof = LatencyProfiler(capacity=8)
+    check("an empty profiler reports no data", prof.percentiles() is None)
+    check("empty summary is safe to log", prof.summary() == "lat=n/a")
+
+    base = 1_000_000_000
+    for i in range(5):
+        prof.record(base, base + 2_000_000, base + 52_000_000)  # 2ms signal, 50ms order
+    pct = prof.percentiles()
+    check(
+        "T1->T2 and T2->T3 are reported in milliseconds",
+        pct is not None and abs(pct[0] - 2.0) < 1e-6 and abs(pct[1] - 50.0) < 1e-6,
+        f"signal {pct[0]:.2f}ms order {pct[1]:.2f}ms p95 {pct[2]:.2f}ms",
+    )
+    last = prof.last()
+    check(
+        "last() returns signal, order and total",
+        last is not None and abs(last[2] - 52.0) < 1e-6,
+        f"total {last[2]:.2f}ms",
+    )
+    check("incomplete samples are ignored", (prof.record(0, 1, 2), prof.count)[1] == 5)
+
+    for _ in range(20):
+        prof.record(base, base + 1_000_000, base + 10_000_000)
+    check(
+        "the sample window is bounded but the total keeps counting",
+        len(prof._samples) == 8 and prof.count == 25,
+        f"window={len(prof._samples)} total={prof.count}",
+    )
+
+    # Recording must be cheap enough to sit on the hot path.
+    n = 50_000
+    t0 = time.perf_counter_ns()
+    for _ in range(n):
+        prof.record(base, base + 1, base + 2)
+    per_op_ns = (time.perf_counter_ns() - t0) / n
+    check(
+        "recording a sample costs well under 1us",
+        per_op_ns < 1000,
+        f"{per_op_ns:.0f} ns/op",
+    )
+
+    # End to end: a dry-run order populates the profiler through the real path.
+    logs, ex, _ = await drive(up_ask=0.45, down_ask=0.56)
+    check(
+        "a completed order records a latency sample",
+        ex.latency.count == 1,
+        ex.latency.summary(),
+    )
+    sample = ex.latency.last()
+    check(
+        "T1 comes from the tick, so T1->T2 spans real signal work",
+        sample is not None and sample[0] > 0.0,
+        f"T1->T2 {sample[0]:.2f} ms",
+    )
+
+
+async def test_eval_loop_benchmark() -> None:
+    print("\n--- evaluation loop benchmark ---")
+
+    buf = PriceBuffer()
+    now_price = 100_000.0
+    for i in range(2_000):  # ~10s of a busy tape
+        buf.add(now_price * (1.0 + (i % 7) * 1e-5), 0)
+
+    n = 2_000
+    t0 = time.perf_counter_ns()
+    for _ in range(n):
+        buf.largest_move(3.0)
+    move_us = (time.perf_counter_ns() - t0) / n / 1e3
+    # Compare against the naive per-tick logarithm the scan replaced.
+    ticks = list(buf._ticks)
+    latest = ticks[-1]
+    t0 = time.perf_counter_ns()
+    for _ in range(n):
+        best = None
+        for tk in ticks:
+            if tk is latest:
+                continue
+            d = math.log(latest.price / tk.price)
+            if best is None or abs(d) > abs(best):
+                best = d
+    naive_us = (time.perf_counter_ns() - t0) / n / 1e3
+    check(
+        "spike detection over a full buffer stays under 1ms",
+        move_us < 1000.0,
+        f"{move_us:.1f} us/pass over {len(buf._ticks)} ticks "
+        f"({naive_us:.1f} us for the per-tick log() it replaced, "
+        f"{naive_us / move_us:.1f}x)",
+    )
+
+    # Bars are sampled on a 1s grid, so a burst of ticks in one instant yields a
+    # single bar. Populate a realistic 300-bar history directly.
+    mono = time.monotonic()
+    buf._bars.clear()
+    buf._bars.extend((mono - 300 + i, now_price * (1.0 + (i % 11) * 2e-5)) for i in range(300))
+    t0 = time.perf_counter_ns()
+    for _ in range(2_000):
+        buf.sigma_per_sqrt_second()
+    sigma_us = (time.perf_counter_ns() - t0) / 2_000 / 1e3
+    check(
+        "vol estimation allocates no intermediate list and stays under 1ms",
+        sigma_us < 1000.0,
+        f"{sigma_us:.1f} us/pass over {len(buf._bars)} bars",
+    )
+
+    check(
+        "tick buffer is bounded by maxlen",
+        buf._ticks.maxlen is not None and buf._bars.maxlen is not None,
+        f"ticks maxlen={buf._ticks.maxlen} bars maxlen={buf._bars.maxlen}",
+    )
+
+    # The optimized min/max scan must agree with the naive per-tick search.
+    naive = PriceBuffer()
+    for price in (100.0, 101.0, 99.0, 100.5):
+        naive.add(price, 0)
+    mv = naive.largest_move(3.0)
+    expected = math.log(100.5 / 99.0)  # largest excursion is from the 99.0 low
+    check(
+        "the min/max scan finds the same move as a per-tick search",
+        mv is not None and abs(mv.delta_log - expected) < 1e-12,
+        f"got {mv.bps:+.2f} bps, expected {expected * 1e4:+.2f} bps",
+    )
+
+    # The O(1) tripwire: the tape must wake the evaluator on a qualifying tick
+    # rather than the evaluator waiting out its polling period.
+    trip = PriceBuffer()
+    fired = {"n": 0}
+    trip.set_wake(lambda: fired.__setitem__("n", fired["n"] + 1))
+    for _ in range(20):
+        trip.add(100_000.0, 0)
+    trip.arm_trigger(12.0)  # 12 bps
+    trip.add(100_000.0 * 1.0005, 0)  # +5 bps, inside the threshold
+    check("a sub-threshold tick does not wake the evaluator", fired["n"] == 0)
+    trip.add(100_000.0 * 1.0020, 0)  # +20 bps, past it
+    check("a qualifying tick wakes the evaluator immediately", fired["n"] == 1)
+    trip.add(100_000.0 * 1.0030, 0)
+    check(
+        "the tripwire debounces until re-armed",
+        fired["n"] == 1,
+        "one wake per arm, not one per tick",
+    )
+    trip.arm_trigger(12.0)
+    trip.add(100_000.0 * 0.9950, 0)  # large move down
+    check("re-arming re-enables the tripwire in both directions", fired["n"] == 2)
+
+    # It must agree with the authoritative scan about what qualifies.
+    agree = PriceBuffer()
+    agree.set_wake(lambda: None)
+    for _ in range(10):
+        agree.add(100_000.0, 0)
+    agree.arm_trigger(12.0)
+    agree.add(100_000.0 * 1.0015, 0)
+    mv2 = agree.largest_move(3.0)
+    check(
+        "tripwire and largest_move agree on a qualifying move",
+        mv2 is not None and abs(mv2.bps) >= 12.0 and agree.wakes == 1,
+        f"{mv2.bps:+.1f} bps, wakes={agree.wakes}",
+    )
+
+    # An absurd threshold must not raise on the tick path.
+    safe = PriceBuffer()
+    for _ in range(5):
+        safe.add(100_000.0, 0)
+    safe.arm_trigger(1e9)
+    safe.add(200_000.0, 0)
+    check("an unreachable threshold arms without overflowing", safe.wakes == 0)
+
+    n2 = 100_000
+    armed = PriceBuffer()
+    armed.add(100_000.0, 0)
+    armed.arm_trigger(12.0)
+    t0 = time.perf_counter_ns()
+    for _ in range(n2):
+        armed.add(100_000.0, 0)
+    add_ns = (time.perf_counter_ns() - t0) / n2
+    # At Binance's ~200 trades/s peak, 5us/tick is 0.1% of a core - the tape
+    # must never be the bottleneck, but chasing below that buys nothing.
+    check(
+        "the per-tick ingest path stays cheap with the tripwire armed",
+        add_ns < 5000,
+        f"{add_ns:.0f} ns/tick = {add_ns * 200 / 1e7:.3f}% of a core at 200 ticks/s",
+    )
+
+    # Whole-evaluation timing against a stubbed book.
+    ex = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk()))
+    await ex.connect()
+    engine = SignalEngine(buf, StubBookFeed(0.45, 0.56), Config(spike_bps=1e9), ex)
+    engine.sync_markets([make_market()])
+    await engine.refresh_books()
+
+    t0 = time.perf_counter_ns()
+    for _ in range(500):
+        await engine.evaluate()
+    eval_us = (time.perf_counter_ns() - t0) / 500 / 1e3
+    check(
+        "a full evaluate() pass stays well inside the 10 Hz budget",
+        eval_us < 5_000.0,
+        f"{eval_us:.1f} us/pass (budget 100,000 us at 10 Hz)",
+    )
+
+    # The headline number: T1 -> T2 against a zero-latency book, i.e. the whole
+    # controllable pipeline (parse, buffer, spike scan, fair value, sizing, risk
+    # gates, payload construction) with the network removed. Anything above this
+    # in a live run is round-trip time, not our code.
+    samples: list[float] = []
+    for _ in range(10):
+        buf2 = PriceBuffer()
+        ex2 = Executor(
+            ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk())
+        )
+        await ex2.connect()
+        eng2 = SignalEngine(
+            buf2,
+            StubBookFeed(0.45, 0.56),
+            Config(
+                spike_bps=12.0, min_edge=0.03, enforce_ask_ceiling=False, signal_cooldown=0.0
+            ),
+            ex2,
+        )
+        eng2.sync_markets([make_market()])
+        for _ in range(60):
+            buf2.add(BASE, 0)
+        await eng2.refresh_books()  # snapshot that will serve as the anchor
+        await asyncio.sleep(0.02)
+        await eng2.refresh_books()
+        buf2.add(BASE, 0)  # flat tick after the anchor
+        await eng2.evaluate()  # arms the tripwire
+        buf2.add(BASE * 1.0025, 0, time.perf_counter_ns())  # the spike: T1
+        await eng2.evaluate()  # event-driven, no polling delay
+        last2 = ex2.latency.last()
+        if last2:
+            samples.append(last2[0])
+
+    median_ms = sorted(samples)[len(samples) // 2] if samples else 999.0
+    check(
+        "signal-to-payload (T1->T2) stays under 5ms with the network removed",
+        samples and median_ms < 5.0,
+        f"{median_ms:.3f} ms median over {len(samples)} spikes "
+        f"-- the rest of any live figure is round-trip time",
+    )
+
+
+# --------------------------------------------------------------------------- #
 
 
 async def main() -> None:
@@ -919,6 +1295,10 @@ async def main() -> None:
     await test_risk_breakers()
     await test_retry_backoff()
     await test_reconnect_resilience()
+    await test_fast_json()
+    await test_order_caching()
+    await test_latency_profiler()
+    await test_eval_loop_benchmark()
     print("=" * 68)
     total = len(PASSED) + len(FAILED)
     if FAILED:

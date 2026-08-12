@@ -71,7 +71,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import json
 import logging
 import math
 import os
@@ -140,6 +139,11 @@ SPIKE_LOOKBACK_SECONDS = 3.0
 VOL_HISTORY_SECONDS = 300.0
 VOL_EWMA_HALFLIFE_SECONDS = 120.0
 
+#: Hard ceilings on the rolling buffers. BTC trades peak around 200/s, so 10s of
+#: tape is ~2k ticks; 8k leaves headroom for a burst without ever reallocating.
+MAX_TICKS_BUFFERED = 8192
+MAX_VOL_BARS = 512
+
 #: Fallback BTC vol (annualized) used until enough 1s bars have accumulated.
 FALLBACK_ANNUAL_VOL = 0.45
 SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
@@ -163,6 +167,36 @@ SERIES = {
 }
 
 log = logging.getLogger("btc-arb")
+
+
+# --------------------------------------------------------------------------- #
+# Fast serialization
+# --------------------------------------------------------------------------- #
+#
+# orjson is ~2.7x faster than the stdlib on a Binance trade payload (0.9us vs
+# 2.5us) and accepts bytes directly, so the websocket frame never needs decoding
+# to str first. ujson is the fallback, stdlib json the last resort - the bot must
+# still start on a machine where neither wheel is installed.
+#
+# All three raise a ValueError subclass on malformed input, so callers catch
+# ValueError rather than a backend-specific type.
+
+try:  # pragma: no cover - import path depends on the host
+    import orjson as _fastjson
+
+    JSON_BACKEND = "orjson"
+    json_loads = _fastjson.loads
+except ImportError:  # pragma: no cover
+    try:
+        import ujson as _fastjson
+
+        JSON_BACKEND = "ujson"
+        json_loads = _fastjson.loads
+    except ImportError:
+        import json as _fastjson
+
+        JSON_BACKEND = "json"
+        json_loads = _fastjson.loads
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +305,67 @@ async def retry_async(
 
 
 # --------------------------------------------------------------------------- #
+# Latency profiling
+# --------------------------------------------------------------------------- #
+
+
+class LatencyProfiler:
+    """Microsecond-resolution timing across three hot-path checkpoints.
+
+        T1  Binance websocket frame received
+        T2  signal evaluated and order payload constructed
+        T3  order response received from the Polymarket CLOB
+
+    Recording is a tuple append into a bounded deque - a few hundred nanoseconds,
+    entirely off the critical measurement. `perf_counter_ns` is monotonic and
+    immune to wall-clock adjustments, which `time.time()` is not.
+    """
+
+    __slots__ = ("_samples", "_total")
+
+    def __init__(self, capacity: int = 256) -> None:
+        self._samples: Deque[tuple[int, int, int]] = deque(maxlen=capacity)
+        self._total = 0
+
+    def record(self, t1_ns: int, t2_ns: int, t3_ns: int) -> None:
+        if t1_ns and t2_ns and t3_ns:
+            self._samples.append((t1_ns, t2_ns, t3_ns))
+            self._total += 1
+
+    @property
+    def count(self) -> int:
+        return self._total
+
+    def last(self) -> tuple[float, float, float] | None:
+        """(signal_ms, order_ms, total_ms) for the most recent order."""
+        if not self._samples:
+            return None
+        t1, t2, t3 = self._samples[-1]
+        return (t2 - t1) / 1e6, (t3 - t2) / 1e6, (t3 - t1) / 1e6
+
+    def percentiles(self) -> tuple[float, float, float] | None:
+        """(median signal_ms, median order_ms, p95 total_ms) over the window."""
+        if not self._samples:
+            return None
+        signal = sorted((t2 - t1) / 1e6 for t1, t2, _ in self._samples)
+        order = sorted((t3 - t2) / 1e6 for _, t2, t3 in self._samples)
+        total = sorted((t3 - t1) / 1e6 for t1, _, t3 in self._samples)
+        mid = len(signal) // 2
+        p95 = total[min(len(total) - 1, int(len(total) * 0.95))]
+        return signal[mid], order[mid], p95
+
+    def summary(self) -> str:
+        pct = self.percentiles()
+        if pct is None:
+            return "lat=n/a"
+        signal_ms, order_ms, p95_ms = pct
+        return (
+            f"lat[n={self._total}] T1->T2 {signal_ms:.2f}ms "
+            f"T2->T3 {order_ms:.1f}ms p95 {p95_ms:.1f}ms"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Math helpers
 # --------------------------------------------------------------------------- #
 
@@ -299,6 +394,7 @@ class Tick:
     mono: float  # local monotonic receive time - used for all windowing
     price: float
     exch_ms: int  # Binance trade time, kept for latency diagnostics
+    perf_ns: int = 0  # T1: perf_counter_ns() at frame receipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +406,7 @@ class Move:
     to_price: float
     from_mono: float
     to_mono: float
+    t1_ns: int = 0  # perf_counter_ns of the tick that completed this move
 
     @property
     def bps(self) -> float:
@@ -339,23 +436,87 @@ class PriceBuffer:
         vol_halflife: float = VOL_EWMA_HALFLIFE_SECONDS,
     ) -> None:
         self._window = window
-        self._ticks: Deque[Tick] = deque()
+        # Fixed maxlen gives O(1) eviction and a hard memory ceiling with no
+        # reallocation as ticks arrive. Time-based pruning still runs for
+        # correctness (the window is 10 *seconds*, not 10k ticks); maxlen is the
+        # backstop that keeps a venue burst from growing the deque unboundedly.
+        self._ticks: Deque[Tick] = deque(maxlen=MAX_TICKS_BUFFERED)
         self._vol_window = vol_window
         self._vol_decay = 0.5 ** (1.0 / max(vol_halflife, 1.0))
-        self._bars: Deque[tuple[float, float]] = deque()  # (mono, price) 1s grid
+        self._bars: Deque[tuple[float, float]] = deque(
+            maxlen=MAX_VOL_BARS
+        )  # (mono, price) on a 1s grid
         self._last_bar_mono: float | None = None
         self._tick_count = 0
         self._latency_ms = 0.0
         self._warm_after = 0.0
         self.resets = 0
+        # O(1) spike tripwire: absolute price levels that, if crossed, mean a
+        # move past the threshold has occurred. Re-armed after each evaluation.
+        self._trigger_low = 0.0
+        self._trigger_high = math.inf
+        self._trigger_armed = False
+        self._on_trigger = None
+        self.wakes = 0
 
     # -- ingest ------------------------------------------------------------- #
 
-    def add(self, price: float, exch_ms: int) -> None:
+    def set_wake(self, callback) -> None:
+        """Register a zero-argument callback fired when the tripwire trips."""
+        self._on_trigger = callback
+
+    def arm_trigger(self, threshold_bps: float) -> None:
+        """Re-arm the tripwire from the current window's price extremes.
+
+        A move of `threshold_bps` from the window low upward lands at
+        `low * exp(+thr)`; from the window high downward at `high * exp(-thr)`.
+        Comparing each incoming tick against those two levels is two float
+        comparisons - no logarithm, no scan - so the tape can detect a candidate
+        spike per tick and wake the evaluator immediately instead of waiting out
+        the polling period.
+
+        This is only a hint: evaluate() still recomputes the real move, so a
+        false wake costs one wasted pass and a missed wake is bounded by the
+        periodic timer.
+        """
+        # Clamped: a threshold large enough to overflow exp() is one that can
+        # never trip anyway, and the tripwire must not raise on the tick path.
+        thr = min(max(threshold_bps, 0.0) / 10_000.0, 5.0)
+        lo = hi = 0.0
+        floor_mono = time.monotonic() - SPIKE_LOOKBACK_SECONDS
+        for tick in reversed(self._ticks):
+            if tick.mono < floor_mono:
+                break
+            if tick.price <= 0.0:
+                continue
+            if lo == 0.0 or tick.price < lo:
+                lo = tick.price
+            if tick.price > hi:
+                hi = tick.price
+
+        if lo <= 0.0:
+            self._trigger_low, self._trigger_high = 0.0, math.inf
+        else:
+            self._trigger_low = hi * math.exp(-thr)
+            self._trigger_high = lo * math.exp(thr)
+        self._trigger_armed = True
+
+    def add(self, price: float, exch_ms: int, perf_ns: int = 0) -> None:
         now = time.monotonic()
-        self._ticks.append(Tick(now, price, exch_ms))
+        self._ticks.append(Tick(now, price, exch_ms, perf_ns or time.perf_counter_ns()))
         self._tick_count += 1
-        self._latency_ms = max(0.0, time.time() * 1000.0 - exch_ms)
+        # Wall-clock feed latency is a heartbeat diagnostic, not a trading
+        # input, so it is sampled rather than measured on every tick - one
+        # fewer clock syscall per tick on the hottest path in the process.
+        if not self._tick_count & 0x3F:
+            self._latency_ms = max(0.0, time.time() * 1000.0 - exch_ms)
+
+        # Two comparisons on the per-tick path; everything else is amortized.
+        if self._trigger_armed and (price >= self._trigger_high or price <= self._trigger_low):
+            self._trigger_armed = False  # debounce until re-armed by evaluate()
+            self.wakes += 1
+            if self._on_trigger is not None:
+                self._on_trigger()
 
         cutoff = now - self._window
         while self._ticks and self._ticks[0].mono < cutoff:
@@ -431,17 +592,38 @@ class PriceBuffer:
 
         latest = self._ticks[-1]
         floor_mono = latest.mono - lookback
+
+        # The largest |log(latest/earlier)| over the window is attained at
+        # either the cheapest or the dearest earlier tick, so scanning for those
+        # two extremes and taking two logarithms is equivalent to taking a
+        # logarithm per tick - and at ~600 ticks per 3s window, evaluated at
+        # 10 Hz, that is the difference between 2 and 600 log() calls per pass.
+        lo_price = hi_price = 0.0
+        lo_tick = hi_tick = None
+        for tick in reversed(self._ticks):
+            if tick.mono < floor_mono:
+                break  # deque is time-ordered; everything earlier is older
+            if tick is latest or tick.price <= 0.0:
+                continue
+            if lo_tick is None or tick.price < lo_price:
+                lo_price, lo_tick = tick.price, tick
+            if hi_tick is None or tick.price > hi_price:
+                hi_price, hi_tick = tick.price, tick
+
         best: Move | None = None
-
-        for tick in self._ticks:
-            if tick.mono < floor_mono or tick is latest:
+        for candidate in (lo_tick, hi_tick):
+            if candidate is None:
                 continue
-            if tick.price <= 0.0:
-                continue
-            delta = math.log(latest.price / tick.price)
+            delta = math.log(latest.price / candidate.price)
             if best is None or abs(delta) > abs(best.delta_log):
-                best = Move(delta, tick.price, latest.price, tick.mono, latest.mono)
-
+                best = Move(
+                    delta,
+                    candidate.price,
+                    latest.price,
+                    candidate.mono,
+                    latest.mono,
+                    latest.perf_ns,
+                )
         return best
 
     def sigma_per_sqrt_second(self) -> float:
@@ -450,30 +632,34 @@ class PriceBuffer:
         if len(self._bars) < 30:
             return fallback
 
-        rets: list[tuple[float, float]] = []  # (dt, log return)
-        prev_mono, prev_price = self._bars[0]
-        for mono, price in list(self._bars)[1:]:
-            dt = mono - prev_mono
-            # Bars are sampled at 1s. A much larger gap means the tape stalled,
-            # so the bridging "return" spans unobserved time and would bias the
-            # vol estimate upward; skip it rather than annualize a hole.
-            if 0 < dt <= 5.0 and price > 0 and prev_price > 0:
-                rets.append((dt, math.log(price / prev_price)))
-            prev_mono, prev_price = mono, price
-
-        if len(rets) < 30:
-            return fallback
-
-        # Newest observation carries weight 1, decaying backwards.
+        # Walk the deque backwards, pairing each bar with its predecessor. The
+        # EWMA weights the newest observation most, which is exactly the order
+        # reverse iteration yields - so no intermediate list is materialised
+        # (the previous `list(self._bars)[1:]` copied the whole history on every
+        # call, and this runs on the evaluation path).
         num = 0.0
         den = 0.0
         weight = 1.0
-        for dt, ret in reversed(rets):
-            num += weight * (ret * ret) / dt  # normalize to per-second variance
-            den += weight
-            weight *= self._vol_decay
+        counted = 0
+        newer_mono: float | None = None
+        newer_price = 0.0
 
-        if den <= 0.0:
+        for mono, price in reversed(self._bars):
+            if newer_mono is not None:
+                dt = newer_mono - mono
+                # Bars are sampled at 1s. A much larger gap means the tape
+                # stalled, so the bridging "return" spans unobserved time and
+                # would bias the estimate upward; skip it rather than
+                # annualize a hole.
+                if 0 < dt <= 5.0 and price > 0 and newer_price > 0:
+                    ret = math.log(newer_price / price)
+                    num += weight * (ret * ret) / dt  # per-second variance
+                    den += weight
+                    weight *= self._vol_decay
+                    counted += 1
+            newer_mono, newer_price = mono, price
+
+        if counted < 30 or den <= 0.0:
             return fallback
         sigma = math.sqrt(num / den)
         # Guard against a dead tape collapsing sigma to ~0 and exploding the
@@ -561,14 +747,17 @@ class BinanceTradeStream:
         )
 
     def _on_message(self, raw: str | bytes) -> None:
+        # T1: stamped before parsing, so the checkpoint measures our own
+        # handling cost rather than excluding deserialization from it.
+        t1 = time.perf_counter_ns()
         try:
-            msg = json.loads(raw)
+            msg = json_loads(raw)
             price = float(msg["p"])
             exch_ms = int(msg.get("T") or msg.get("E") or 0)
         except (ValueError, KeyError, TypeError):
             return
         if price > 0.0:
-            self._buffer.add(price, exch_ms)
+            self._buffer.add(price, exch_ms, t1)
 
 
 # --------------------------------------------------------------------------- #
@@ -761,7 +950,12 @@ class MarketDiscovery:
                 # burn retries on a malformed query.
                 log.warning("Gamma returned HTTP %s (not retrying)", resp.status)
                 return []
-            data = await resp.json(content_type=None)
+            body = await resp.read()
+
+        try:
+            data = json_loads(body) if body else []
+        except ValueError as exc:
+            raise RetryableError(f"Gamma returned unparseable JSON: {exc}") from exc
 
         if isinstance(data, dict):
             data = data.get("data", [])
@@ -794,9 +988,9 @@ class MarketDiscovery:
             return None
 
         try:
-            outcomes = json.loads(market.get("outcomes") or "[]")
-            token_ids = json.loads(market.get("clobTokenIds") or "[]")
-        except json.JSONDecodeError:
+            outcomes = json_loads(market.get("outcomes") or "[]")
+            token_ids = json_loads(market.get("clobTokenIds") or "[]")
+        except ValueError:
             return None
         if len(outcomes) != 2 or len(token_ids) != 2:
             return None
@@ -937,6 +1131,44 @@ def _maybe_bool(value) -> bool | None:
 # --------------------------------------------------------------------------- #
 
 
+def tune_clob_http_client(
+    connect_timeout: float = 3.0,
+    read_timeout: float = 8.0,
+    pool_size: int = 20,
+) -> bool:
+    """Retune py-clob-client's shared httpx client for low-latency trading.
+
+    The library already keeps one module-level `httpx.Client(http2=True)`, so
+    connections pool and TLS is negotiated once. What it does not set is an
+    explicit timeout budget or pool sizing: the stock 5s blanket timeout is far
+    too long for an order that is only valuable for a few hundred milliseconds.
+
+    Best-effort - a library refactor that moves the client just means we keep
+    the stock behaviour, which still works.
+    """
+    try:
+        import httpx
+        from py_clob_client.http_helpers import helpers
+
+        old = getattr(helpers, "_http_client", None)
+        helpers._http_client = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
+            limits=httpx.Limits(
+                max_connections=pool_size,
+                max_keepalive_connections=pool_size,
+                keepalive_expiry=90.0,
+            ),
+        )
+        if old is not None:
+            with contextlib.suppress(Exception):
+                old.close()
+        return True
+    except Exception as exc:  # noqa: BLE001 - optimization only
+        log.debug("Could not retune the CLOB http client: %s", exc)
+        return False
+
+
 def load_dotenv(path: str | Path = ".env") -> None:
     """Populate os.environ from a .env file without clobbering real env vars.
 
@@ -977,6 +1209,13 @@ class Credentials:
     api_passphrase: str | None = None
     signature_type: int = SIG_TYPE_EOA
     funder: str | None = None
+    #: Private Polygon RPC (Alchemy / QuickNode / Chainstack). When set, balance
+    #: and allowance are read straight from chain instead of via the CLOB API,
+    #: which is both faster and independent of Polymarket's own uptime.
+    rpc_url: str | None = None
+    #: Websocket RPC. Plumbed through and validated for on-chain subscriptions;
+    #: the trading path is REST-only today and does not use it.
+    ws_rpc_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Credentials":
@@ -994,6 +1233,8 @@ class Credentials:
             api_passphrase=_env("POLYMARKET_PASSPHRASE"),
             signature_type=sig_type,
             funder=_env("POLYMARKET_FUNDER"),
+            rpc_url=_env("POLYGON_RPC_URL"),
+            ws_rpc_url=_env("POLYGON_WS_URL"),
         )
 
     @property
@@ -1033,6 +1274,63 @@ def _env(name: str) -> str | None:
     value = os.getenv(name)
     value = value.strip() if value else ""
     return value or None
+
+
+#: Bridged USDC (USDC.e) on Polygon - the collateral Polymarket settles in.
+USDC_POLYGON = "0x2791Bca1f2de4661eD88A30C99A7a9449Aa84174"
+#: ERC-20 selectors: balanceOf(address) and allowance(address,address).
+ERC20_BALANCE_OF = "0x70a08231"
+ERC20_ALLOWANCE = "0xdd62ed3e"
+USDC_DECIMALS = 1_000_000
+
+
+class PolygonRpc:
+    """Minimal JSON-RPC client for reading USDC balance and allowance.
+
+    Deliberately raw eth_calls over the shared aiohttp session rather than a
+    web3 dependency: two ERC-20 selectors need no ABI machinery, and reusing the
+    session keeps the pooled TLS connection to the provider warm. A private
+    endpoint (Alchemy / QuickNode / Chainstack) answers these in well under the
+    Polymarket API's own latency, and does not go down when Polymarket does.
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, url: str) -> None:
+        self._session = session
+        self._url = url
+        self._id = 0
+
+    async def _call(self, to: str, data: str) -> int:
+        self._id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._id,
+            "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+        }
+        async with self._session.post(
+            self._url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
+            if resp.status in RETRYABLE_STATUS:
+                raise RetryableError(f"RPC HTTP {resp.status}", status=resp.status)
+            body = await resp.read()
+        parsed = json_loads(body)
+        if "error" in parsed:
+            raise RuntimeError(f"RPC error: {parsed['error']}")
+        result = parsed.get("result") or "0x"
+        return int(result, 16) if result not in ("0x", "") else 0
+
+    @staticmethod
+    def _addr_arg(address: str) -> str:
+        return address.lower().removeprefix("0x").rjust(64, "0")
+
+    async def usdc_balance(self, owner: str) -> float:
+        raw = await self._call(USDC_POLYGON, ERC20_BALANCE_OF + self._addr_arg(owner))
+        return raw / USDC_DECIMALS
+
+    async def usdc_allowance(self, owner: str, spender: str) -> float:
+        data = ERC20_ALLOWANCE + self._addr_arg(owner) + self._addr_arg(spender)
+        raw = await self._call(USDC_POLYGON, data)
+        return raw / USDC_DECIMALS
 
 
 @dataclass(slots=True)
@@ -1124,6 +1422,51 @@ class RiskManager:
         self.peak_equity = self.equity()
         log.info("Paper bankroll seeded at $%.2f", self.bankroll)
 
+    async def refresh_balance_via_rpc(
+        self, rpc: "PolygonRpc", owner: str, neg_risk: bool = False
+    ) -> bool:
+        """Read balance and allowance straight from Polygon. Faster path."""
+        from py_clob_client.config import get_contract_config
+
+        exchange = get_contract_config(POLYGON_CHAIN_ID, neg_risk).exchange
+        try:
+            balance, allowance = await asyncio.gather(
+                retry_async(rpc.usdc_balance, owner, attempts=3, label="RPC balanceOf"),
+                retry_async(
+                    rpc.usdc_allowance, owner, exchange, attempts=3, label="RPC allowance"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - caller falls back to the CLOB
+            log.warning("Direct RPC balance read failed (%s); falling back to CLOB", exc)
+            return False
+
+        self.balance = balance
+        self.allowance = allowance
+        self.bankroll = balance
+        self.peak_equity = self.equity()
+        log.warning(
+            "Wallet via private RPC: USDC balance $%.2f | CTF Exchange allowance $%.2f",
+            balance,
+            allowance,
+        )
+        return self._validate_allowance()
+
+    def _validate_allowance(self) -> bool:
+        if self.allowance is not None and self.allowance <= 0.0:
+            log.error(
+                "USDC allowance to the CTF Exchange is zero - every order will be "
+                "rejected on-chain. Approve the exchange before trading."
+            )
+            return False
+        if self.allowance is not None and self.balance is not None and self.allowance < self.balance:
+            log.warning(
+                "Allowance ($%.2f) is below balance ($%.2f); only the approved "
+                "portion is actually usable.",
+                self.allowance,
+                self.balance,
+            )
+        return True
+
     async def refresh_balance(self, client: ClobClient, signature_type: int) -> bool:
         """Read on-chain USDC balance and CTF-Exchange allowance via the CLOB.
 
@@ -1163,20 +1506,7 @@ class RiskManager:
             f"${self.allowance:.2f}" if self.allowance is not None else "unknown",
         )
 
-        if self.allowance is not None and self.allowance <= 0.0:
-            log.error(
-                "USDC allowance to the CTF Exchange is zero - every order will be "
-                "rejected on-chain. Approve the exchange before trading."
-            )
-            return False
-        if self.allowance is not None and self.allowance < self.balance:
-            log.warning(
-                "Allowance ($%.2f) is below balance ($%.2f); only the approved "
-                "portion is actually usable.",
-                self.allowance,
-                self.balance,
-            )
-        return True
+        return self._validate_allowance()
 
     # -- sizing ------------------------------------------------------------- #
 
@@ -1466,6 +1796,12 @@ class ExecutionResult:
         )
 
 
+def _tick_str(tick: float) -> str:
+    """Render a tick size the way the CLOB expects it ("0.01", "0.001")."""
+    text = f"{tick:.6f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
 def quantize_price(price: float, tick: float, side: str) -> float:
     """Snap a price onto the venue's tick grid.
 
@@ -1481,6 +1817,28 @@ def quantize_price(price: float, tick: float, side: str) -> float:
     snapped = rounded * tick
     decimals = max(0, round(-math.log10(tick)))
     return min(max(round(snapped, decimals), tick), round(1.0 - tick, decimals))
+
+
+@dataclass(slots=True)
+class OrderTemplate:
+    """Everything about an order that is knowable before the signal fires.
+
+    Built once per token at market discovery so the hot path only fills in
+    price and size. Crucially this also warms py-clob-client's three internal
+    caches (tick size, neg-risk flag, fee rate), each of which is otherwise a
+    *blocking HTTP GET issued from inside create_order* on the first order for
+    a token. These markets roll every five minutes with brand-new token ids, so
+    without pre-warming every new window's first order - the one the whole
+    system exists to send quickly - pays all three round-trips before signing
+    even begins.
+    """
+
+    token_id: str
+    tick_size: float
+    neg_risk: bool
+    options: PartialCreateOrderOptions
+    fee_rate_bps: int = 0
+    warmed: bool = False
 
 
 class Executor:
@@ -1510,6 +1868,28 @@ class Executor:
         self.orders_sent = 0
         self.orders_filled = 0
         self.expected_pnl = 0.0
+        self.latency = LatencyProfiler()
+        #: token_id -> pre-built order template, populated off the hot path.
+        self._templates: dict[str, OrderTemplate] = {}
+        self._warm_failures = 0
+        self._rpc: PolygonRpc | None = None
+
+    def attach_session(self, session: aiohttp.ClientSession) -> None:
+        """Share the pooled HTTP session, enabling the private-RPC fast path."""
+        if self._creds.rpc_url:
+            self._rpc = PolygonRpc(session, self._creds.rpc_url)
+            log.info("Private Polygon RPC configured for balance reads")
+        if self._creds.ws_rpc_url:
+            log.info(
+                "POLYGON_WS_URL is set but unused: the trading path is REST-only. "
+                "It is plumbed through for on-chain subscriptions."
+            )
+
+    def _signer_address(self) -> str | None:
+        try:
+            return self._client.get_address() if self._client else None
+        except Exception:  # noqa: BLE001 - address is best-effort
+            return None
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -1574,7 +1954,14 @@ class Executor:
 
         # Fail closed: without a confirmed balance and allowance we cannot size
         # a position or know an order will be accepted, so we do not trade.
-        if not await self.risk.refresh_balance(self._client, self._creds.signature_type):
+        # Prefer the private RPC when configured, fall back to the CLOB.
+        ok = False
+        owner = self._creds.funder or self._signer_address()
+        if self._rpc is not None and owner:
+            ok = await self.risk.refresh_balance_via_rpc(self._rpc, owner)
+        if not ok:
+            ok = await self.risk.refresh_balance(self._client, self._creds.signature_type)
+        if not ok:
             log.error("Balance/allowance preflight failed; refusing to trade live")
             return False
 
@@ -1614,6 +2001,78 @@ class Executor:
         client.set_api_creds(creds)
         return client
 
+    # -- order pre-caching -------------------------------------------------- #
+
+    def template_for(self, token_id: str, market: "TrackedMarket") -> OrderTemplate:
+        """Cached template for a token, created on demand if discovery missed it."""
+        tmpl = self._templates.get(token_id)
+        if tmpl is None:
+            tmpl = OrderTemplate(
+                token_id=token_id,
+                tick_size=market.tick_size,
+                neg_risk=market.neg_risk,
+                options=PartialCreateOrderOptions(
+                    tick_size=_tick_str(market.tick_size), neg_risk=market.neg_risk
+                ),
+            )
+            self._templates[token_id] = tmpl
+        elif tmpl.tick_size != market.tick_size or tmpl.neg_risk != market.neg_risk:
+            # The live book tightened the tick (or neg-risk flipped); rebuild the
+            # options object so the signed order matches the venue's grid.
+            tmpl.tick_size = market.tick_size
+            tmpl.neg_risk = market.neg_risk
+            tmpl.options = PartialCreateOrderOptions(
+                tick_size=_tick_str(market.tick_size), neg_risk=market.neg_risk
+            )
+        return tmpl
+
+    async def prepare_market(self, market: "TrackedMarket") -> None:
+        """Warm order metadata for a newly discovered market, off the hot path.
+
+        Runs in a worker thread: the three getters below each issue a blocking
+        HTTP GET on a cold token, and paying that here costs nothing, whereas
+        paying it inside create_order costs the trade.
+        """
+        for token_id in (market.up_token, market.down_token):
+            tmpl = self.template_for(token_id, market)
+            if tmpl.warmed or self._client is None:
+                continue
+            try:
+                fee = await asyncio.to_thread(self._warm_token, token_id)
+            except Exception as exc:  # noqa: BLE001 - warming is best-effort
+                self._warm_failures += 1
+                log.warning(
+                    "Order metadata pre-warm failed for %s (the first order in "
+                    "this market will pay the round-trips): %s",
+                    market.slug,
+                    exc,
+                )
+                continue
+            tmpl.fee_rate_bps = fee
+            tmpl.warmed = True
+            log.debug("Pre-warmed order metadata for %s / %s", market.slug, token_id[:12])
+
+    def _warm_token(self, token_id: str) -> int:
+        """Populate py-clob-client's tick/neg-risk/fee caches. Blocking."""
+        assert self._client is not None
+        self._client.get_tick_size(token_id)
+        self._client.get_neg_risk(token_id)
+        return int(self._client.get_fee_rate_bps(token_id) or 0)
+
+    @property
+    def templates_cached(self) -> int:
+        return len(self._templates)
+
+    def forget_market(self, market_slug: str, tokens: Sequence[str]) -> None:
+        """Drop cached templates for a retired market.
+
+        Templates are keyed by token id, and every window mints new ones, so
+        without eviction the cache grows for the life of the process. Keying by
+        token also means one market's template can never be served to another.
+        """
+        for token_id in tokens:
+            self._templates.pop(token_id, None)
+
     # -- position gate ------------------------------------------------------ #
 
     async def acquire_market(self, market_key: str) -> bool:
@@ -1652,6 +2111,8 @@ class Executor:
         *,
         tick_size: float = 0.01,
         neg_risk: bool = False,
+        template: OrderTemplate | None = None,
+        t1_ns: int = 0,
     ) -> ExecutionResult:
         """Submit one order leg. Never raises; always returns a result.
 
@@ -1702,13 +2163,19 @@ class Executor:
             log.warning("Order blocked: %s", result.error)
             return result
 
+        # T2: the payload is fully determined here - price quantized, size
+        # resolved, funds reserved. Everything after this is signing and wire.
+        t2_ns = time.perf_counter_ns()
         try:
             outcome = await self._dispatch(
-                result, token_id, side, price, size, order_type, tick_size, neg_risk
+                result, token_id, side, price, size, order_type, tick_size, neg_risk, template
             )
         except BaseException:
             self.risk.release(notional)
             raise
+        finally:
+            # T3: response in hand (or failure known).
+            self.latency.record(t1_ns, t2_ns, time.perf_counter_ns())
 
         if outcome.ok:
             # Hand the reservation to the caller: it stays committed until
@@ -1729,6 +2196,7 @@ class Executor:
         order_type: str,
         tick_size: float,
         neg_risk: bool,
+        template: OrderTemplate | None = None,
     ) -> ExecutionResult:
         if self._settings.dry_run:
             # Assume the resting liquidity we just measured is still there. The
@@ -1749,7 +2217,15 @@ class Executor:
             # No retry wrapper here, by design: a POST that times out may still
             # have executed, and a duplicate fill is far worse than a miss.
             response = await asyncio.to_thread(
-                self._submit, token_id, side, price, size, order_type, tick_size, neg_risk
+                self._submit,
+                token_id,
+                side,
+                price,
+                size,
+                order_type,
+                tick_size,
+                neg_risk,
+                template,
             )
         except Exception as exc:  # noqa: BLE001 - venue errors are routine
             self._note_error()
@@ -1792,10 +2268,18 @@ class Executor:
         order_type: str,
         tick_size: float,
         neg_risk: bool,
+        template: OrderTemplate | None = None,
     ) -> dict:
         """Blocking sign-and-post. Runs in a worker thread."""
         assert self._client is not None
-        options = PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=neg_risk)
+        # Reuse the pre-built options object rather than allocating one per
+        # order; more importantly, a warmed template means create_order's
+        # internal tick/neg-risk/fee lookups all hit cache instead of the wire.
+        options = (
+            template.options
+            if template is not None
+            else PartialCreateOrderOptions(tick_size=_tick_str(tick_size), neg_risk=neg_risk)
+        )
         signed = self._client.create_order(
             OrderArgs(token_id=token_id, price=price, size=size, side=side),
             options,
@@ -1907,13 +2391,14 @@ class SignalEngine:
 
         for slug in [s for s, m in self._markets.items() if not m.is_live(now)]:
             log.info("Retiring %s (window closed)", slug)
-            self._markets.pop(slug, None)
+            retired = self._markets.pop(slug)
             # The window is over, so any position in it has settled. Realize the
             # PnL and free the gate slot, or the set would grow without bound.
             if self._executor is not None:
                 self._executor.risk.close_market(slug)
                 self._executor.risk.check_breakers()
                 self._executor.release_market(slug)
+                self._executor.forget_market(slug, (retired.up_token, retired.down_token))
 
     def active_markets(self) -> list[TrackedMarket]:
         now = time.time()
@@ -2014,6 +2499,9 @@ class SignalEngine:
             self._risk_block_logged = ""
 
         move = self._buffer.largest_move(self._cfg.spike_lookback)
+        # Re-arm the tripwire from the window we just measured, so the next
+        # qualifying tick wakes this loop instead of waiting for the timer.
+        self._buffer.arm_trigger(self._cfg.spike_bps)
         if move is None or abs(move.bps) < self._cfg.spike_bps:
             return
 
@@ -2129,7 +2617,9 @@ class SignalEngine:
         market.last_signal[side] = time.monotonic()
 
         token_id = market.up_token if side == "UP" else market.down_token
-        await self._execute_model_signal(market, token_id, token_label, ask, p_fair)
+        await self._execute_model_signal(
+            market, token_id, token_label, ask, p_fair, move.t1_ns
+        )
 
     async def _execute_model_signal(
         self,
@@ -2138,6 +2628,7 @@ class SignalEngine:
         token_label: str,
         ask: float,
         p_fair: float,
+        t1_ns: int = 0,
     ) -> None:
         """Single-leg take of a stale ask, behind the position gate."""
         executor = self._executor
@@ -2176,6 +2667,8 @@ class SignalEngine:
             order_type="FOK",
             tick_size=market.tick_size,
             neg_risk=market.neg_risk,
+            template=executor.template_for(token_id, market),
+            t1_ns=t1_ns,
         )
 
         if result.ok:
@@ -2233,10 +2726,10 @@ class SignalEngine:
             move.elapsed,
         )
         market.last_signal["CROSS"] = time.monotonic()
-        await self._execute_cross_book(market, book.up_ask, book.down_ask)
+        await self._execute_cross_book(market, book.up_ask, book.down_ask, move.t1_ns)
 
     async def _execute_cross_book(
-        self, market: TrackedMarket, up_ask: float, down_ask: float
+        self, market: TrackedMarket, up_ask: float, down_ask: float, t1_ns: int = 0
     ) -> None:
         """Lift both legs at once. The pair is the position, not either leg."""
         executor = self._executor
@@ -2283,6 +2776,8 @@ class SignalEngine:
                 order_type="FOK",
                 tick_size=market.tick_size,
                 neg_risk=market.neg_risk,
+                template=executor.template_for(market.up_token, market),
+                t1_ns=t1_ns,
             ),
             executor.execute_arb_order(
                 market.down_token,
@@ -2292,6 +2787,8 @@ class SignalEngine:
                 order_type="FOK",
                 tick_size=market.tick_size,
                 neg_risk=market.neg_risk,
+                template=executor.template_for(market.down_token, market),
+                t1_ns=t1_ns,
             ),
         )
 
@@ -2370,15 +2867,35 @@ class Scanner:
             cfg.execution, Credentials.from_env(), RiskManager(cfg.risk)
         )
         self._engine = SignalEngine(self._buffer, self._books, cfg, self._executor)
+        #: Set by the tape when a tick crosses the spike tripwire.
+        self._wake = asyncio.Event()
+        self._buffer.set_wake(self._wake.set)
 
     async def run(self) -> None:
-        if not await self._executor.connect():
-            log.error("Execution layer failed to arm; aborting before any market data is consumed")
-            return
-
+        # One pooled session for every REST call this process makes (Gamma
+        # discovery and the private Polygon RPC). Keeping connections alive
+        # removes a TCP handshake and a TLS negotiation - together the dominant
+        # cost of a cold request - from every call after the first.
+        connector = aiohttp.TCPConnector(
+            limit=32,
+            limit_per_host=16,
+            ttl_dns_cache=300,
+            keepalive_timeout=90.0,
+            enable_cleanup_closed=True,
+        )
         async with aiohttp.ClientSession(
-            headers={"User-Agent": "btc-polymarket-arb/1.0"}
+            connector=connector,
+            headers={"User-Agent": "btc-polymarket-arb/1.0", "Connection": "keep-alive"},
+            timeout=aiohttp.ClientTimeout(total=10, connect=3, sock_read=8),
         ) as session:
+            self._executor.attach_session(session)
+            if not await self._executor.connect():
+                log.error(
+                    "Execution layer failed to arm; aborting before any market data "
+                    "is consumed"
+                )
+                return
+
             discovery = MarketDiscovery(session)
 
             tasks = [
@@ -2400,6 +2917,9 @@ class Scanner:
             try:
                 found = await discovery.discover()
                 self._engine.sync_markets(found)
+                # Warm order metadata here, well before any signal needs it.
+                for market in found:
+                    await self._executor.prepare_market(market)
                 if not found:
                     log.info("No live BTC Up/Down window found; will retry")
             except asyncio.CancelledError:
@@ -2419,6 +2939,13 @@ class Scanner:
             await asyncio.sleep(self._cfg.book_poll_interval)
 
     async def _eval_loop(self) -> None:
+        """Event-driven evaluation with a periodic floor.
+
+        Waiting on the tripwire rather than sleeping a fixed period removes up
+        to a full polling interval of dead time between the tick that creates
+        the edge and the evaluation that acts on it. The timeout keeps the
+        periodic pass for housekeeping (expiry, cooldowns, re-arming).
+        """
         period = 1.0 / max(self._cfg.eval_hz, 1.0)
         while True:
             try:
@@ -2427,7 +2954,10 @@ class Scanner:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("Eval loop error: %s", exc)
-            await asyncio.sleep(period)
+
+            self._wake.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), timeout=period)
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -2437,7 +2967,7 @@ class Scanner:
             move = self._buffer.largest_move(self._cfg.spike_lookback)
             log.info(
                 "hb | %s | spot=%s | sigma=%.2f bps/s | ws=%s lat=%.0fms ticks=%d "
-                "| 3s move=%+.1f bps | %s | %s | markets=%s",
+                "| 3s move=%+.1f bps | %s | %s | %s | markets=%s",
                 "DRY" if self._executor.dry_run else "LIVE",
                 f"{last.price:,.2f}" if last else "n/a",
                 self._buffer.sigma_per_sqrt_second() * 10_000.0,
@@ -2446,6 +2976,7 @@ class Scanner:
                 self._buffer.tick_count,
                 move.bps if move else 0.0,
                 self._executor.stats(),
+                self._executor.latency.summary(),
                 self._executor.risk.stats(),
                 ", ".join(
                     f"{m.horizon}:{_quote(m)}@{m.seconds_remaining():.0f}s" for m in markets
@@ -2637,8 +3168,31 @@ async def amain(cfg: Config) -> None:
             task.result()  # surface a genuine crash
 
 
+def _ecc_backend() -> str:
+    """Which elliptic-curve backend eth-keys picked.
+
+    The pure-Python fallback signs an order in ~7.4ms; libsecp256k1 via
+    coincurve does it in ~0.8ms. Worth surfacing at startup, because the only
+    difference is whether the wheel is installed.
+    """
+    try:
+        from eth_keys import backends
+
+        name = type(backends.get_backend()).__name__
+        return "coincurve" if "CoinCurve" in name else f"{name} (SLOW - pip install coincurve)"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def main() -> None:
     cfg = parse_args()
+    tuned = tune_clob_http_client()
+    log.info(
+        "Runtime | json=%s | ecc=%s | clob-http=%s",
+        JSON_BACKEND,
+        _ecc_backend(),
+        "tuned" if tuned else "stock",
+    )
     log.info(
         "Starting scanner | %s | spike>%gbps/%gs | ask gate %.2f | min edge %.3f",
         "DRY RUN" if cfg.execution.dry_run else "*** LIVE TRADING ***",

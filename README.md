@@ -159,12 +159,19 @@ stale resting ask, so the order must take it in full right now or die. A partial
 fill or a resting remainder converts a latency arb into an unhedged directional
 bet at exactly the moment the book is repricing against you.
 
-`tick_size` and `neg_risk` are carried on `TrackedMarket` from the Gamma
-payload and passed via `PartialCreateOrderOptions`, which avoids two extra
-network round-trips per order on the latency-critical path. Prices are snapped
-onto the venue tick grid (buys round up, sells round down) — the CLOB rejects
-off-grid prices, and `0.45/0.01 == 44.99999...` in binary would otherwise bump a
-correct price a full tick.
+`tick_size` and `neg_risk` are carried on `TrackedMarket` and passed via a
+cached `PartialCreateOrderOptions`.
+
+> Passing those options does **not**, on its own, keep `create_order` off the
+> network. It tests `if options and options.neg_risk` — a truthiness check — so
+> a legitimately `False` neg-risk flag falls straight through to a blocking
+> `get_neg_risk()` GET, and `get_tick_size()` is called unconditionally to
+> validate. The only thing that actually removes those round-trips is warming
+> the client's internal caches at discovery. See [Latency](#latency).
+
+Prices are snapped onto the venue tick grid (buys round up, sells round down) —
+the CLOB rejects off-grid prices, and `0.45/0.01 == 44.99999...` in binary would
+otherwise bump a correct price a full tick.
 
 Every venue call goes through `asyncio.to_thread`: `py-clob-client` is
 synchronous, and a blocking HTTP round-trip on the event loop would stall the
@@ -246,6 +253,112 @@ to ignore the banner.
 PnL is realized when a market retires, using the last mark. By expiry the book
 has converged to ~0 or ~1, so the mark is a close proxy — but it is a proxy, not
 settlement-confirmed accounting.
+
+## Latency
+
+### Where the time actually goes
+
+Measured, not assumed. The controllable pipeline — parse, buffer, spike scan,
+fair value, sizing, risk gates, payload construction — is **0.15 ms**. Everything
+above that in a live run is round-trip time.
+
+| Stage | Before | After | Note |
+|---|---:|---:|---|
+| Order metadata on a new market | **1035 ms** | **~0 ms** | pre-warmed at discovery |
+| EIP-712 order signing | 7.44 ms | **0.83 ms** | `coincurve` backend |
+| Tick deserialization | 2.47 µs | **0.91 µs** | `orjson` |
+| Spike scan (2k ticks) | 355 µs | **147 µs** | min/max instead of per-tick `log()` |
+| Eval scheduling delay | ≤100 ms | **~0 ms** | event-driven wake |
+| **T1→T2, network removed** | — | **0.15 ms** | full local pipeline |
+
+> **The big one.** `create_order` internally calls `get_tick_size`,
+> `get_neg_risk` and `get_fee_rate_bps`, each of which is a **blocking HTTP GET
+> on a token it has not seen before**. These markets roll every five minutes
+> with brand-new token ids, so without pre-warming, the first order in every
+> window — the one the whole system exists to send quickly — paid **1,035 ms**
+> of round-trips before signing even began. `prepare_market()` now warms all
+> three at discovery, off the hot path.
+
+> **Install `coincurve`.** Without it `eth-keys` falls back to a pure-Python
+> elliptic curve implementation and every order costs 7.4 ms to sign instead of
+> 0.8 ms. The startup banner reports which backend is live; it prints
+> `SLOW - pip install coincurve` if you are on the fallback.
+
+### Reaching <100 ms end-to-end
+
+Local compute is 0.15 ms, so the budget is **entirely network**:
+
+```
+T1→T2 = 0.15 ms local + one book-confirmation round-trip
+T2→T3 = 0.83 ms signing + one order POST round-trip
+```
+
+The book confirmation is not removable without changing the design: the whole
+claim is that the resting ask is stale, and you cannot assert that without
+looking at the book *after* the spike. So end-to-end is roughly `2 × RTT`, and
+<100 ms requires **RTT under ~45 ms** — routine from a well-peered host near
+Polymarket's infrastructure, impossible from a distant one no matter how fast
+the code is. On the sandbox these numbers were developed on, RTT is ~160 ms
+(proxied and geographically distant), giving T1→T2 ≈ 167 ms of which 0.15 ms is
+ours.
+
+The next structural win, if you need it, is the CLOB market websocket
+(`wss://ws-subscriptions-clob.polymarket.com/ws/market`): a streamed book is
+always fresh, which removes the confirmation round-trip from the hot path
+entirely and halves the budget. That is not implemented here.
+
+### Instrumentation
+
+Three checkpoints, `time.perf_counter_ns()` throughout — monotonic and immune to
+wall-clock adjustment, which `time.time()` is not:
+
+| | Checkpoint |
+|---|---|
+| **T1** | Binance websocket frame received (stamped before parsing, so deserialization is counted, not excluded) |
+| **T2** | Signal evaluated, payload constructed, funds reserved |
+| **T3** | Order response received from the CLOB |
+
+Recording costs ~196 ns into a bounded deque. The heartbeat reports medians and
+p95:
+
+```
+lat[n=2] T1->T2 166.65ms T2->T3 0.0ms p95 166.7ms
+```
+
+### Event-driven evaluation
+
+The evaluator no longer polls on a fixed timer. Each tick is compared against
+two pre-armed price levels — `low × e^(+thr)` and `high × e^(-thr)`, recomputed
+after each pass — so detecting a candidate spike costs **two float comparisons
+per tick, no logarithm and no scan**. Crossing one wakes the evaluator
+immediately, removing up to a full polling interval of dead time. The timer
+remains as a floor for housekeeping.
+
+The tripwire is a *hint*, never the decision: `evaluate()` always recomputes the
+real move, so a false wake costs one wasted pass and a missed wake is bounded by
+the periodic timer.
+
+### Connection reuse
+
+One pooled `aiohttp.ClientSession` serves every REST call this process makes
+(Gamma discovery and the private Polygon RPC), with keepalive, DNS caching and
+explicit timeouts. CLOB traffic goes through py-clob-client's shared
+`httpx.Client`, which already pools over HTTP/2; the bot retunes it at startup
+with a trading-appropriate timeout budget, since the stock blanket 5 s timeout
+is far too long for an order that is only valuable for a few hundred
+milliseconds.
+
+### Private RPC
+
+`POLYGON_RPC_URL` (Alchemy / QuickNode / Chainstack) switches balance and
+allowance reads to direct `eth_call`s against USDC on Polygon — faster than the
+Polymarket API and independent of its uptime. Implemented as two raw ERC-20
+selectors over the shared session rather than a web3 dependency; falls back to
+the CLOB endpoint if the RPC is absent or fails.
+
+`POLYGON_WS_URL` is accepted, validated and logged, but the trading path is
+REST-only and does not use it. It is plumbed through for on-chain
+subscriptions.
 
 ## Resilience
 
@@ -350,11 +463,11 @@ Five cooperating `asyncio` tasks:
 
 | Task | Cadence | Role |
 |---|---|---|
-| `binance` | event-driven | WS tape → rolling 10s buffer, auto-reconnect + failover |
+| `binance` | event-driven | WS tape → rolling 10s buffer, tripwire, auto-reconnect + failover |
 | `discovery` | 20s | Gamma poll, market roll-over, retire expired windows |
 | `books` | 1s | Batched CLOB book snapshots per tracked token |
-| `eval` | 10 Hz | Spike detection → forced book refresh → signal → execution |
-| `heartbeat` | 15s | Liveness: mode, spot, σ, WS state, latency, order stats, quotes |
+| `eval` | tripwire-woken, 10 Hz floor | Spike detection → book confirmation → signal → execution |
+| `heartbeat` | 15s | Liveness: mode, spot, σ, WS state, T1→T2/T2→T3 latency, order stats, risk, quotes |
 
 `py-clob-client` is synchronous, so its calls are dispatched via
 `asyncio.to_thread` to keep the event loop — and therefore the tape —
@@ -369,7 +482,7 @@ phantom edge.
 python test_signal_path.py
 ```
 
-80 checks. Spins up a local websocket server speaking the Binance trade payload
+120 checks. Spins up a local websocket server speaking the Binance trade payload
 format, replays a scripted spike against a stubbed stale book, and asserts each
 gate independently.
 
@@ -409,6 +522,16 @@ and announces the suppression once rather than per tick.
 classified correctly; backoff recovers through 429s; a non-retryable status
 fails without burning attempts; retries are bounded; `Retry-After` overrides the
 computed delay.
+
+**Latency** — a JSON backend is selected at import and parses both str and
+bytes frames; malformed input raises `ValueError` on all three backends and a
+corrupt frame never kills the tape; templates stay isolated per market and a
+tightened live tick rebuilds the cached options; retiring a market evicts only
+its own templates; the profiler reports T1→T2/T2→T3 in ms, bounds its sample
+window, and records in ~196 ns; the tripwire wakes on a qualifying tick,
+debounces until re-armed, agrees with the authoritative scan, and survives an
+unreachable threshold; the min/max spike scan returns the same answer as the
+per-tick search it replaced; and **T1→T2 with the network removed is 0.15 ms**.
 
 **Resilience** — a reset drops the stale tick window and blocks signals during
 warm-up; `largest_move` cannot see across a gap; a dropped tape resets the
