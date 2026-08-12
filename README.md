@@ -177,8 +177,113 @@ Binance tape, which is the one thing this system cannot afford.
 | **Dry run** | Default. Simulates fills, books expected PnL, never builds a signing client. |
 | **Position gate** | `active_positions` holds at most one open trade per market window. A spike stays above threshold for many consecutive 10 Hz ticks; without this the bot would re-bet the same spike dozens of times. Slots are freed when a market retires. |
 | **Notional cap** | `--max-notional` blocks any leg above the cap outright, before signing. |
-| **Circuit breaker** | Three consecutive execution errors halts submission for the rest of the session. |
-| **Credential preflight** | `--live` aborts at startup on a missing key or a proxy signature type with no funder. |
+| **Balance pre-flight** | Every order reserves its notional against free funds before signing. Insufficient funds → refused, never sent. |
+| **Drawdown breaker** | Peak-to-trough session drawdown past the limit pauses new entries; repeated trips halt the session. |
+| **Consecutive losses** | Three losing closes or failed executions in a row halts the session permanently. |
+| **Execution breaker** | Three consecutive execution *errors* halts submission for the rest of the session. |
+| **Credential preflight** | `--live` aborts at startup on a missing key, a proxy signature type with no funder, or an unreadable balance. |
+
+## Risk management
+
+### Bankroll and dynamic sizing
+
+On startup in live mode the bot reads the wallet's USDC balance and its
+allowance to the CTF Exchange, and **fails closed** — no balance, no trading.
+Reading through the CLOB's balance/allowance endpoint rather than a direct RPC
+keeps the number aligned with the venue's own view (it is what actually decides
+whether an order is accepted) and avoids a web3 dependency plus RPC config. A
+zero allowance aborts startup, since every order would be rejected on-chain.
+
+Position size comes from the risk budget, not a fixed count:
+
+```
+budget = equity × max_risk_pct        capped by --max-notional and free funds
+size   = budget / price               floored at the venue's orderMinSize
+```
+
+For a binary the entire premium is at risk, so `risk == size × price`. Sizing
+off **current equity** rather than the opening balance means risk per trade
+scales down as a session loses ground; realized losses also reduce buying power
+directly. A `$500` bankroll at 2% buys exactly `$10` of premium whether the ask
+is `0.14` or `0.50`.
+
+Cross-book pairs are sized off the *combined* leg cost, so a hedged pair is one
+risk unit rather than two.
+
+### Capital reservation
+
+Orders reserve their notional before signing and hold it until
+`risk.open_position()` converts it into position cost. The handoff is atomic on
+purpose: releasing at submission time would leave a window where spent capital
+looks free, and the cross-book path submits both legs concurrently — without a
+reservation each leg would independently see the full free balance and together
+commit more than the wallet holds.
+
+### Session breakers
+
+Equity is `bankroll + realized + unrealized`, with open positions marked to the
+**best bid** — the price you could actually exit at. Marking to the mid would
+flatter the book and let a real drawdown hide.
+
+> When a leg has no bid at all, it marks off the complement of the opposite ask
+> (`1 − ask`), since the pair must sum to $1. Without this a position that has
+> gone worthless keeps its entry mark and stays invisible to the breaker right
+> up until settlement — exactly when the breaker most needs to see it.
+
+Drawdown is measured **peak-to-trough**, and the *tighter* of `--max-drawdown-pct`
+(of peak equity) and `--max-drawdown-usd` binds. A trip pauses new entries for
+`--risk-cooldown`, then re-baselines the peak and resumes; `--max-drawdown-trips`
+caps how many times that can happen before the session halts for good.
+
+> Re-baselining means each cooldown permits another full drawdown, so total
+> session loss can reach roughly `trips × limit`. That is why trips are counted
+> and capped — set `--max-drawdown-trips 1` for a hard single-strike stop.
+
+A tripped breaker suppresses **signal generation**, not just order submission:
+logging tradeable edges the bot has no intention of taking trains the operator
+to ignore the banner.
+
+PnL is realized when a market retires, using the last mark. By expiry the book
+has converged to ~0 or ~1, so the mark is a close proxy — but it is a proxy, not
+settlement-confirmed accounting.
+
+## Resilience
+
+### Retry and backoff
+
+Idempotent reads — Gamma discovery, CLOB book fetches, balance queries — retry
+on `408/425/429/500/502/503/504` and on connection-level faults, with
+exponential backoff, full jitter, and a cap. A server-sent `Retry-After` always
+wins over the computed delay. A 4xx that is not rate limiting fails immediately
+rather than burning attempts on something backoff cannot fix.
+
+> **Order submission is deliberately excluded.** A POST that times out may still
+> have executed, so retrying risks a double fill — far worse than a missed
+> trade. Only reads retry.
+
+### Tape reconnects
+
+The websocket reconnects with exponential backoff and endpoint failover, and on
+every disconnect it **resets the price buffer** and re-enters a warm-up equal to
+the spike lookback.
+
+> Without the reset, ticks captured before the drop stay in the 10s buffer and
+> get compared against the first tick after reconnect. Any drift during the
+> outage reads as an instantaneous spike — firing a signal, and now a live
+> order, against a book that had every opportunity to reprice.
+
+The reset is scoped to market data only. `active_positions`, open positions,
+session PnL and the breakers live on the Executor and RiskManager, so a
+reconnect never disturbs risk state. The volatility estimator separately skips
+any 1-second return spanning a gap, so a stalled tape cannot inflate σ.
+
+### Live venue metadata
+
+Tick size, minimum order size and `neg_risk` are taken from the order book
+response and override the Gamma snapshot. Polymarket tightens the tick for
+extreme prices near expiry, and quantizing a `0.001` ask onto a stale `0.01`
+grid would price an order an order of magnitude away from the liquidity being
+taken.
 
 ### Leg risk on the cross-book trade
 
@@ -205,10 +310,20 @@ attempt to auto-unwind it.
 
 execution:
 --live            ARM LIVE TRADING with real funds         (default: dry run)
---size            contracts per order leg                  (default 20)
+--size            contracts per leg when sizing is fixed   (default 20)
 --max-notional    hard USDC cap per leg                    (default 50)
 --slippage-ticks  extra ticks above the ask to cross       (default 0)
 --env-file        dotenv path                              (default .env)
+
+risk management:
+--max-risk-pct         percent of equity risked per trade  (default 2.0)
+--fixed-size           disable dynamic sizing, use --size
+--max-drawdown-pct     percent drawdown that trips         (default 5.0)
+--max-drawdown-usd     absolute USDC drawdown that trips   (default 100)
+--max-consecutive-losses  losing/failed trades to halt     (default 3)
+--risk-cooldown        pause after a trip, seconds         (default 300)
+--max-drawdown-trips   trips before permanent halt         (default 3)
+--paper-bankroll       simulated bankroll for dry runs     (default 1000)
 ```
 
 ## Spot tape failover
@@ -254,7 +369,7 @@ phantom edge.
 python test_signal_path.py
 ```
 
-29 checks. Spins up a local websocket server speaking the Binance trade payload
+80 checks. Spins up a local websocket server speaking the Binance trade payload
 format, replays a scripted spike against a stubbed stale book, and asserts each
 gate independently.
 
@@ -277,6 +392,31 @@ without a key, or with a proxy signature type and no funder; the circuit breaker
 trips after three consecutive failures and rejects everything after; prices snap
 onto the tick grid.
 
+**Balance & sizing** — USDC parses across every response shape the CLOB returns
+(raw 6-decimal, plain decimal, nested allowances map); 2% of $1000 sizes to
+exactly $20 of premium; the notional cap and venue minimum both bind correctly;
+realized losses shrink buying power and the risk budget; the allowance caps
+available funds; an unfundable order is refused before signing; and two
+concurrent legs cannot over-commit the same capital.
+
+**Risk breakers** — drawdown inside the limit does not trip; past it enters a
+timed cooldown and re-baselines the peak; exhausting the trip budget halts
+permanently; three failed executions halt; a losing close increments the streak
+and a winning close resets it; a halted session emits **zero** signal banners
+and announces the suppression once rather than per tick.
+
+**Retry & rate limits** — 429/503 retryable, 400 not; `PolyApiException` status
+classified correctly; backoff recovers through 429s; a non-retryable status
+fails without burning attempts; retries are bounded; `Retry-After` overrides the
+computed delay.
+
+**Resilience** — a reset drops the stale tick window and blocks signals during
+warm-up; `largest_move` cannot see across a gap; a dropped tape resets the
+buffer while `active_positions`, open positions and PnL survive untouched; a
+bidless leg marks off the opposite ask so the loss reaches the breaker; live
+book tick size overrides the Gamma snapshot; and the vol estimator ignores
+returns spanning a gap.
+
 Beyond the suite, the execution path was driven end-to-end against **live
 Polymarket books** by injecting a synthetic spike through `--ws-url` while
 discovery, order books, tick sizes and `neg_risk` all came from the real venue.
@@ -290,11 +430,18 @@ discovery, order books, tick sizes and `neg_risk` all came from the real venue.
   under this model's own fair value. It is not marked to settlement, and the
   bot does not track resolution outcomes. Treat it as a diagnostic, not a P&L
   statement.
-- **No inventory or balance checks.** The bot does not verify USDC balance or
-  allowance before submitting. A rejected order trips toward the circuit
-  breaker rather than being pre-empted.
-- **No unwind logic.** Positions are held to settlement. There is no stop, no
-  exit, and no auto-hedge if a cross-book leg misses.
+- **No unwind logic.** Positions are held to settlement. The breakers stop the
+  bot from opening *new* risk; they do not close existing positions. There is no
+  stop-loss exit and no auto-hedge if a cross-book leg misses.
+- **Realized PnL is mark-based, not settlement-confirmed.** Positions are closed
+  at their last observed mark when a window retires, not against the Chainlink
+  resolution. Close by construction, but not an accounting record.
+- **Balance is read once at startup.** It is not re-polled, so fills, deposits
+  or withdrawals during a session are not reflected until restart. Session
+  accounting tracks the delta from that opening snapshot.
+- **Depth is still not checked.** Sizing respects your bankroll, not the book.
+  A computed size can exceed the resting liquidity at the ask, in which case
+  the FOK simply fails rather than filling.
 - **Displayed size is not fillable size.** The scanner reads top-of-book price
   only; it does not walk the book for depth at your clip.
 - **Settlement is Chainlink, not Binance.** The scanner uses Binance as a fast

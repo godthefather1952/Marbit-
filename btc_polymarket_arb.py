@@ -75,6 +75,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import statistics
 import time
@@ -95,6 +96,8 @@ from websockets.exceptions import ConnectionClosed
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
     BookParams,
     OrderArgs,
     OrderType,
@@ -160,6 +163,111 @@ SERIES = {
 }
 
 log = logging.getLogger("btc-arb")
+
+
+# --------------------------------------------------------------------------- #
+# Retry / rate-limit handling
+# --------------------------------------------------------------------------- #
+
+#: HTTP statuses worth retrying: rate limiting plus transient server faults.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+class RetryableError(Exception):
+    """A transient failure that backoff may clear."""
+
+    def __init__(self, message: str, status: int | None = None, retry_after: float | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _status_of(exc: BaseException) -> int | None:
+    """Pull an HTTP status off whichever client raised."""
+    for attr in ("status", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _retry_after_of(exc: BaseException) -> float | None:
+    """Honour an explicit Retry-After hint when the venue sends one."""
+    hint = getattr(exc, "retry_after", None)
+    if isinstance(hint, (int, float)) and hint >= 0:
+        return float(hint)
+
+    headers = getattr(exc, "headers", None)
+    if headers:
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            raw = headers.get("Retry-After")
+            if raw is not None:
+                return max(0.0, float(raw))
+    return None
+
+
+def is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    # An explicit status always decides, even on a RetryableError: a 400 wrapped
+    # in one is still a client error that no amount of backoff will fix.
+    status = _status_of(exc)
+    if status is not None:
+        return status in RETRYABLE_STATUS
+    if isinstance(exc, RetryableError):
+        return True
+    # Connection-level faults carry no status but are exactly what backoff is for.
+    return isinstance(exc, (aiohttp.ClientError, ConnectionError, OSError))
+
+
+async def retry_async(
+    func,
+    *args,
+    attempts: int = 4,
+    base_delay: float = 0.4,
+    max_delay: float = 8.0,
+    label: str = "request",
+    **kwargs,
+):
+    """Call an async function with exponential backoff on transient failures.
+
+    Backoff is `base_delay * 2**n` with full jitter, capped at `max_delay`, and
+    a server-sent `Retry-After` always wins over the computed delay.
+
+    Deliberately NOT applied to order submission. A POST that times out may have
+    executed, so retrying it risks a double fill - far worse than a missed
+    trade. Only idempotent reads (books, discovery, balances) retry.
+    """
+    delay = base_delay
+    last: BaseException | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classified immediately below
+            last = exc
+            if not is_retryable(exc) or attempt == attempts:
+                raise
+
+            hint = _retry_after_of(exc)
+            wait = hint if hint is not None else random.uniform(0.0, min(delay, max_delay))
+            status = _status_of(exc)
+            log.warning(
+                "%s failed (attempt %d/%d%s): %s - retrying in %.2fs",
+                label,
+                attempt,
+                attempts,
+                f", HTTP {status}" if status else "",
+                exc,
+                wait,
+            )
+            await asyncio.sleep(wait)
+            delay = min(delay * 2.0, max_delay)
+
+    assert last is not None
+    raise last
 
 
 # --------------------------------------------------------------------------- #
@@ -238,6 +346,8 @@ class PriceBuffer:
         self._last_bar_mono: float | None = None
         self._tick_count = 0
         self._latency_ms = 0.0
+        self._warm_after = 0.0
+        self.resets = 0
 
     # -- ingest ------------------------------------------------------------- #
 
@@ -259,11 +369,41 @@ class PriceBuffer:
             while self._bars and self._bars[0][0] < bar_cutoff:
                 self._bars.popleft()
 
+    def reset(self, reason: str, warmup: float = SPIKE_LOOKBACK_SECONDS) -> None:
+        """Drop the tick window after a tape gap and re-enter warm-up.
+
+        Without this, the ticks captured before a disconnect stay in the 10s
+        buffer and get compared against the first tick after reconnect. Any
+        price drift that happened during the outage would then read as an
+        instantaneous spike and fire a signal against a book that had every
+        opportunity to reprice - a phantom edge, and a live order behind it.
+
+        Deliberately scoped to market data only. `active_positions`, session
+        PnL and the breakers live on the Executor and RiskManager, so a
+        reconnect never disturbs the risk state.
+        """
+        dropped = len(self._ticks)
+        self._ticks.clear()
+        self._last_bar_mono = None
+        self._warm_after = time.monotonic() + max(warmup, 0.0)
+        self.resets += 1
+        log.info(
+            "Price buffer reset (%s): dropped %d ticks, warming up for %.1fs",
+            reason,
+            dropped,
+            warmup,
+        )
+
     # -- state -------------------------------------------------------------- #
 
     @property
     def ready(self) -> bool:
-        return len(self._ticks) >= 2
+        """Enough clean, gap-free history to trust a spike measurement."""
+        return len(self._ticks) >= 2 and time.monotonic() >= self._warm_after
+
+    @property
+    def warming_up(self) -> bool:
+        return time.monotonic() < self._warm_after
 
     @property
     def tick_count(self) -> int:
@@ -314,7 +454,10 @@ class PriceBuffer:
         prev_mono, prev_price = self._bars[0]
         for mono, price in list(self._bars)[1:]:
             dt = mono - prev_mono
-            if dt > 0 and price > 0 and prev_price > 0:
+            # Bars are sampled at 1s. A much larger gap means the tape stalled,
+            # so the bridging "return" spans unobserved time and would bias the
+            # vol estimate upward; skip it rather than annualize a hole.
+            if 0 < dt <= 5.0 and price > 0 and prev_price > 0:
                 rets.append((dt, math.log(price / prev_price)))
             prev_mono, prev_price = mono, price
 
@@ -398,6 +541,8 @@ class BinanceTradeStream:
                 self._note_failure()
             finally:
                 self._connected.clear()
+                # Market-data state only. Position locks and PnL are untouched.
+                self._buffer.reset(f"tape disconnect from {url}")
 
             log.info("Reconnecting to %s in %.1fs", self.url, backoff)
             await asyncio.sleep(backoff)
@@ -445,6 +590,7 @@ class TrackedMarket:
     tick_size: float
     accepting_orders: bool
     neg_risk: bool = False
+    min_order_size: float = 5.0
     books: Deque["BookSnapshot"] = field(default_factory=lambda: deque(maxlen=64))
     last_signal: dict[str, float] = field(default_factory=dict)
 
@@ -501,6 +647,17 @@ class BookSnapshot:
         if self.down_ask is not None and self.down_bid is not None:
             return 1.0 - (self.down_ask + self.down_bid) / 2.0
         return self.up_ask or self.up_bid
+
+
+@dataclass(frozen=True, slots=True)
+class Quote:
+    """Top of book plus the venue metadata needed to price an order."""
+
+    bid: float | None
+    ask: float | None
+    tick_size: float | None = None
+    min_order_size: float | None = None
+    neg_risk: bool | None = None
 
 
 def _best_ask(levels: Sequence) -> float | None:
@@ -582,18 +739,29 @@ class MarketDiscovery:
 
     async def _get(self, params: list[tuple[str, str]]) -> list[dict]:
         try:
-            async with self._session.get(
-                GAMMA_EVENTS_URL,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    log.warning("Gamma returned HTTP %s", resp.status)
-                    return []
-                data = await resp.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
-            log.warning("Gamma discovery failed: %s", exc)
+            return await retry_async(self._get_once, params, label="Gamma discovery")
+        except Exception as exc:  # noqa: BLE001 - discovery retries next cycle
+            log.warning("Gamma discovery failed after retries: %s", exc)
             return []
+
+    async def _get_once(self, params: list[tuple[str, str]]) -> list[dict]:
+        async with self._session.get(
+            GAMMA_EVENTS_URL,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status in RETRYABLE_STATUS:
+                raise RetryableError(
+                    f"Gamma returned HTTP {resp.status}",
+                    status=resp.status,
+                    retry_after=_header_seconds(resp.headers.get("Retry-After")),
+                )
+            if resp.status != 200:
+                # A 4xx that is not rate limiting will not fix itself; do not
+                # burn retries on a malformed query.
+                log.warning("Gamma returned HTTP %s (not retrying)", resp.status)
+                return []
+            data = await resp.json(content_type=None)
 
         if isinstance(data, dict):
             data = data.get("data", [])
@@ -667,7 +835,18 @@ class MarketDiscovery:
             # Carried so orders can be signed without an extra round-trip to
             # resolve neg_risk / tick size at execution time.
             neg_risk=bool(market.get("negRisk", False)),
+            min_order_size=float(market.get("orderMinSize") or 5.0),
         )
+
+
+def _header_seconds(raw: str | None) -> float | None:
+    """Parse a Retry-After header expressed in seconds."""
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
 
 
 def _parse_iso(value: str | None) -> float | None:
@@ -702,26 +881,55 @@ class BookFeed:
         self._client = ClobClient(host, chain_id=chain_id)
         self._lock = asyncio.Lock()
 
-    async def fetch(self, token_ids: Sequence[str]) -> dict[str, tuple[float | None, float | None]]:
-        """Return {token_id: (best_bid, best_ask)}."""
+    async def fetch(self, token_ids: Sequence[str]) -> dict[str, "Quote"]:
+        """Return {token_id: Quote} with live top-of-book and venue metadata."""
         if not token_ids:
             return {}
 
         params = [BookParams(token_id=tid) for tid in token_ids]
         try:
             async with self._lock:
-                books = await asyncio.to_thread(self._client.get_order_books, params)
+                # Book reads are idempotent, so retrying a 429 or a 5xx is safe.
+                books = await retry_async(
+                    asyncio.to_thread,
+                    self._client.get_order_books,
+                    params,
+                    attempts=3,
+                    label="CLOB book fetch",
+                )
         except Exception as exc:  # noqa: BLE001 - network/venue errors are routine
-            log.warning("CLOB book fetch failed: %s", exc)
+            log.warning("CLOB book fetch failed after retries: %s", exc)
             return {}
 
-        out: dict[str, tuple[float | None, float | None]] = {}
+        out: dict[str, Quote] = {}
         for book in books or []:
             token = str(getattr(book, "asset_id", "") or "")
             if not token:
                 continue
-            out[token] = (_best_bid(book.bids or []), _best_ask(book.asks or []))
+            out[token] = Quote(
+                bid=_best_bid(book.bids or []),
+                ask=_best_ask(book.asks or []),
+                # Trust the book over the Gamma snapshot. Polymarket tightens the
+                # tick for extreme prices near expiry, and quantizing a 0.001 ask
+                # onto a stale 0.01 grid would price the order an order of
+                # magnitude away from the liquidity we are trying to take.
+                tick_size=_maybe_float(getattr(book, "tick_size", None)),
+                min_order_size=_maybe_float(getattr(book, "min_order_size", None)),
+                neg_risk=_maybe_bool(getattr(book, "neg_risk", None)),
+            )
         return out
+
+
+def _maybe_float(value) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out > 0 else None
+
+
+def _maybe_bool(value) -> bool | None:
+    return bool(value) if isinstance(value, bool) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -830,10 +1038,402 @@ def _env(name: str) -> str | None:
 @dataclass(slots=True)
 class ExecutionSettings:
     dry_run: bool = True
-    order_size: float = 20.0  # contracts per leg
+    order_size: float = 20.0  # fallback contracts/leg when sizing is disabled
     max_notional: float = 50.0  # hard USDC cap per leg
     slippage_ticks: int = 0  # ticks of price improvement offered to cross
     max_consecutive_errors: int = 3  # trip the breaker after this many
+
+
+@dataclass(slots=True)
+class RiskSettings:
+    """Account-level risk limits. All are session-scoped."""
+
+    #: Fraction of bankroll put at risk per leg. For a binary the entire
+    #: premium is at risk, so risk == size * price.
+    max_risk_pct: float = 0.02
+    dynamic_sizing: bool = True
+    #: Session drawdown limits, measured peak-to-trough on equity.
+    max_drawdown_pct: float = 0.05
+    max_drawdown_usd: float = 100.0
+    #: Losing closes (or failed executions) in a row before halting.
+    max_consecutive_losses: int = 3
+    #: Protective pause after a drawdown trip, then trading resumes.
+    risk_cooldown: float = 300.0
+    #: Drawdown trips tolerated before the session halts for good.
+    max_drawdown_trips: int = 3
+    #: Simulated bankroll for dry runs, where there is no wallet to read.
+    paper_bankroll: float = 1_000.0
+    #: Venue floor; overridden per-market by `orderMinSize` when available.
+    min_order_size: float = 5.0
+
+
+@dataclass(slots=True)
+class Position:
+    market: str
+    token_id: str
+    label: str  # "YES" / "NO"
+    size: float
+    entry: float
+    opened: float
+    mark: float  # latest observable exit price
+
+    @property
+    def cost(self) -> float:
+        return self.size * self.entry
+
+    @property
+    def value(self) -> float:
+        return self.size * self.mark
+
+    @property
+    def unrealized(self) -> float:
+        return self.value - self.cost
+
+
+class RiskManager:
+    """Bankroll, position sizing, and the session-level circuit breakers.
+
+    Equity is tracked as `bankroll + realized + unrealized`, where unrealized
+    marks open positions to the best bid (the price we could actually exit at,
+    not the mid). Drawdown is measured peak-to-trough on that equity.
+    """
+
+    def __init__(self, settings: RiskSettings) -> None:
+        self._s = settings
+        self.settings = settings
+        self.balance: float | None = None
+        self.allowance: float | None = None
+        self.bankroll: float = 0.0
+        self.committed: float = 0.0  # capital reserved for in-flight orders
+        self.positions: dict[str, Position] = {}
+        self.realized_pnl: float = 0.0
+        self.peak_equity: float = 0.0
+        self.consecutive_losses: int = 0
+        self.wins: int = 0
+        self.losses: int = 0
+        self.drawdown_trips: int = 0
+        self.halted_until: float = 0.0
+        self.halted_permanently: bool = False
+        self.halt_reason: str = ""
+        self._lock = asyncio.Lock()
+
+    # -- bankroll ----------------------------------------------------------- #
+
+    def seed_paper_bankroll(self) -> None:
+        self.bankroll = self._s.paper_bankroll
+        self.peak_equity = self.equity()
+        log.info("Paper bankroll seeded at $%.2f", self.bankroll)
+
+    async def refresh_balance(self, client: ClobClient, signature_type: int) -> bool:
+        """Read on-chain USDC balance and CTF-Exchange allowance via the CLOB.
+
+        The CLOB reports the wallet's actual Polygon USDC balance and its
+        allowance to the exchange contract, which is the number that decides
+        whether an order is accepted. Reading it here rather than through a
+        direct RPC keeps the check aligned with the venue's own view and avoids
+        a web3 dependency plus RPC configuration.
+        """
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=signature_type,
+        )
+        try:
+            raw = await retry_async(
+                asyncio.to_thread,
+                client.get_balance_allowance,
+                params,
+                attempts=3,
+                label="balance/allowance",
+            )
+        except Exception as exc:  # noqa: BLE001 - caller decides whether to trade
+            log.error("Could not read USDC balance/allowance: %s", exc)
+            return False
+
+        self.balance = _usdc(raw, "balance")
+        self.allowance = _usdc(raw, "allowance", "allowances")
+        if self.balance is None:
+            log.error("Balance response had no parseable balance field: %r", raw)
+            return False
+
+        self.bankroll = self.balance
+        self.peak_equity = self.equity()
+        log.warning(
+            "Wallet: USDC balance $%.2f | CTF Exchange allowance %s",
+            self.balance,
+            f"${self.allowance:.2f}" if self.allowance is not None else "unknown",
+        )
+
+        if self.allowance is not None and self.allowance <= 0.0:
+            log.error(
+                "USDC allowance to the CTF Exchange is zero - every order will be "
+                "rejected on-chain. Approve the exchange before trading."
+            )
+            return False
+        if self.allowance is not None and self.allowance < self.balance:
+            log.warning(
+                "Allowance ($%.2f) is below balance ($%.2f); only the approved "
+                "portion is actually usable.",
+                self.allowance,
+                self.balance,
+            )
+        return True
+
+    # -- sizing ------------------------------------------------------------- #
+
+    def cash(self) -> float:
+        """Spendable cash: starting balance adjusted by realized PnL.
+
+        Realized losses must reduce buying power, otherwise a losing session
+        keeps sizing off the balance it started with.
+        """
+        return self.bankroll + self.realized_pnl
+
+    def available(self) -> float:
+        """Cash not already spent on open positions or reserved in flight."""
+        spent = sum(p.cost for p in self.positions.values())
+        usable = self.cash()
+        if self.allowance is not None:
+            usable = min(usable, self.allowance)
+        return max(0.0, usable - spent - self.committed)
+
+    def size_for(self, price: float, max_notional: float, min_size: float) -> float:
+        """Contracts to buy at `price`, respecting risk %, caps and free funds.
+
+        Returns 0.0 when the position cannot be opened at a legal size, which
+        the caller must treat as "do not trade".
+        """
+        if price <= 0.0:
+            return 0.0
+
+        # Size off current equity, not the opening balance, so risk per trade
+        # scales down as the session loses ground.
+        base = max(0.0, self.equity())
+        budget = base * self._s.max_risk_pct if self._s.dynamic_sizing else max_notional
+        budget = min(budget, max_notional, self.available())
+        if budget <= 0.0:
+            return 0.0
+
+        size = math.floor((budget / price) * 100.0) / 100.0  # venue accepts 2dp
+        return size if size >= min_size else 0.0
+
+    async def reserve(self, amount: float) -> bool:
+        """Ring-fence capital for an in-flight order.
+
+        The cross-book path submits both legs concurrently; without a
+        reservation each leg would independently see the full free balance and
+        together they could commit more than the wallet holds.
+        """
+        async with self._lock:
+            if amount > self.available():
+                return False
+            self.committed += amount
+            return True
+
+    def release(self, amount: float) -> None:
+        self.committed = max(0.0, self.committed - amount)
+
+    # -- position lifecycle ------------------------------------------------- #
+
+    @staticmethod
+    def key(market: str, token_id: str) -> str:
+        return f"{market}:{token_id}"
+
+    def open_position(
+        self,
+        market: str,
+        token_id: str,
+        label: str,
+        size: float,
+        price: float,
+        reserved: float = 0.0,
+    ) -> Position:
+        """Record a fill, converting its reservation into position cost.
+
+        `reserved` is released here rather than by the executor so the capital
+        moves from committed to spent atomically. Releasing earlier would leave
+        a window in which the funds look free to a concurrently sizing leg.
+        """
+        if reserved:
+            self.release(reserved)
+        pos = Position(
+            market=market,
+            token_id=token_id,
+            label=label,
+            size=size,
+            entry=price,
+            opened=time.monotonic(),
+            mark=price,
+        )
+        self.positions[self.key(market, token_id)] = pos
+        self._update_peak()
+        return pos
+
+    def mark_to_market(self, token_id: str, exit_price: float | None) -> None:
+        if exit_price is None:
+            return
+        for pos in self.positions.values():
+            if pos.token_id == token_id:
+                pos.mark = exit_price
+        self._update_peak()
+
+    def close_market(self, market: str) -> float:
+        """Realize every position in a settled market at its last mark.
+
+        Marks are used rather than confirmed settlement because the breakers
+        need a fast risk signal; by expiry the book has converged to ~0 or ~1,
+        so the mark is a close proxy. It is not accounting-grade PnL.
+        """
+        total = 0.0
+        for key in [k for k, p in self.positions.items() if p.market == market]:
+            pos = self.positions.pop(key)
+            pnl = pos.unrealized
+            total += pnl
+            self.realized_pnl += pnl
+            if pnl < 0:
+                self.losses += 1
+                self.consecutive_losses += 1
+            else:
+                self.wins += 1
+                self.consecutive_losses = 0
+            log.info(
+                "Closed %s %s: %g @ %.3f -> %.3f = %+.2f USDC (session %+.2f)",
+                pos.market,
+                pos.label,
+                pos.size,
+                pos.entry,
+                pos.mark,
+                pnl,
+                self.realized_pnl,
+            )
+        if total:
+            self._update_peak()
+        return total
+
+    def note_execution_failure(self) -> None:
+        """A failed execution counts toward the consecutive-loss limit."""
+        self.consecutive_losses += 1
+
+    # -- equity and breakers ------------------------------------------------ #
+
+    def unrealized_pnl(self) -> float:
+        return sum(p.unrealized for p in self.positions.values())
+
+    def equity(self) -> float:
+        return self.bankroll + self.realized_pnl + self.unrealized_pnl()
+
+    def drawdown(self) -> float:
+        """Peak-to-trough equity loss, always >= 0."""
+        return max(0.0, self.peak_equity - self.equity())
+
+    def _update_peak(self) -> None:
+        self.peak_equity = max(self.peak_equity, self.equity())
+
+    def check_breakers(self) -> str | None:
+        """Evaluate the session breakers. Returns a reason if one just tripped."""
+        if self.halted_permanently:
+            return None
+
+        if self.consecutive_losses >= self._s.max_consecutive_losses:
+            self.halted_permanently = True
+            self.halt_reason = (
+                f"{self.consecutive_losses} consecutive losing or failed trades"
+            )
+            log.error(
+                "RISK HALT (permanent): %s. No further orders this session.", self.halt_reason
+            )
+            return self.halt_reason
+
+        dd = self.drawdown()
+        pct_limit = self.peak_equity * self._s.max_drawdown_pct
+        limit = min(pct_limit, self._s.max_drawdown_usd) if self.peak_equity > 0 else self._s.max_drawdown_usd
+        if dd >= limit > 0 and time.monotonic() >= self.halted_until:
+            self.drawdown_trips += 1
+            reason = (
+                f"session drawdown ${dd:.2f} breached the ${limit:.2f} limit "
+                f"({self._s.max_drawdown_pct:.1%} of peak equity ${self.peak_equity:.2f} "
+                f"vs ${self._s.max_drawdown_usd:.2f} cap)"
+            )
+            self.halt_reason = reason
+            if self.drawdown_trips >= self._s.max_drawdown_trips:
+                self.halted_permanently = True
+                log.error(
+                    "RISK HALT (permanent): %s. Trip %d of %d - session over.",
+                    reason,
+                    self.drawdown_trips,
+                    self._s.max_drawdown_trips,
+                )
+            else:
+                self.halted_until = time.monotonic() + self._s.risk_cooldown
+                # Re-baseline the peak, or the same loss re-trips instantly on
+                # resume. This is why trips are counted and capped: total
+                # session loss can reach roughly trips x limit.
+                self.peak_equity = self.equity()
+                log.error(
+                    "RISK COOLDOWN: %s. Pausing new entries for %gs (trip %d of %d).",
+                    reason,
+                    self._s.risk_cooldown,
+                    self.drawdown_trips,
+                    self._s.max_drawdown_trips,
+                )
+            return reason
+        return None
+
+    def trading_allowed(self) -> tuple[bool, str]:
+        if self.halted_permanently:
+            return False, f"halted: {self.halt_reason}"
+        if time.monotonic() < self.halted_until:
+            remaining = self.halted_until - time.monotonic()
+            return False, f"risk cooldown, {remaining:.0f}s remaining"
+        return True, ""
+
+    def stats(self) -> str:
+        allowed, why = self.trading_allowed()
+        return (
+            f"eq=${self.equity():.2f} dd=${self.drawdown():.2f} "
+            f"real=${self.realized_pnl:+.2f} unreal=${self.unrealized_pnl():+.2f} "
+            f"w/l={self.wins}/{self.losses} streak={self.consecutive_losses}"
+            + ("" if allowed else f" [{why}]")
+        )
+
+
+def _usdc(payload, *keys: str) -> float | None:
+    """Pull a USDC amount out of a balance/allowance response.
+
+    The CLOB reports raw 6-decimal integer strings, but has historically also
+    returned plain decimals and a nested allowances map, so all three shapes are
+    accepted rather than assuming one and silently sizing to zero.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    for key in keys:
+        if key not in payload:
+            continue
+        raw = payload[key]
+        if isinstance(raw, dict):  # nested allowances map: take the largest
+            candidates = [_scale_usdc(v) for v in raw.values()]
+            candidates = [c for c in candidates if c is not None]
+            if candidates:
+                return max(candidates)
+            continue
+        scaled = _scale_usdc(raw)
+        if scaled is not None:
+            return scaled
+    return None
+
+
+def _scale_usdc(raw) -> float | None:
+    if isinstance(raw, (int, float)):
+        return float(raw) / 1e6 if float(raw) > 1e5 else float(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    # An integer string is raw 6-decimal units; a decimal string is already USDC.
+    return value / 1e6 if "." not in text else value
 
 
 @dataclass(slots=True)
@@ -848,6 +1448,8 @@ class ExecutionResult:
     order_id: str | None = None
     status: str = ""
     error: str | None = None
+    #: Capital still committed for this fill, released by risk.open_position().
+    reserved: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -889,11 +1491,18 @@ class Executor:
     the Binance tape - which is the one thing this whole system cannot afford.
     """
 
-    def __init__(self, settings: ExecutionSettings, creds: Credentials | None = None) -> None:
+    def __init__(
+        self,
+        settings: ExecutionSettings,
+        creds: Credentials | None = None,
+        risk: RiskManager | None = None,
+    ) -> None:
         self._settings = settings
         self._creds = creds or Credentials()
         self._client: ClobClient | None = None
+        self.risk = risk if risk is not None else RiskManager(RiskSettings())
         #: Market slugs currently holding an open trade. The position gate.
+        #: Owned here, not by the tape, so a websocket reconnect cannot drop it.
         self.active_positions: set[str] = set()
         self._gate_lock = asyncio.Lock()
         self._consecutive_errors = 0
@@ -920,6 +1529,26 @@ class Executor:
     def slippage_ticks(self) -> int:
         return self._settings.slippage_ticks
 
+    def size_for(
+        self, price: float, market: "TrackedMarket", pair_price: float | None = None
+    ) -> float:
+        """Contracts to buy, from the risk budget and the venue's minimum.
+
+        `pair_price` is the combined cost of both legs of a cross-book trade:
+        the risk budget must cover the pair, not each leg independently, or the
+        position ends up at twice the intended size.
+        """
+        if not self.risk.settings.dynamic_sizing:
+            return self._settings.order_size
+        # Dividing the budget by the pair cost yields the number of PAIRS, which
+        # is the per-leg size. It also caps the pair (not each leg) at
+        # --max-notional, which is the conservative reading.
+        return self.risk.size_for(
+            pair_price if pair_price is not None else price,
+            self._settings.max_notional,
+            market.min_order_size,
+        )
+
     async def connect(self) -> bool:
         """Build the signing client. Returns False if live trading can't start."""
         if self._settings.dry_run:
@@ -928,6 +1557,7 @@ class Executor:
             # first time anyone discovers the wallet is misconfigured.
             for issue in self._creds.problems():
                 log.info("  (live mode would fail: %s)", issue)
+            self.risk.seed_paper_bankroll()
             return True
 
         problems = self._creds.problems()
@@ -942,10 +1572,17 @@ class Executor:
             log.error("Failed to initialize signing CLOB client: %s", exc)
             return False
 
+        # Fail closed: without a confirmed balance and allowance we cannot size
+        # a position or know an order will be accepted, so we do not trade.
+        if not await self.risk.refresh_balance(self._client, self._creds.signature_type):
+            log.error("Balance/allowance preflight failed; refusing to trade live")
+            return False
+
         log.warning(
-            "LIVE TRADING ARMED | %s | size=%g max_notional=$%.2f",
+            "LIVE TRADING ARMED | %s | bankroll=$%.2f risk/trade=%.1f%% max_notional=$%.2f",
             self._creds.describe(),
-            self._settings.order_size,
+            self.risk.bankroll,
+            self.risk.settings.max_risk_pct * 100.0,
             self._settings.max_notional,
         )
         return True
@@ -1039,6 +1676,12 @@ class Executor:
             result.error = "execution halted by circuit breaker"
             return result
 
+        allowed, why = self.risk.trading_allowed()
+        if not allowed:
+            result.error = f"risk manager blocked the order ({why})"
+            log.warning("Order blocked: %s", result.error)
+            return result
+
         if notional > self._settings.max_notional:
             result.error = (
                 f"notional ${notional:.2f} exceeds --max-notional "
@@ -1047,6 +1690,46 @@ class Executor:
             log.error("Order blocked: %s", result.error)
             return result
 
+        # Pre-flight funding check. Reserving up front is what stops the two
+        # concurrent cross-book legs from each seeing the full free balance and
+        # together committing more than the wallet actually holds.
+        if not await self.risk.reserve(notional):
+            result.error = (
+                f"insufficient unlocked funds: need ${notional:.2f}, "
+                f"${self.risk.available():.2f} available "
+                f"(bankroll ${self.risk.bankroll:.2f})"
+            )
+            log.warning("Order blocked: %s", result.error)
+            return result
+
+        try:
+            outcome = await self._dispatch(
+                result, token_id, side, price, size, order_type, tick_size, neg_risk
+            )
+        except BaseException:
+            self.risk.release(notional)
+            raise
+
+        if outcome.ok:
+            # Hand the reservation to the caller: it stays committed until
+            # risk.open_position() converts it into position cost. Releasing it
+            # here would briefly make spent capital look available again.
+            outcome.reserved = notional
+        else:
+            self.risk.release(notional)
+        return outcome
+
+    async def _dispatch(
+        self,
+        result: ExecutionResult,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        order_type: str,
+        tick_size: float,
+        neg_risk: bool,
+    ) -> ExecutionResult:
         if self._settings.dry_run:
             # Assume the resting liquidity we just measured is still there. The
             # caller only reaches this path when our limit crosses the ask.
@@ -1063,11 +1746,15 @@ class Executor:
 
         try:
             self.orders_sent += 1
+            # No retry wrapper here, by design: a POST that times out may still
+            # have executed, and a duplicate fill is far worse than a miss.
             response = await asyncio.to_thread(
                 self._submit, token_id, side, price, size, order_type, tick_size, neg_risk
             )
         except Exception as exc:  # noqa: BLE001 - venue errors are routine
             self._note_error()
+            self.risk.note_execution_failure()
+            self.risk.check_breakers()
             result.error = f"{type(exc).__name__}: {exc}"
             log.error("Order submission failed (%s %s @ %.3f): %s", side, token_id[:12], price, exc)
             return result
@@ -1089,6 +1776,10 @@ class Executor:
             self.orders_filled += 1
         else:
             result.error = str(response.get("errorMsg") or response.get("error") or result.status)
+            # An unmatched FOK is a missed trade, not a venue fault - but a run
+            # of them still counts toward the consecutive-loss limit.
+            self.risk.note_execution_failure()
+            self.risk.check_breakers()
 
         return result
 
@@ -1167,6 +1858,7 @@ class Config:
     enforce_ask_ceiling: bool = True
     ws_endpoints: tuple[str, ...] = BINANCE_WS_FALLBACKS
     execution: ExecutionSettings = field(default_factory=ExecutionSettings)
+    risk: RiskSettings = field(default_factory=RiskSettings)
 
 
 class SignalEngine:
@@ -1183,6 +1875,7 @@ class SignalEngine:
         self._executor = executor
         self._markets: dict[str, TrackedMarket] = {}
         self._last_forced_fetch = 0.0
+        self._risk_block_logged = ""
 
     @property
     def executor(self) -> Executor | None:
@@ -1215,9 +1908,11 @@ class SignalEngine:
         for slug in [s for s, m in self._markets.items() if not m.is_live(now)]:
             log.info("Retiring %s (window closed)", slug)
             self._markets.pop(slug, None)
-            # The window is over, so any position in it has settled. Free the
-            # gate slot or the set would grow without bound across a long run.
+            # The window is over, so any position in it has settled. Realize the
+            # PnL and free the gate slot, or the set would grow without bound.
             if self._executor is not None:
+                self._executor.risk.close_market(slug)
+                self._executor.risk.check_breakers()
                 self._executor.release_market(slug)
 
     def active_markets(self) -> list[TrackedMarket]:
@@ -1251,9 +1946,22 @@ class SignalEngine:
             return
 
         mono = time.monotonic()
+        empty = Quote(bid=None, ask=None)
         for market in markets:
-            up_bid, up_ask = quotes.get(market.up_token, (None, None))
-            down_bid, down_ask = quotes.get(market.down_token, (None, None))
+            up_q = quotes.get(market.up_token, empty)
+            down_q = quotes.get(market.down_token, empty)
+            up_bid, up_ask = up_q.bid, up_q.ask
+            down_bid, down_ask = down_q.bid, down_q.ask
+
+            # Adopt the venue's live tick/min-size over the Gamma snapshot.
+            for quote in (up_q, down_q):
+                if quote.tick_size:
+                    market.tick_size = quote.tick_size
+                if quote.min_order_size:
+                    market.min_order_size = quote.min_order_size
+                if quote.neg_risk is not None:
+                    market.neg_risk = quote.neg_risk
+
             if up_ask is None and down_ask is None:
                 continue
             market.books.append(
@@ -1265,6 +1973,26 @@ class SignalEngine:
                     down_bid=down_bid,
                 )
             )
+            if self._executor is not None:
+                # Mark to the best BID - the price we could actually exit at.
+                # Marking to the mid would flatter the book and let a real
+                # drawdown hide from the breaker.
+                #
+                # When a side has no bid at all, fall back to the complement of
+                # the opposite ask: the pair must sum to $1, so an Up with no
+                # bid and a Down offered at 0.99 is worth about 0.01. Without
+                # this a position that has gone worthless keeps its entry mark
+                # and stays invisible to the drawdown breaker right up until it
+                # settles - exactly when the breaker most needs to see it.
+                self._executor.risk.mark_to_market(
+                    market.up_token, _exit_mark(up_bid, down_ask)
+                )
+                self._executor.risk.mark_to_market(
+                    market.down_token, _exit_mark(down_bid, up_ask)
+                )
+
+        if self._executor is not None:
+            self._executor.risk.check_breakers()
 
     # -- evaluation --------------------------------------------------------- #
 
@@ -1272,6 +2000,18 @@ class SignalEngine:
         markets = self.active_markets()
         if not markets or not self._buffer.ready:
             return
+
+        # A tripped breaker suppresses signal generation entirely, not just
+        # order submission: logging tradeable edges we have no intention of
+        # taking trains the operator to ignore the banner.
+        if self._executor is not None:
+            allowed, why = self._executor.risk.trading_allowed()
+            if not allowed:
+                if self._risk_block_logged != why:
+                    log.warning("Signals suppressed: %s", why)
+                    self._risk_block_logged = why
+                return
+            self._risk_block_logged = ""
 
         move = self._buffer.largest_move(self._cfg.spike_lookback)
         if move is None or abs(move.bps) < self._cfg.spike_bps:
@@ -1412,8 +2152,21 @@ class SignalEngine:
             )
             return
 
-        size = executor.order_size
-        limit = ask + executor.slippage_ticks * market.tick_size
+        limit = quantize_price(
+            ask + executor.slippage_ticks * market.tick_size, market.tick_size, BUY
+        )
+        size = executor.size_for(limit, market)
+        if size <= 0.0:
+            log.warning(
+                " execution   : %s | SKIPPED - no legal size at %.3f "
+                "(available $%.2f, min size %g)",
+                market.slug,
+                limit,
+                executor.risk.available(),
+                market.min_order_size,
+            )
+            executor.release_market(market.slug)
+            return
 
         result = await executor.execute_arb_order(
             token_id,
@@ -1426,6 +2179,14 @@ class SignalEngine:
         )
 
         if result.ok:
+            executor.risk.open_position(
+                market.slug,
+                token_id,
+                token_label,
+                result.filled_size,
+                result.price,
+                reserved=result.reserved,
+            )
             expected = result.filled_size * (p_fair - result.price)
             executor.record_expected_pnl(expected)
             log.warning(
@@ -1489,8 +2250,26 @@ class SignalEngine:
             )
             return
 
-        size = executor.order_size
         slip = executor.slippage_ticks * market.tick_size
+        up_limit = quantize_price(up_ask + slip, market.tick_size, BUY)
+        down_limit = quantize_price(down_ask + slip, market.tick_size, BUY)
+
+        # Both legs must be the same size or the pair is not actually hedged, so
+        # size the pair off their combined cost and use the smaller of the two.
+        size = min(
+            executor.size_for(up_limit, market, pair_price=up_limit + down_limit),
+            executor.size_for(down_limit, market, pair_price=up_limit + down_limit),
+        )
+        if size <= 0.0:
+            log.warning(
+                " execution   : %s | SKIPPED - no legal paired size "
+                "(available $%.2f, min size %g)",
+                market.slug,
+                executor.risk.available(),
+                market.min_order_size,
+            )
+            executor.release_market(market.slug)
+            return
 
         # Both legs are submitted concurrently. Sequencing them would leave the
         # second leg exposed to the book moving between the two round-trips,
@@ -1499,7 +2278,7 @@ class SignalEngine:
             executor.execute_arb_order(
                 market.up_token,
                 BUY,
-                up_ask + slip,
+                up_limit,
                 size,
                 order_type="FOK",
                 tick_size=market.tick_size,
@@ -1508,7 +2287,7 @@ class SignalEngine:
             executor.execute_arb_order(
                 market.down_token,
                 BUY,
-                down_ask + slip,
+                down_limit,
                 size,
                 order_type="FOK",
                 tick_size=market.tick_size,
@@ -1518,6 +2297,15 @@ class SignalEngine:
 
         log.warning(" execution   : %s | UP  leg | %s", market.slug, up_result.summary())
         log.warning(" execution   : %s | DOWN leg | %s", market.slug, down_result.summary())
+
+        for leg, token, label in (
+            (up_result, market.up_token, "YES"),
+            (down_result, market.down_token, "NO"),
+        ):
+            if leg.ok:
+                executor.risk.open_position(
+                    market.slug, token, label, leg.filled_size, leg.price, reserved=leg.reserved
+                )
 
         if up_result.ok and down_result.ok:
             paired = min(up_result.filled_size, down_result.filled_size)
@@ -1559,6 +2347,15 @@ class SignalEngine:
 # --------------------------------------------------------------------------- #
 
 
+def _exit_mark(own_bid: float | None, opposite_ask: float | None) -> float | None:
+    """Best available estimate of what this leg could be sold for."""
+    if own_bid is not None:
+        return own_bid
+    if opposite_ask is not None:
+        return max(0.0, min(1.0, 1.0 - opposite_ask))
+    return None
+
+
 def _fmt_clock(unix_ts: float) -> str:
     return time.strftime("%H:%M:%S", time.gmtime(unix_ts)) + "Z"
 
@@ -1569,7 +2366,9 @@ class Scanner:
         self._buffer = PriceBuffer()
         self._stream = BinanceTradeStream(self._buffer, cfg.ws_endpoints)
         self._books = BookFeed()
-        self._executor = Executor(cfg.execution, Credentials.from_env())
+        self._executor = Executor(
+            cfg.execution, Credentials.from_env(), RiskManager(cfg.risk)
+        )
         self._engine = SignalEngine(self._buffer, self._books, cfg, self._executor)
 
     async def run(self) -> None:
@@ -1638,7 +2437,7 @@ class Scanner:
             move = self._buffer.largest_move(self._cfg.spike_lookback)
             log.info(
                 "hb | %s | spot=%s | sigma=%.2f bps/s | ws=%s lat=%.0fms ticks=%d "
-                "| 3s move=%+.1f bps | %s | markets=%s",
+                "| 3s move=%+.1f bps | %s | %s | markets=%s",
                 "DRY" if self._executor.dry_run else "LIVE",
                 f"{last.price:,.2f}" if last else "n/a",
                 self._buffer.sigma_per_sqrt_second() * 10_000.0,
@@ -1647,6 +2446,7 @@ class Scanner:
                 self._buffer.tick_count,
                 move.bps if move else 0.0,
                 self._executor.stats(),
+                self._executor.risk.stats(),
                 ", ".join(
                     f"{m.horizon}:{_quote(m)}@{m.seconds_remaining():.0f}s" for m in markets
                 )
@@ -1727,6 +2527,55 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     execution.add_argument(
         "--env-file", default=".env", help="path to the dotenv file holding credentials"
     )
+
+    risk = parser.add_argument_group("risk management")
+    risk.add_argument(
+        "--max-risk-pct",
+        type=float,
+        default=2.0,
+        help="percent of bankroll put at risk per trade (binaries risk the full premium)",
+    )
+    risk.add_argument(
+        "--fixed-size",
+        action="store_true",
+        help="disable dynamic sizing and always use --size contracts",
+    )
+    risk.add_argument(
+        "--max-drawdown-pct",
+        type=float,
+        default=5.0,
+        help="percent peak-to-trough session drawdown that trips the breaker",
+    )
+    risk.add_argument(
+        "--max-drawdown-usd",
+        type=float,
+        default=100.0,
+        help="absolute USDC drawdown that trips the breaker (whichever binds first)",
+    )
+    risk.add_argument(
+        "--max-consecutive-losses",
+        type=int,
+        default=3,
+        help="losing or failed trades in a row before halting the session",
+    )
+    risk.add_argument(
+        "--risk-cooldown",
+        type=float,
+        default=300.0,
+        help="protective pause after a drawdown trip, seconds",
+    )
+    risk.add_argument(
+        "--max-drawdown-trips",
+        type=int,
+        default=3,
+        help="drawdown trips tolerated before the session halts permanently",
+    )
+    risk.add_argument(
+        "--paper-bankroll",
+        type=float,
+        default=1000.0,
+        help="simulated bankroll for dry runs, where there is no wallet to read",
+    )
     parser.add_argument("--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -1752,6 +2601,16 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             order_size=args.size,
             max_notional=args.max_notional,
             slippage_ticks=args.slippage_ticks,
+        ),
+        risk=RiskSettings(
+            max_risk_pct=args.max_risk_pct / 100.0,
+            dynamic_sizing=not args.fixed_size,
+            max_drawdown_pct=args.max_drawdown_pct / 100.0,
+            max_drawdown_usd=args.max_drawdown_usd,
+            max_consecutive_losses=args.max_consecutive_losses,
+            risk_cooldown=args.risk_cooldown,
+            max_drawdown_trips=args.max_drawdown_trips,
+            paper_bankroll=args.paper_bankroll,
         ),
     )
 

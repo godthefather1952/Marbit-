@@ -26,14 +26,23 @@ from btc_polymarket_arb import (
     BinanceTradeStream,
     BookFeed,
     Config,
+    Quote,
     Credentials,
     ExecutionSettings,
     Executor,
     PriceBuffer,
+    RetryableError,
+    RiskManager,
+    RiskSettings,
     SignalEngine,
     TrackedMarket,
+    _scale_usdc,
+    _usdc,
+    is_retryable,
     quantize_price,
+    retry_async,
 )
+from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY, SELL
 
 BASE = 100_000.0
@@ -61,8 +70,12 @@ class StubBookFeed(BookFeed):
     async def fetch(self, token_ids):  # type: ignore[override]
         self.calls += 1
         return {
-            "UP_TOKEN": (round(self.up_ask - 0.01, 4), self.up_ask),
-            "DOWN_TOKEN": (round(self.down_ask - 0.01, 4), self.down_ask),
+            "UP_TOKEN": Quote(
+                bid=round(self.up_ask - 0.01, 4), ask=self.up_ask, tick_size=0.01
+            ),
+            "DOWN_TOKEN": Quote(
+                bid=round(self.down_ask - 0.01, 4), ask=self.down_ask, tick_size=0.01
+            ),
         }
 
 
@@ -146,6 +159,16 @@ class LogCapture:
         return sum(1 for r in self.records if needle in r.getMessage())
 
 
+def fixed_size_risk(**kw) -> RiskSettings:
+    """Deterministic sizing so signal-path assertions stay focused.
+
+    Dynamic sizing is exercised separately in test_dynamic_sizing.
+    """
+    kw.setdefault("dynamic_sizing", False)
+    kw.setdefault("paper_bankroll", 1_000.0)
+    return RiskSettings(**kw)
+
+
 async def drive(
     *,
     up_ask: float,
@@ -154,7 +177,9 @@ async def drive(
     enforce_ceiling: bool = True,
     cooldown: float = 5.0,
     settings: ExecutionSettings | None = None,
+    risk_settings: RiskSettings | None = None,
     executor: Executor | None = None,
+    connect: bool = True,
     run_for: float | None = None,
     on_tick=None,
 ) -> tuple[LogCapture, Executor, int]:
@@ -164,7 +189,12 @@ async def drive(
     for that many seconds so repeat-suppression can be counted.
     """
     exec_settings = settings or ExecutionSettings(dry_run=True, order_size=10.0)
-    executor = executor or Executor(exec_settings)
+    if executor is None:
+        executor = Executor(
+            exec_settings, Credentials(), RiskManager(risk_settings or fixed_size_risk())
+        )
+    if connect:
+        await executor.connect()  # seeds the paper bankroll
     ticks = 0
 
     with LogCapture() as logs:
@@ -352,7 +382,7 @@ async def test_position_gate() -> None:
     )
 
     # The gate is per-market, and must be cleared when the window retires.
-    ex = Executor(ExecutionSettings(dry_run=True))
+    ex = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk()))
     got_first = await ex.acquire_market("mkt-a")
     got_again = await ex.acquire_market("mkt-a")
     got_other = await ex.acquire_market("mkt-b")
@@ -385,7 +415,12 @@ async def test_safety_gates() -> None:
     print("\n--- safety gates ---")
 
     # Notional cap.
-    ex = Executor(ExecutionSettings(dry_run=True, order_size=1000.0, max_notional=50.0))
+    ex = Executor(
+        ExecutionSettings(dry_run=True, order_size=1000.0, max_notional=50.0),
+        Credentials(),
+        RiskManager(fixed_size_risk()),
+    )
+    await ex.connect()
     res = await ex.execute_arb_order("TOK", BUY, 0.45, 1000.0)
     check(
         "notional cap blocks an oversized order",
@@ -408,7 +443,7 @@ async def test_safety_gates() -> None:
     )
 
     # Dry run arms regardless of missing credentials.
-    ex = Executor(ExecutionSettings(dry_run=True), Credentials())
+    ex = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk()))
     check("dry run arms without any credentials", await ex.connect())
 
     # Circuit breaker.
@@ -416,8 +451,13 @@ async def test_safety_gates() -> None:
         def _submit(self, *a, **kw):
             raise RuntimeError("venue on fire")
 
-    ex = ExplodingExecutor(ExecutionSettings(dry_run=False, max_consecutive_errors=3))
-    ex._client = object()  # bypass connect(); we only exercise the error path
+    ex = ExplodingExecutor(
+        ExecutionSettings(dry_run=False, max_consecutive_errors=3),
+        Credentials(),
+        RiskManager(fixed_size_risk(max_consecutive_losses=99)),
+    )
+    ex.risk.bankroll = 1_000.0  # bypass connect(); we only exercise the error path
+    ex._client = object()
     for _ in range(3):
         await ex.execute_arb_order("TOK", BUY, 0.45, 10.0)
     check("circuit breaker trips after repeated failures", ex.halted)
@@ -442,6 +482,430 @@ async def test_safety_gates() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Balance, allowance and dynamic sizing
+# --------------------------------------------------------------------------- #
+
+
+async def test_balance_and_sizing() -> None:
+    print("\n--- balance & dynamic sizing ---")
+
+    # The CLOB has returned raw 6-decimal integers, plain decimals, and a
+    # nested allowances map. All three must parse, or sizing silently zeroes.
+    shapes = [
+        ({"balance": "1234560000"}, 1234.56),
+        ({"balance": "1234.56"}, 1234.56),
+        ({"balance": 1234560000}, 1234.56),
+        ({"allowances": {"exchange": "50000000"}}, 50.0),
+        ({"nothing": "1"}, None),
+    ]
+    ok = all(
+        (_usdc(p, "balance", "allowance", "allowances") is None and want is None)
+        or abs((_usdc(p, "balance", "allowance", "allowances") or -1) - (want or -1)) < 1e-6
+        for p, want in shapes
+    )
+    check("USDC parses across every response shape the CLOB returns", ok)
+    check("a malformed amount yields None, not a silent zero", _scale_usdc("abc") is None)
+
+    risk = RiskManager(RiskSettings(max_risk_pct=0.02))
+    risk.bankroll = 1_000.0
+    risk.peak_equity = 1_000.0
+    size = risk.size_for(0.45, max_notional=50.0, min_size=5.0)
+    check(
+        "2% of a $1000 bankroll sizes to $20 of premium",
+        abs(size * 0.45 - 20.0) < 0.01,
+        f"size={size} notional=${size * 0.45:.2f}",
+    )
+
+    capped = risk.size_for(0.45, max_notional=10.0, min_size=5.0)
+    check(
+        "max-notional overrides the risk percentage when tighter",
+        abs(capped * 0.45 - 10.0) < 0.01,
+        f"notional=${capped * 0.45:.2f}",
+    )
+
+    check(
+        "a size below the venue minimum returns 0 (do not trade)",
+        risk.size_for(0.45, max_notional=1.0, min_size=5.0) == 0.0,
+    )
+
+    # Realized losses must shrink both buying power and the risk budget.
+    risk.realized_pnl = -300.0
+    check(
+        "realized losses reduce buying power",
+        abs(risk.available() - 700.0) < 1e-6,
+        f"available=${risk.available():.2f}",
+    )
+    shrunk = risk.size_for(0.45, max_notional=50.0, min_size=5.0)
+    check(
+        "risk budget scales down with equity",
+        abs(shrunk * 0.45 - 14.0) < 0.01,
+        f"notional=${shrunk * 0.45:.2f} (2% of $700)",
+    )
+
+    risk.allowance = 100.0
+    check(
+        "allowance caps available funds below cash",
+        abs(risk.available() - 100.0) < 1e-6,
+        f"available=${risk.available():.2f}",
+    )
+
+    # Pre-flight: an order larger than free funds is refused before signing.
+    ex = Executor(
+        ExecutionSettings(dry_run=True, max_notional=500.0),
+        Credentials(),
+        RiskManager(RiskSettings()),
+    )
+    ex.risk.bankroll = 10.0
+    res = await ex.execute_arb_order("TOK", BUY, 0.50, 100.0)  # $50 of a $10 wallet
+    check(
+        "pre-flight balance check blocks an unfundable order",
+        not res.ok and "insufficient unlocked funds" in (res.error or ""),
+        res.error or "",
+    )
+    check("blocked order never reaches the venue", ex.orders_sent == 0)
+    check("failed reservation leaves no committed capital", ex.risk.committed == 0.0)
+
+    # Concurrent legs must not both claim the same funds.
+    ex2 = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(RiskSettings()))
+    ex2.risk.bankroll = 30.0
+    r1, r2 = await asyncio.gather(
+        ex2.execute_arb_order("A", BUY, 0.50, 40.0),  # $20
+        ex2.execute_arb_order("B", BUY, 0.50, 40.0),  # $20 - only one fits
+    )
+    check(
+        "capital reservation stops two concurrent legs over-committing",
+        [r1.ok, r2.ok].count(True) == 1,
+        f"ok={[r1.ok, r2.ok]}",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Session risk breakers
+# --------------------------------------------------------------------------- #
+
+
+async def test_risk_breakers() -> None:
+    print("\n--- session risk breakers ---")
+
+    # Drawdown: tighter of (pct of peak, absolute USD) binds.
+    risk = RiskManager(
+        RiskSettings(
+            max_drawdown_pct=0.05,
+            max_drawdown_usd=100.0,
+            risk_cooldown=0.4,
+            max_drawdown_trips=2,
+            max_consecutive_losses=99,
+        )
+    )
+    risk.bankroll = 1_000.0
+    risk.peak_equity = 1_000.0
+
+    risk.realized_pnl = -40.0
+    check("drawdown inside the limit does not trip", risk.check_breakers() is None)
+    check("trading still allowed at -$40", risk.trading_allowed()[0])
+
+    risk.realized_pnl = -55.0  # 5% of $1000 = $50 limit
+    tripped = risk.check_breakers()
+    check("drawdown past the limit trips the breaker", tripped is not None)
+    check("tripped breaker blocks trading", not risk.trading_allowed()[0])
+    check("trip enters a timed cooldown, not a permanent halt", not risk.halted_permanently)
+
+    await asyncio.sleep(0.5)
+    check("trading resumes after the cooldown expires", risk.trading_allowed()[0])
+    check(
+        "peak is re-baselined so the same loss does not instantly re-trip",
+        abs(risk.peak_equity - 945.0) < 1e-6,
+        f"peak=${risk.peak_equity:.2f}",
+    )
+
+    risk.realized_pnl = -110.0
+    risk.check_breakers()
+    check(
+        "exhausting the trip budget halts the session permanently",
+        risk.halted_permanently and risk.drawdown_trips == 2,
+        f"trips={risk.drawdown_trips}",
+    )
+
+    # Consecutive losses, from failed executions.
+    risk2 = RiskManager(
+        RiskSettings(max_consecutive_losses=3, max_drawdown_usd=1e9, max_drawdown_pct=1.0)
+    )
+    risk2.bankroll = 1_000.0
+    risk2.peak_equity = 1_000.0
+    for _ in range(2):
+        risk2.note_execution_failure()
+        risk2.check_breakers()
+    check("two failures do not yet halt", not risk2.halted_permanently)
+    risk2.note_execution_failure()
+    risk2.check_breakers()
+    check(
+        "three consecutive failures halt the session",
+        risk2.halted_permanently and not risk2.trading_allowed()[0],
+        risk2.halt_reason,
+    )
+
+    # Losing closes also count, and a win resets the streak.
+    risk3 = RiskManager(
+        RiskSettings(max_consecutive_losses=3, max_drawdown_usd=1e9, max_drawdown_pct=1.0)
+    )
+    risk3.bankroll = 1_000.0
+    risk3.peak_equity = 1_000.0
+    risk3.open_position("m1", "t1", "YES", 10, 0.60)
+    risk3.mark_to_market("t1", 0.10)
+    risk3.close_market("m1")
+    check(
+        "a losing close realizes PnL and increments the streak",
+        risk3.consecutive_losses == 1 and abs(risk3.realized_pnl + 5.0) < 1e-6,
+        f"streak={risk3.consecutive_losses} realized={risk3.realized_pnl:+.2f}",
+    )
+    risk3.open_position("m2", "t2", "YES", 10, 0.40)
+    risk3.mark_to_market("t2", 0.90)
+    risk3.close_market("m2")
+    check(
+        "a winning close resets the consecutive-loss streak",
+        risk3.consecutive_losses == 0,
+        f"streak={risk3.consecutive_losses} realized={risk3.realized_pnl:+.2f}",
+    )
+
+    # End to end: a halted breaker suppresses signals, not just orders.
+    halted = Executor(
+        ExecutionSettings(dry_run=True, order_size=10.0),
+        Credentials(),
+        RiskManager(fixed_size_risk(max_consecutive_losses=1)),
+    )
+    halted.risk.bankroll = 1_000.0
+    halted.risk.peak_equity = 1_000.0
+    halted.risk.note_execution_failure()
+    halted.risk.check_breakers()
+    logs, ex, _ = await drive(
+        up_ask=0.45, down_ask=0.56, executor=halted, connect=False, run_for=3.0
+    )
+    check(
+        "a halted session emits no signal banners at all",
+        logs.count("ARBITRAGE WINDOW OPEN") == 0,
+        f"{logs.count('ARBITRAGE WINDOW OPEN')} banners",
+    )
+    check("a halted session submits no orders", ex.orders_sent == 0)
+    check(
+        "suppression is announced once, not per tick",
+        logs.count_all("Signals suppressed") == 1,
+        f"{logs.count_all('Signals suppressed')} notices",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Retry / rate-limit handling
+# --------------------------------------------------------------------------- #
+
+
+async def test_retry_backoff() -> None:
+    print("\n--- retry & rate-limit handling ---")
+
+    check("429 is classified retryable", is_retryable(RetryableError("rate", status=429)))
+    check("503 is classified retryable", is_retryable(RetryableError("busy", status=503)))
+    check("400 is NOT retryable", not is_retryable(RetryableError("bad", status=400)))
+    check("timeouts are retryable", is_retryable(asyncio.TimeoutError()))
+
+    poly = PolyApiException(error_msg="rate limited")
+    poly.status_code = 429
+    check("PolyApiException 429 is classified retryable", is_retryable(poly))
+    poly_bad = PolyApiException(error_msg="bad request")
+    poly_bad.status_code = 400
+    check("PolyApiException 400 is not retried", not is_retryable(poly_bad))
+
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RetryableError("429 Too Many Requests", status=429)
+        return "recovered"
+
+    result = await retry_async(flaky, attempts=4, base_delay=0.01, label="test")
+    check(
+        "backoff retries through 429s and returns the eventual success",
+        result == "recovered" and calls["n"] == 3,
+        f"attempts={calls['n']}",
+    )
+
+    hard = {"n": 0}
+
+    async def always_400():
+        hard["n"] += 1
+        raise RetryableError("400 Bad Request", status=400)
+
+    try:
+        await retry_async(always_400, attempts=4, base_delay=0.01, label="test")
+        raised = False
+    except RetryableError:
+        raised = True
+    check(
+        "a non-retryable status fails immediately without burning attempts",
+        raised and hard["n"] == 1,
+        f"attempts={hard['n']}",
+    )
+
+    exhaust = {"n": 0}
+
+    async def always_429():
+        exhaust["n"] += 1
+        raise RetryableError("429", status=429)
+
+    try:
+        await retry_async(always_429, attempts=3, base_delay=0.01, label="test")
+        raised = False
+    except RetryableError:
+        raised = True
+    check(
+        "retries are bounded and the final failure propagates",
+        raised and exhaust["n"] == 3,
+        f"attempts={exhaust['n']}",
+    )
+
+    # A server-sent Retry-After must win over the computed backoff.
+    slow = {"n": 0}
+
+    async def retry_after():
+        slow["n"] += 1
+        if slow["n"] == 1:
+            raise RetryableError("429", status=429, retry_after=0.35)
+        return "ok"
+
+    started = time.monotonic()
+    await retry_async(retry_after, attempts=3, base_delay=0.001, label="test")
+    waited = time.monotonic() - started
+    check(
+        "Retry-After overrides the computed backoff delay",
+        waited >= 0.3,
+        f"waited {waited:.2f}s for a 0.35s hint",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reconnect resilience
+# --------------------------------------------------------------------------- #
+
+
+async def test_reconnect_resilience() -> None:
+    print("\n--- reconnect resilience ---")
+
+    buf = PriceBuffer()
+    for _ in range(30):
+        buf.add(BASE, 0)
+    check("buffer is ready with clean history", buf.ready)
+
+    buf.reset("test disconnect", warmup=0.4)
+    check("reset drops the stale tick window", buf.last() is None)
+    check("reset enters warm-up", buf.warming_up)
+    buf.add(BASE * 1.01, 0)
+    buf.add(BASE * 1.01, 0)
+    check(
+        "no signal is possible during warm-up even with ticks present",
+        not buf.ready,
+        "prevents a phantom spike across the gap",
+    )
+    check(
+        "largest_move cannot see across the gap",
+        (buf.largest_move(3.0) is None) or abs(buf.largest_move(3.0).bps) < 1e-6,
+    )
+    await asyncio.sleep(0.5)
+    check("buffer becomes ready again after warm-up", buf.ready)
+
+    # The stream must reset the buffer when the tape drops.
+    async def slam_shut(ws):
+        await ws.close()
+
+    buf2 = PriceBuffer()
+    for _ in range(5):
+        buf2.add(BASE, 0)
+    ex = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk()))
+    await ex.acquire_market("btc-updown-5m-LOCKED")
+    ex.risk.open_position("btc-updown-5m-LOCKED", "TOK", "YES", 10, 0.45)
+
+    async with serve(slam_shut, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        stream = BinanceTradeStream(buf2, [f"ws://127.0.0.1:{port}"])
+        tape = asyncio.create_task(stream.run())
+        await asyncio.sleep(1.2)  # allow at least one connect/drop cycle
+        tape.cancel()
+        await asyncio.gather(tape, return_exceptions=True)
+
+    check(
+        "a dropped tape resets the price buffer",
+        buf2.resets >= 1,
+        f"{buf2.resets} resets",
+    )
+    check(
+        "reconnect does NOT clear active_positions",
+        ex.active_positions == {"btc-updown-5m-LOCKED"},
+        f"{ex.active_positions}",
+    )
+    check(
+        "reconnect does NOT disturb open positions or PnL",
+        len(ex.risk.positions) == 1,
+        f"{len(ex.risk.positions)} positions held",
+    )
+
+    # A worthless leg with no bid must still mark down, or a real loss stays
+    # invisible to the drawdown breaker until the moment it settles.
+    class OneSidedBook(BookFeed):
+        def __init__(self):  # noqa: super-init-not-called
+            self.calls = 0
+
+        async def fetch(self, token_ids):  # type: ignore[override]
+            self.calls += 1
+            return {
+                "UP_TOKEN": Quote(bid=None, ask=None, tick_size=0.001),
+                "DOWN_TOKEN": Quote(bid=0.98, ask=0.99, tick_size=0.001),
+            }
+
+    ex2 = Executor(ExecutionSettings(dry_run=True), Credentials(), RiskManager(fixed_size_risk()))
+    ex2.risk.bankroll = 1_000.0
+    ex2.risk.peak_equity = 1_000.0
+    ex2.risk.open_position("btc-updown-5m-TEST", "UP_TOKEN", "YES", 100, 0.40)
+    engine = SignalEngine(PriceBuffer(), OneSidedBook(), Config(), ex2)
+    engine.sync_markets([make_market()])
+    await engine.refresh_books()
+    marked = ex2.risk.positions["btc-updown-5m-TEST:UP_TOKEN"].mark
+    check(
+        "a bidless leg marks off the opposite ask, not its entry price",
+        abs(marked - 0.01) < 1e-9,
+        f"mark={marked} (1 - 0.99), unrealized {ex2.risk.unrealized_pnl():+.2f}",
+    )
+    check(
+        "that loss is visible to the drawdown breaker",
+        ex2.risk.drawdown() > 38.0,
+        f"drawdown=${ex2.risk.drawdown():.2f}",
+    )
+
+    # The venue's live tick size must override the Gamma snapshot: Polymarket
+    # tightens the tick for extreme prices, and quantizing onto a stale 0.01
+    # grid would price an order 10x away from the resting liquidity.
+    market = engine._markets["btc-updown-5m-TEST"]
+    check(
+        "live book tick size overrides the Gamma snapshot",
+        abs(market.tick_size - 0.001) < 1e-9,
+        f"tick={market.tick_size} (Gamma said 0.01)",
+    )
+    check(
+        "a 0.001 ask quantizes onto the tightened grid",
+        abs(quantize_price(0.001, market.tick_size, BUY) - 0.001) < 1e-9,
+        f"got {quantize_price(0.001, market.tick_size, BUY)}",
+    )
+
+    # A stalled tape must not poison the volatility estimate.
+    buf3 = PriceBuffer()
+    now = time.monotonic()
+    buf3._bars.extend([(now - 400 + i, BASE) for i in range(60)])
+    buf3._bars.append((now, BASE * 1.05))  # 5% jump across a long gap
+    check(
+        "vol estimator ignores returns spanning a tape gap",
+        buf3.sigma_per_sqrt_second() < 1e-4,
+        f"sigma={buf3.sigma_per_sqrt_second():.2e}",
+    )
+
+
+# --------------------------------------------------------------------------- #
 
 
 async def main() -> None:
@@ -451,6 +915,10 @@ async def main() -> None:
     await test_dry_run_execution()
     await test_position_gate()
     await test_safety_gates()
+    await test_balance_and_sizing()
+    await test_risk_breakers()
+    await test_retry_backoff()
+    await test_reconnect_resilience()
     print("=" * 68)
     total = len(PASSED) + len(FAILED)
     if FAILED:
