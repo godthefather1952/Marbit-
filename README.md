@@ -254,6 +254,71 @@ PnL is realized when a market retires, using the last mark. By expiry the book
 has converged to ~0 or ~1, so the mark is a close proxy — but it is a proxy, not
 settlement-confirmed accounting.
 
+## Kalshi — the venue that actually has this instrument
+
+Kalshi is CFTC-regulated (so US-accessible) and lists **`KXBTC15M` — "BTC price
+up in next 15 mins?"**, structurally the same contract as Polymarket's
+`btc-updown-15m`. Verified live: 1c spreads, ~870k contracts traded in a single
+15-minute window, an order of magnitude deeper than the Polymarket equivalent.
+
+Settlement, verbatim from their API:
+
+> *"If the simple average of the sixty seconds of CF Benchmarks' BRTI before
+> HH:15 is at least the simple average of the sixty seconds of BRTI before
+> HH:00, then the market resolves to Yes."*
+
+Same 60-second TWAP structure, so the piecewise `effective_tau` haircut derived
+for Polymarket transfers unchanged. And Kalshi **publishes the strike**
+(`floor_strike`), so fair value is computed outright instead of via the
+strike-free delta-shift workaround Polymarket forced.
+
+```bash
+python kalshi_monitor.py                 # read-only, no orders, no credentials
+python kalshi_monitor.py --min-edge 0.02
+```
+
+### The two things that decide viability
+
+**1. Fees are not a rounding error.** Kalshi charges `0.07 x contracts x P x
+(1-P)`, rounded up to the cent — quadratic, so it *peaks at 50c*, which is
+exactly where these markets open.
+
+| ask | fee/contract | share of a 3c gross edge |
+|---|---:|---:|
+| $0.05 | 0.33c | 11% |
+| $0.20 | 1.12c | 37% |
+| **$0.50** | **1.75c** | **58%** |
+
+Every edge the monitor prints is net of this. Polymarket was effectively free;
+here the trade is much better at the extremes than near the money.
+
+**2. The reference feed must be USD-quoted, not USDT.**
+
+> This one produced a phantom 29-cent edge that persisted for minutes on a
+> market with 870k volume — which is how it was caught. Settlement is BRTI, a
+> **USD** index. Binance quotes **USDT**, and USDT/USD routinely drifts 5-15
+> bps from parity. Measured live: Binance $63,841.94 against a USD composite of
+> $63,766.69, a **+11.8 bps premium** — the same order of magnitude as an
+> entire 15-minute BTC move, and a *biased* error rather than noise that
+> averages out.
+
+With Binance the model said `fair 0.617` while the market quoted `0.31/0.32`.
+Switching to Coinbase BTC-USD (a BRTI constituent) it tracks within a cent:
+
+```
+spot=$63,772 strike=$63,777 | fair=0.478 | market 0.470/0.480
+spot=$63,766 strike=$63,777 | fair=0.453 | market 0.470/0.480
+```
+
+`kalshi_monitor.py --binance` reproduces the error deliberately.
+
+### Read-only, enforced
+
+`kalshi.py` has no order-placing method and issues zero POST/PUT/DELETE
+requests, both asserted by the suite. Auth is RSA-PSS SHA256 over
+`{timestamp}{METHOD}{path}` with the query string **excluded** — differing from
+Polymarket US, which includes it.
+
 ## Two different Polymarket exchanges
 
 `polymarket.com` and `polymarket.us` are **separate venues** with separate

@@ -1407,6 +1407,210 @@ async def test_polymarket_us() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Kalshi adapter (read-only)
+# --------------------------------------------------------------------------- #
+
+
+async def test_kalshi() -> None:
+    print("\n--- kalshi adapter (read-only) ---")
+
+    import inspect
+
+    import kalshi as kx
+    from kalshi import (
+        KalshiBook,
+        KalshiClient,
+        KalshiCredentials,
+        breakeven_fair_value,
+        fee_per_contract,
+        net_edge,
+        parse_market,
+        quantize_kalshi_price,
+        trading_fee,
+    )
+
+    # Read-only, same property as the Polymarket US adapter.
+    methods = [
+        n for n, _ in inspect.getmembers(KalshiClient, inspect.isfunction)
+        if not n.startswith("_")
+    ]
+    banned = [m for m in methods if any(w in m.lower() for w in
+              ("order", "cancel", "modify", "create", "place", "submit", "buy", "sell"))]
+    banned = [m for m in banned if m != "orderbook"]  # orderbook is a read
+    check("the Kalshi client exposes no order-placing method", not banned, f"{methods}")
+    src = inspect.getsource(kx)
+    check(
+        "the Kalshi module issues no POST/PUT/DELETE",
+        sum(src.count(f".{v}(") for v in ("post", "put", "delete")) == 0,
+    )
+
+    # Fees. This is what decides whether the strategy is viable at all.
+    check("fee is zero outside (0,1)", trading_fee(0.0, 10) == 0 and trading_fee(1.0, 10) == 0)
+    check(
+        "fee peaks at 50c, which is where these markets open",
+        abs(fee_per_contract(0.50) - 0.0175) < 1e-9,
+        f"{fee_per_contract(0.50) * 100:.2f}c/contract",
+    )
+    check(
+        "fee is smaller at the extremes",
+        fee_per_contract(0.05) < fee_per_contract(0.20) < fee_per_contract(0.50),
+    )
+    check(
+        "total fee rounds UP to the cent",
+        abs(trading_fee(0.50, 20) - 0.35) < 1e-9,
+        f"20 contracts @ 0.50 = ${trading_fee(0.50, 20):.2f}",
+    )
+    check(
+        "net edge subtracts the fee from the gross",
+        abs(net_edge(0.55, 0.50) - (0.05 - 0.0175)) < 1e-9,
+        f"gross 0.05 -> net {net_edge(0.55, 0.50):.4f}",
+    )
+    check(
+        "breakeven fair value sits above the ask by exactly the fee",
+        abs(breakeven_fair_value(0.50) - 0.5175) < 1e-9,
+    )
+    check(
+        "a 3c gross edge at 50c is more than half consumed by fees",
+        net_edge(0.53, 0.50) < 0.015,
+        f"net {net_edge(0.53, 0.50) * 100:.2f}c of a 3c gross edge",
+    )
+
+    # Tapered tick ladder.
+    ladder = [
+        {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+        {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+        {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+    ]
+    check(
+        "sub-cent ticks are honoured below $0.10",
+        abs(quantize_kalshi_price(0.0990, ladder, True) - 0.099) < 1e-9,
+        f"0.0990 -> {quantize_kalshi_price(0.0990, ladder, True)}",
+    )
+    check(
+        "cent ticks apply in the middle band",
+        abs(quantize_kalshi_price(0.1234, ladder, True) - 0.13) < 1e-9,
+        f"0.1234 -> {quantize_kalshi_price(0.1234, ladder, True)}",
+    )
+    check(
+        "sub-cent ticks return above $0.90",
+        abs(quantize_kalshi_price(0.9123, ladder, True) - 0.913) < 1e-9,
+        f"0.9123 -> {quantize_kalshi_price(0.9123, ladder, True)}",
+    )
+    check(
+        "buys round up and sells round down",
+        quantize_kalshi_price(0.1234, ladder, True) > quantize_kalshi_price(0.1234, ladder, False),
+    )
+
+    # Book convention: both ladders are BIDS; the YES ask is the NO complement.
+    book = KalshiBook.from_payload({"orderbook_fp": {
+        "yes_dollars": [["0.0010", "5"], ["0.0850", "12"]],
+        "no_dollars": [["0.0010", "7"], ["0.9100", "9"]],
+    }})
+    check(
+        "YES ask is derived as 1 - best NO bid, not read off the yes ladder",
+        abs(book.yes_ask - 0.09) < 1e-9 and abs(book.yes_bid - 0.085) < 1e-9,
+        f"bid {book.yes_bid} / ask {book.yes_ask}",
+    )
+    check("mid sits between the two", abs(book.yes_mid - 0.0875) < 1e-9)
+    empty = KalshiBook.from_payload({"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})
+    check("an empty book yields None, not a false zero", empty.yes_ask is None)
+
+    # Market parsing and fair value from the PUBLISHED strike.
+    raw = {
+        "ticker": "KXBTC15M-TEST-15", "event_ticker": "KXBTC15M-TEST",
+        "title": "BTC price up in next 15 mins?", "floor_strike": "63777.35",
+        "open_time": "2026-08-13T06:15:00Z", "close_time": "2026-08-13T06:30:00Z",
+        "status": "active", "yes_bid_dollars": "0.47", "yes_ask_dollars": "0.48",
+        "volume_fp": "779773", "open_interest_fp": "354832", "price_ranges": ladder,
+    }
+    m = parse_market(raw)
+    check("market parses with its published strike", m is not None and m.strike == 63777.35)
+
+    now = m.close_ts - 600.0  # 10 minutes left
+    check(
+        "effective_tau matches the Polymarket derivation (tau - 2L/3)",
+        abs(m.effective_tau(now) - (600.0 - 40.0)) < 1e-6,
+        f"{m.effective_tau(now):.0f}s",
+    )
+    near = m.close_ts - 30.0  # inside the averaging window
+    check(
+        "the tau < L branch switches to tau/3",
+        abs(m.effective_tau(near) - 10.0) < 1e-6,
+        f"{m.effective_tau(near):.1f}s",
+    )
+
+    sigma = 0.8e-4
+    at_strike = m.fair_value(63777.35, sigma, now)
+    check("spot exactly at the strike prices near 50/50", abs(at_strike - 0.5) < 1e-6)
+    above = m.fair_value(63777.35 * 1.001, sigma, now)
+    below = m.fair_value(63777.35 * 0.999, sigma, now)
+    check(
+        "above the strike is more likely than below, symmetrically",
+        above > 0.5 > below and abs((above - 0.5) - (0.5 - below)) < 1e-3,
+        f"+10bps -> {above:.3f}, -10bps -> {below:.3f}",
+    )
+
+    # The USDT-vs-USD trap that produced a phantom 30-point edge live.
+    usdt_spot = 63_841.94          # Binance BTCUSDT
+    usd_spot = 63_766.69           # USD composite at the same instant
+    fair_wrong = m.fair_value(usdt_spot, sigma, now)
+    fair_right = m.fair_value(usd_spot, sigma, now)
+    check(
+        "a USDT-quoted feed misprices this USD-settled contract badly",
+        abs(fair_wrong - fair_right) > 0.20,
+        f"USDT feed {fair_wrong:.3f} vs USD feed {fair_right:.3f} "
+        f"= {abs(fair_wrong - fair_right) * 100:.0f} points of error",
+    )
+    check(
+        "the USD feed lands near the market's own quote (0.47/0.48)",
+        abs(fair_right - 0.475) < 0.10,
+        f"fair {fair_right:.3f} vs market 0.475",
+    )
+
+    # Credentials.
+    check("missing Kalshi credentials are reported", len(KalshiCredentials().problems()) == 2)
+    check(
+        "a non-PEM private key is rejected",
+        any("PEM" in p for p in KalshiCredentials(key_id="k", private_key_pem="nope").problems()),
+    )
+    check(
+        "describe() never leaks the key material",
+        "PRIVATE" not in KalshiCredentials(key_id="abcdefgh1234", private_key_pem="x").describe(),
+    )
+
+    # RSA-PSS signing, against a generated key.
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    signer = kx.RsaPssSigner(KalshiCredentials(key_id="test-key", private_key_pem=pem))
+    headers = signer.headers("GET", "/trade-api/v2/portfolio/balance")
+    check(
+        "signing produces the three KALSHI-ACCESS headers",
+        {"KALSHI-ACCESS-KEY", "KALSHI-ACCESS-TIMESTAMP", "KALSHI-ACCESS-SIGNATURE"} <= set(headers),
+    )
+    import base64 as _b64
+
+    message = f"{headers['KALSHI-ACCESS-TIMESTAMP']}GET/trade-api/v2/portfolio/balance".encode()
+    try:
+        key.public_key().verify(
+            _b64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"]),
+            message,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
+        verified = True
+    except Exception:
+        verified = False
+    check("signature verifies as RSA-PSS over `{timestamp}{METHOD}{path}`", verified)
+
+
+# --------------------------------------------------------------------------- #
 
 
 async def main() -> None:
@@ -1425,6 +1629,7 @@ async def main() -> None:
     await test_latency_profiler()
     await test_eval_loop_benchmark()
     await test_polymarket_us()
+    await test_kalshi()
     print("=" * 68)
     total = len(PASSED) + len(FAILED)
     if FAILED:
