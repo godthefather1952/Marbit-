@@ -46,8 +46,17 @@ from btc_polymarket_arb import (
     quantize_price,
     retry_async,
 )
-from py_clob_client.exceptions import PolyApiException
-from py_clob_client.order_builder.constants import BUY, SELL
+from btc_polymarket_arb import POLYMARKET_SDK
+
+# The Polymarket CLOB SDK is optional (see requirements-polymarket.txt). Without
+# it the venue-specific checks are skipped and everything else - model, risk,
+# resilience, Kalshi - still runs, so a light install can still verify itself.
+if POLYMARKET_SDK:
+    from py_clob_client.exceptions import PolyApiException
+    from py_clob_client.order_builder.constants import BUY, SELL
+else:  # pragma: no cover
+    PolyApiException = None
+    BUY, SELL = "BUY", "SELL"
 
 BASE = 100_000.0
 FLAT_TICKS = 40  # ~2s of flat tape, so a pre-spike book anchor exists
@@ -710,12 +719,13 @@ async def test_retry_backoff() -> None:
     check("400 is NOT retryable", not is_retryable(RetryableError("bad", status=400)))
     check("timeouts are retryable", is_retryable(asyncio.TimeoutError()))
 
-    poly = PolyApiException(error_msg="rate limited")
-    poly.status_code = 429
-    check("PolyApiException 429 is classified retryable", is_retryable(poly))
-    poly_bad = PolyApiException(error_msg="bad request")
-    poly_bad.status_code = 400
-    check("PolyApiException 400 is not retried", not is_retryable(poly_bad))
+    if POLYMARKET_SDK:
+        poly = PolyApiException(error_msg="rate limited")
+        poly.status_code = 429
+        check("PolyApiException 429 is classified retryable", is_retryable(poly))
+        poly_bad = PolyApiException(error_msg="bad request")
+        poly_bad.status_code = 400
+        check("PolyApiException 400 is not retried", not is_retryable(poly_bad))
 
     calls = {"n": 0}
 
@@ -1616,20 +1626,28 @@ async def test_kalshi() -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.CRITICAL)
     print("=" * 68)
-    await test_signals()
-    await test_dry_run_execution()
-    await test_position_gate()
-    await test_safety_gates()
-    await test_balance_and_sizing()
-    await test_risk_breakers()
+    # Venue-agnostic: always run.
     await test_retry_backoff()
-    await test_reconnect_resilience()
     await test_fast_json()
-    await test_order_caching()
     await test_latency_profiler()
-    await test_eval_loop_benchmark()
-    await test_polymarket_us()
+    await test_reconnect_resilience()
+    await test_risk_breakers()
     await test_kalshi()
+    await test_polymarket_us()
+
+    if POLYMARKET_SDK:
+        await test_signals()
+        await test_dry_run_execution()
+        await test_position_gate()
+        await test_safety_gates()
+        await test_balance_and_sizing()
+        await test_order_caching()
+        await test_eval_loop_benchmark()
+    else:
+        print(
+            "\n(skipping the Polymarket CLOB suites - py-clob-client is not installed;"
+            "\n install it with: pip install -r requirements-polymarket.txt)"
+        )
     print("=" * 68)
     total = len(PASSED) + len(FAILED)
     if FAILED:

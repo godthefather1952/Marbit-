@@ -7,11 +7,52 @@ Polymarket's rolling 5-minute / 15-minute **"Bitcoin Up or Down"** binaries.
 ever touching the order API. Live trading requires an explicit `--live` flag
 *and* credentials.
 
+## Quickstart (VS Code)
+
+Requires **Python 3.10+** (3.11 recommended).
+
 ```bash
+git clone <this repo> && cd Marbit-
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python btc_polymarket_arb.py                  # dry run, no credentials needed
-cp .env.example .env && $EDITOR .env          # then, to trade for real:
-python btc_polymarket_arb.py --live --size 20 --max-notional 25
+```
+
+Then open the folder in VS Code, press **F5**, and pick a configuration. The
+one to start with is **"Kalshi monitor (live data, no orders)"** — it needs no
+credentials at all and streams a real 15-minute BTC market immediately.
+
+| Run configuration | Needs credentials? | What it does |
+|---|---|---|
+| **Kalshi monitor (live data, no orders)** | no | Live BTC 15-min market, fair value vs book, net of fees |
+| Kalshi monitor (verbose) | no | Same, reports every edge including negative ones |
+| Kalshi monitor (WRONG feed) | no | Reproduces the USDT-basis bug on purpose |
+| Polymarket scanner (dry run) | no | The original scanner, simulated fills |
+| Tests (165 checks) | no | Full suite, ~3 minutes |
+| Check Kalshi account | yes | Verifies your key, shows balance |
+| Check Polymarket US account | yes | Verifies your key, shows balance |
+| Check a Polygon wallet | no | Balance from a public address |
+
+Nothing in `.vscode/launch.json` can place an order.
+
+### Two install tiers
+
+`requirements.txt` covers Kalshi and everything shared — four packages, quick
+and portable. The Polymarket global CLOB additionally needs the eth-account /
+web3 stack, which is a slower and more fragile install, so it lives separately:
+
+```bash
+pip install -r requirements-polymarket.txt   # only to trade polymarket.com
+```
+
+The SDK is imported optionally. Without it the Kalshi tools, the model and the
+risk engine all still run; only Polymarket execution raises, and it says
+exactly what to install rather than failing with an ImportError at startup.
+
+### If you want credentials
+
+```bash
+cp .env.example .env     # then fill in only the venue you use; .env is gitignored
 ```
 
 ---

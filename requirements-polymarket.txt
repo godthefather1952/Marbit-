@@ -1,0 +1,5 @@
+# Extra dependencies for trading the Polymarket global CLOB (polymarket.com).
+# Skip these if you only want the Kalshi tools.
+-r requirements.txt
+py-clob-client>=0.34
+coincurve>=18.0          # libsecp256k1: order signing 7.4ms -> 0.8ms

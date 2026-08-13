@@ -92,17 +92,55 @@ except ImportError:  # pragma: no cover - older websockets
 
 from websockets.exceptions import ConnectionClosed
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    ApiCreds,
-    AssetType,
-    BalanceAllowanceParams,
-    BookParams,
-    OrderArgs,
-    OrderType,
-    PartialCreateOrderOptions,
-)
-from py_clob_client.order_builder.constants import BUY
+# py-clob-client is only needed to trade Polymarket's global CLOB. The Kalshi
+# adapter and the shared machinery (model, risk, resilience) import from this
+# module, and dragging the whole eth-account/web3 stack in just to watch a
+# Kalshi market is a slow and failure-prone install. So the SDK is optional:
+# without it everything except Polymarket execution still runs, and the parts
+# that genuinely need it fail with a clear instruction instead of an ImportError
+# at startup.
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import (
+        ApiCreds,
+        AssetType,
+        BalanceAllowanceParams,
+        BookParams,
+        OrderArgs,
+        OrderType,
+        PartialCreateOrderOptions,
+    )
+    from py_clob_client.order_builder.constants import BUY
+
+    POLYMARKET_SDK = True
+except ImportError:  # pragma: no cover - exercised by the fallback test
+    POLYMARKET_SDK = False
+    BUY = "BUY"  # the literal wire value; no SDK needed to know it
+    ClobClient = None  # type: ignore[assignment]
+    ApiCreds = AssetType = BalanceAllowanceParams = None  # type: ignore[assignment]
+    OrderArgs = OrderType = None  # type: ignore[assignment]
+
+    @dataclass(slots=True)
+    class BookParams:  # type: ignore[no-redef]
+        """Stand-in matching the SDK's shape, so cached objects still build."""
+
+        token_id: str
+        side: str | None = None
+
+    @dataclass(slots=True)
+    class PartialCreateOrderOptions:  # type: ignore[no-redef]
+        tick_size: str | None = None
+        neg_risk: bool | None = None
+
+
+def require_polymarket_sdk(what: str = "this operation") -> None:
+    """Fail with an actionable message rather than an ImportError traceback."""
+    if not POLYMARKET_SDK:
+        raise RuntimeError(
+            f"{what} needs the Polymarket CLOB SDK. Install it with:\n"
+            "    pip install py-clob-client\n"
+            "It is not required for the Kalshi tools or the shared model."
+        )
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -1072,6 +1110,7 @@ class BookFeed:
     """
 
     def __init__(self, host: str = CLOB_HOST, chain_id: int = POLYGON_CHAIN_ID) -> None:
+        require_polymarket_sdk("Reading the Polymarket order book")
         self._client = ClobClient(host, chain_id=chain_id)
         self._lock = asyncio.Lock()
 
@@ -1476,6 +1515,7 @@ class RiskManager:
         direct RPC keeps the check aligned with the venue's own view and avoids
         a web3 dependency plus RPC configuration.
         """
+        require_polymarket_sdk("Reading balance through the Polymarket CLOB")
         params = BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
             signature_type=signature_type,
@@ -1946,6 +1986,12 @@ class Executor:
                 log.error("Cannot trade live: %s", issue)
             return False
 
+        if not POLYMARKET_SDK:
+            log.error(
+                "Live Polymarket trading needs the CLOB SDK: pip install py-clob-client"
+            )
+            return False
+
         try:
             self._client = await asyncio.to_thread(self._build_client)
         except Exception as exc:  # noqa: BLE001 - auth failures must be loud
@@ -2271,6 +2317,7 @@ class Executor:
         template: OrderTemplate | None = None,
     ) -> dict:
         """Blocking sign-and-post. Runs in a worker thread."""
+        require_polymarket_sdk("Submitting a Polymarket order")
         assert self._client is not None
         # Reuse the pre-built options object rather than allocating one per
         # order; more importantly, a warmed template means create_order's

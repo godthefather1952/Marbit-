@@ -1,0 +1,105 @@
+{
+  // Run/Debug configurations. Press F5, or pick one from the Run and Debug
+  // panel (Ctrl/Cmd+Shift+D). Everything here is READ-ONLY or DRY RUN --
+  // nothing in this file can place an order.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Kalshi monitor (live data, no orders)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/kalshi_monitor.py",
+      "args": ["--min-edge", "0.02", "--size", "20"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Kalshi monitor (verbose, report every edge)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/kalshi_monitor.py",
+      "args": ["--min-edge", "0.0", "--heartbeat", "10", "--verbose"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Kalshi monitor (WRONG feed -- demonstrates the USDT bug)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/kalshi_monitor.py",
+      "args": ["--binance", "--min-edge", "0.02"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Polymarket scanner (dry run)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/btc_polymarket_arb.py",
+      "args": ["--spike-bps", "12", "--paper-bankroll", "500"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Polymarket scanner (dry run, sensitive)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/btc_polymarket_arb.py",
+      "args": ["--spike-bps", "3", "--min-edge", "0.01", "--no-ask-ceiling",
+               "--paper-bankroll", "500"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Tests (all 165 checks)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_signal_path.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Check Kalshi account (needs KALSHI_* in .env)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/check_kalshi_account.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Check Polymarket US account (needs POLYMARKET_US_* in .env)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/check_us_account.py",
+      "args": ["--verbose"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Check a Polygon wallet (prompts for address)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/check_wallet.py",
+      "args": ["${input:walletAddress}"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "walletAddress",
+      "type": "promptString",
+      "description": "Polygon wallet address (0x...)",
+      "default": "0x"
+    }
+  ]
+}
