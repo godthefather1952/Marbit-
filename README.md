@@ -254,6 +254,29 @@ PnL is realized when a market retires, using the last mark. By expiry the book
 has converged to ~0 or ~1, so the mark is a close proxy — but it is a proxy, not
 settlement-confirmed accounting.
 
+## Checking your wallet
+
+Balances and approvals are public on-chain data, so verifying them needs **only
+your address** — no API key, no secret, no private key:
+
+```bash
+python check_wallet.py 0xYourWalletAddress
+python check_wallet.py 0xYour... --rpc https://polygon-mainnet.g.alchemy.com/v2/KEY
+```
+
+It reports USDC.e balance and the allowance to both exchange contracts, and
+flags the two setups that silently break live trading: funds sitting in the
+proxy wallet rather than the signing wallet, and a zero allowance.
+
+> **The CLOB does not use `X-PM-*` API keys.** Polymarket's newer developer
+> keys (`X-PM-Access-Key` / `X-PM-Signature`, Ed25519) are a different product
+> from the CLOB trading API, which authenticates with HMAC-SHA256 over
+> `POLY_ADDRESS` / `POLY_API_KEY` / `POLY_PASSPHRASE` / `POLY_SIGNATURE`. The
+> CLOB triplet also includes a **passphrase**, which the Ed25519 keys do not
+> issue. They are not interchangeable, and neither replaces `POLYMARKET_PK`:
+> orders are EIP-712 signed by the wallet key itself, so no API credential of
+> any kind can place a trade.
+
 ## Latency
 
 ### Where the time actually goes
