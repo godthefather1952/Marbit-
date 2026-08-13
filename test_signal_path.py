@@ -1282,6 +1282,131 @@ async def test_eval_loop_benchmark() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Polymarket US adapter (read-only)
+# --------------------------------------------------------------------------- #
+
+
+async def test_polymarket_us() -> None:
+    print("\n--- polymarket US adapter (read-only) ---")
+
+    import base64
+    import inspect
+
+    import polymarket_us as pu
+    from polymarket_us import (
+        AuthError,
+        Ed25519Signer,
+        PolymarketUSClient,
+        USCredentials,
+        summarize_balances,
+    )
+
+    # The safety property this module exists for: it must not be able to trade.
+    methods = [
+        n for n, _ in inspect.getmembers(PolymarketUSClient, inspect.isfunction)
+        if not n.startswith("_")
+    ]
+    banned = [
+        m for m in methods
+        if any(w in m.lower() for w in
+               ("order", "cancel", "modify", "create", "place", "submit", "trade", "buy", "sell"))
+    ]
+    check("the US client exposes no order-capable method", not banned, f"methods={methods}")
+    src = inspect.getsource(pu)
+    writes = sum(src.count(f".{verb}(") for verb in ("post", "put", "delete"))
+    check("the US module issues no POST/PUT/DELETE at all", writes == 0, f"{writes} found")
+
+    # Credential validation must name the actual problem.
+    check("missing credentials are reported", len(USCredentials().problems()) == 2)
+    check(
+        "a non-base64 secret is rejected with a reason",
+        "base64" in (USCredentials(key_id="k", secret_key="!!!not-base64!!!").seed_error() or ""),
+    )
+    short = USCredentials(key_id="k", secret_key=base64.b64encode(b"tooshort").decode())
+    check(
+        "an under-length secret is rejected",
+        "at least 32" in (short.seed_error() or ""),
+        short.seed_error() or "",
+    )
+    good = USCredentials(key_id="k", secret_key=base64.b64encode(bytes(64)).decode())
+    check(
+        "a 64-byte secret yields a 32-byte Ed25519 seed",
+        good.seed_error() is None and len(good.seed()) == 32,
+    )
+    check(
+        "describe() never leaks the secret",
+        "set" in good.describe() and base64.b64encode(bytes(64)).decode() not in good.describe(),
+        good.describe(),
+    )
+
+    # Signature construction must match the documented scheme exactly.
+    signer = Ed25519Signer(good)
+    h1 = signer.headers("GET", "/v1/account/balances")
+    check(
+        "signing produces the three documented headers",
+        {"X-PM-Access-Key", "X-PM-Timestamp", "X-PM-Signature"} <= set(h1),
+        sorted(h1),
+    )
+    sig = base64.b64decode(h1["X-PM-Signature"])
+    check("the signature is a 64-byte Ed25519 signature", len(sig) == 64, f"{len(sig)} bytes")
+    check("the timestamp is in milliseconds", len(h1["X-PM-Timestamp"]) == 13)
+
+    # Verify against the message the docs specify: timestamp + METHOD + path.
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+
+    pub = _ed.Ed25519PrivateKey.from_private_bytes(good.seed()).public_key()
+    message = f"{h1['X-PM-Timestamp']}GET/v1/account/balances".encode()
+    try:
+        pub.verify(sig, message)
+        verified = True
+    except Exception:
+        verified = False
+    check("signature verifies over `{timestamp}{METHOD}{path}`", verified)
+
+    h2 = signer.headers("GET", "/v1/account/balances")
+    check(
+        "a different path or time produces a different signature",
+        signer.headers("GET", "/v1/portfolio/positions")["X-PM-Signature"]
+        != h2["X-PM-Signature"],
+    )
+
+    # An unauthenticated client must refuse to sign rather than send unsigned.
+    class _NoSession:
+        pass
+
+    client = PolymarketUSClient(_NoSession(), USCredentials())  # type: ignore[arg-type]
+    check("an unauthenticated client is flagged", not client.authenticated)
+    try:
+        await client.account_balances()
+        raised = False
+    except AuthError:
+        raised = True
+    except Exception:
+        raised = False
+    check("an authenticated read without a signer raises AuthError", raised)
+    try:
+        PolymarketUSClient(_NoSession(), USCredentials()).authenticate()  # type: ignore[arg-type]
+        built = True
+    except AuthError:
+        built = False
+    check("authenticate() refuses to build a signer with no credentials", not built)
+
+    # Balance parsing must tolerate the shapes the venue may return.
+    shapes = [
+        ({"balances": [{"currency": "USD", "cashBalance": 3.21}]}, 3.21),
+        ({"accountBalances": [{"currency": "USD", "cash": 3.21}]}, 3.21),
+        ([{"currency": "USD", "balance": "3.21"}], 3.21),
+        ({"currency": "USD", "cashBalance": 3.21}, 3.21),
+    ]
+    ok = all(
+        summarize_balances(p) and abs(summarize_balances(p)[0][1] - want) < 1e-9
+        for p, want in shapes
+    )
+    check("balances parse across every plausible response shape", ok)
+    check("an unrecognized payload yields no rows, not a false zero", summarize_balances({}) == [])
+
+
+# --------------------------------------------------------------------------- #
 
 
 async def main() -> None:
@@ -1299,6 +1424,7 @@ async def main() -> None:
     await test_order_caching()
     await test_latency_profiler()
     await test_eval_loop_benchmark()
+    await test_polymarket_us()
     print("=" * 68)
     total = len(PASSED) + len(FAILED)
     if FAILED:

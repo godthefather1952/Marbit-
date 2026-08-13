@@ -254,6 +254,48 @@ PnL is realized when a market retires, using the last mark. By expiry the book
 has converged to ~0 or ~1, so the mark is a close proxy — but it is a proxy, not
 settlement-confirmed accounting.
 
+## Two different Polymarket exchanges
+
+`polymarket.com` and `polymarket.us` are **separate venues** with separate
+accounts, credentials and markets. Getting this wrong wastes a lot of time, so:
+
+| | polymarket.com (global) | polymarket.us |
+|---|---|---|
+| Auth | EIP-712 orders signed by a Polygon wallet | Ed25519 request signatures |
+| Credential | `POLYMARKET_PK` (wallet private key) | Key ID + secret from the developer portal |
+| Money | USDC on Polygon | Fiat balance |
+| Short-dated BTC | **Yes** — rolling 5m/15m Up/Down | **No** — shortest crypto horizon is ~525 h |
+| Traded by | `btc_polymarket_arb.py` | `polymarket_us.py` (read-only) |
+
+**This bot's strategy only exists on polymarket.com.** Polymarket US has 51 BTC
+markets, but they are 2026-expiry price milestones ("When will Bitcoin hit
+$150k?"), not sub-minute binaries. There is no latency edge on a market that
+expires next year, so the scanner cannot be pointed at Polymarket US and work.
+
+### Read-only Polymarket US adapter
+
+`polymarket_us.py` covers the US venue for balances, positions, markets and
+books. It **cannot place, modify or cancel an order** — there is no such method
+and the module issues zero POST/PUT/DELETE requests, both asserted by the test
+suite. The first thing you point at a funded account should not be able to
+spend it.
+
+```bash
+export POLYMARKET_US_KEY_ID=...
+export POLYMARKET_US_SECRET_KEY=...
+python check_us_account.py
+```
+
+It checks credentials, clock skew (signatures expire after 30 s), the public
+gateway, then your balance and positions — in that order, so a failure tells you
+which layer broke.
+
+> **Gateway gotcha:** `gateway.polymarket.us` silently drops unknown query
+> parameters and returns a default sports feed instead of erroring. Filtering by
+> `category` (singular) or `seriesSlug` on `/v1/markets` looks like a genuine
+> empty result. The real parameter is `categories`. Always confirm a filter is
+> honoured before trusting a zero.
+
 ## Checking your wallet
 
 Balances and approvals are public on-chain data, so verifying them needs **only
