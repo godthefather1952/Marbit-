@@ -24,6 +24,7 @@ import time
 
 import aiohttp
 
+from run_log import start_run_log
 from btc_polymarket_arb import (
     BINANCE_WS_FALLBACKS,
     BinanceTradeStream,
@@ -64,8 +65,20 @@ class Monitor:
         self._observations = 0
         self._best_net = -1.0
         self._last_signal_mono = 0.0
+        # Every observation's best net edge, so the summary can report the
+        # distribution rather than just the maximum. This is the number that
+        # answers whether the strategy is worth funding.
+        self._net_edges: list[float] = []
+        self._signal_by_market: dict[str, int] = {}
+        self._markets_seen: set[str] = set()
+        self._edge_seconds = 0.0
+        self._last_eval_mono = 0.0
+        self._start_mono = 0.0
+        self._fallback_vol_obs = 0
+        self.run_log = None
 
     async def run(self) -> None:
+        self._start_mono = time.monotonic()
         async with aiohttp.ClientSession(
             headers={"User-Agent": "kalshi-monitor/1.0"}
         ) as session:
@@ -164,6 +177,10 @@ class Monitor:
         sigma = self._buffer.sigma_per_sqrt_second()
         fair = market.fair_value(tick.price, sigma)
         self._observations += 1
+        self._markets_seen.add(market.ticker)
+        if not self._buffer.vol_is_measured:
+            self._fallback_vol_obs += 1
+        best_this_pass = -1.0
 
         for side, ask, fair_side in (
             ("YES", book.yes_ask, fair),
@@ -173,6 +190,7 @@ class Monitor:
                 continue
             edge = net_edge(fair_side, ask)
             self._best_net = max(self._best_net, edge)
+            best_this_pass = max(best_this_pass, edge)
             if edge < self._args.min_edge:
                 continue
             if time.monotonic() - self._last_signal_mono < self._args.cooldown:
@@ -180,6 +198,9 @@ class Monitor:
 
             move = self._buffer.largest_move(3.0)
             self._signals += 1
+            self._signal_by_market[market.ticker] = (
+                self._signal_by_market.get(market.ticker, 0) + 1
+            )
             self._last_signal_mono = time.monotonic()
             size = self._args.size
             gross = fair_side - ask
@@ -221,6 +242,77 @@ class Monitor:
                 move.bps if move else 0.0,
             )
 
+        # Post-pass bookkeeping for the session summary.
+        if best_this_pass > -1.0:
+            self._net_edges.append(best_this_pass)
+            now_mono = time.monotonic()
+            if self._last_eval_mono and best_this_pass >= self._args.min_edge:
+                # Wall time spent with a tradeable edge on the screen - a far
+                # more useful figure than a raw signal count, because it says
+                # how long the window actually stays open.
+                self._edge_seconds += min(now_mono - self._last_eval_mono, 5.0)
+            self._last_eval_mono = now_mono
+
+    def build_summary(self) -> list[str]:
+        """The numbers worth reading after a long run."""
+        edges = self._net_edges
+        elapsed = max(time.monotonic() - (self._start_mono or time.monotonic()), 1e-9)
+        lines = [
+            f"series        : {self._args.series}",
+            f"reference     : {'Binance BTCUSDT (USDT - MISPRICED)' if self._args.binance else 'Coinbase BTC-USD (USD, BRTI constituent)'}",
+            f"min net edge  : {self._args.min_edge:+.4f}/contract",
+            f"markets seen  : {len(self._markets_seen)}",
+            f"observations  : {self._observations:,}",
+            f"signals       : {self._signals}",
+        ]
+
+        if self._fallback_vol_obs:
+            share = self._fallback_vol_obs / max(self._observations, 1) * 100.0
+            lines += [
+                "",
+                f"WARNING: {self._fallback_vol_obs:,} of {self._observations:,} observations "
+                f"({share:.0f}%) priced with",
+                "         ASSUMED volatility (45% annualized), not measured. The",
+                "         estimator needs ~5 minutes of tape. Edges below are only",
+                "         as trustworthy as that assumption - run longer before",
+                "         drawing any conclusion.",
+            ]
+        if edges:
+            lines += [
+                "",
+                "net edge per observation (after fees), best of YES/NO:",
+                f"   p50  {_fmt_edge(_percentile(edges, 50))}",
+                f"   p90  {_fmt_edge(_percentile(edges, 90))}",
+                f"   p99  {_fmt_edge(_percentile(edges, 99))}",
+                f"   max  {_fmt_edge(max(edges))}",
+                "",
+                f"time with a tradeable edge : {self._edge_seconds:.0f}s of {elapsed:.0f}s "
+                f"({self._edge_seconds / elapsed * 100.0:.2f}%)",
+            ]
+            positive = sum(1 for e in edges if e >= self._args.min_edge)
+            lines.append(
+                f"observations at or above the threshold : {positive:,} of "
+                f"{len(edges):,} ({positive / len(edges) * 100.0:.2f}%)"
+            )
+        else:
+            lines += ["", "no observations recorded - the market or tape never came up"]
+
+        if self._signal_by_market:
+            lines += ["", "signals by market:"]
+            for ticker, count in sorted(
+                self._signal_by_market.items(), key=lambda kv: -kv[1]
+            ):
+                lines.append(f"   {count:4d}  {ticker}")
+
+        if edges and max(edges) >= self._args.min_edge:
+            lines += [
+                "",
+                "NOTE: a large, persistent edge on a liquid market usually means a",
+                "      model or feed error, not free money. Sanity-check the fair",
+                "      value against the quote before believing it.",
+            ]
+        return lines
+
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._args.heartbeat)
@@ -244,6 +336,20 @@ class Monitor:
                 self._signals,
                 self._best_net,
             )
+            if not self._buffer.vol_is_measured:
+                log.info("     (sigma is still the assumed prior, not measured from tape)")
+
+
+def _fmt_edge(value: float) -> str:
+    return "n/a" if value != value else f"{value:+.4f}"
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round(pct / 100.0 * (len(ordered) - 1)))))
+    return ordered[idx]
 
 
 def parse_args() -> argparse.Namespace:
@@ -263,6 +369,9 @@ def parse_args() -> argparse.Namespace:
                    help="use Binance BTCUSDT instead of Coinbase BTC-USD. WRONG for this "
                         "venue - Kalshi settles in USD and Binance quotes USDT, a basis "
                         "as large as the signal. Provided to demonstrate the error.")
+    p.add_argument("--log-dir", default="logs",
+                   help="directory for per-run log files (L_MMDDYY_HHMMSS.log)")
+    p.add_argument("--no-log", action="store_true", help="console only, write no log file")
     p.add_argument("--env-file", default=".env")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
@@ -277,8 +386,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-async def amain(args: argparse.Namespace) -> None:
-    monitor = Monitor(args)
+async def amain(args: argparse.Namespace, monitor: "Monitor") -> None:
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -299,14 +407,30 @@ async def amain(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    log.info(
-        "Kalshi monitor | READ-ONLY, no orders | series=%s | min NET edge %.3f",
-        args.series,
-        args.min_edge,
-    )
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(amain(args))
-    log.info("Monitor stopped")
+    monitor = Monitor(args)
+
+    run_log = None
+    if not args.no_log:
+        run_log = start_run_log(
+            log,
+            directory=args.log_dir,
+            title="KALSHI MONITOR (READ-ONLY, NO ORDERS)",
+            context=[
+                f"series  : {args.series}",
+                f"feed    : {'Binance BTCUSDT (USDT - MISPRICED)' if args.binance else 'Coinbase BTC-USD (USD, BRTI constituent)'}",
+                f"min edge: {args.min_edge:+.4f}/contract, net of Kalshi taker fees",
+            ],
+        )
+    monitor.run_log = run_log
+
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(amain(args, monitor))
+    finally:
+        # Written even on Ctrl+C, which is how a long monitoring run ends.
+        if run_log is not None:
+            run_log.close(monitor.build_summary())
+        log.info("Monitor stopped")
 
 
 if __name__ == "__main__":

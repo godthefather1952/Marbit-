@@ -605,6 +605,17 @@ class PriceBuffer:
         return time.monotonic() < self._warm_after
 
     @property
+    def vol_is_measured(self) -> bool:
+        """True once sigma comes from the tape rather than the prior.
+
+        Below ~30 one-second bars `sigma_per_sqrt_second` returns the 45%
+        annualized fallback. That is a *guess*, and on a short run every fair
+        value inherits it - which can manufacture a steady, entirely fictional
+        edge. Callers pricing anything should surface which one they used.
+        """
+        return len(self._bars) >= 31
+
+    @property
     def tick_count(self) -> int:
         return self._tick_count
 
@@ -2387,6 +2398,8 @@ class Config:
     eval_hz: float = 10.0
     min_seconds_left: float = 8.0  # ignore markets about to settle
     enforce_ask_ceiling: bool = True
+    log_dir: str = "logs"
+    log_dir_disabled: bool = False
     ws_endpoints: tuple[str, ...] = BINANCE_WS_FALLBACKS
     execution: ExecutionSettings = field(default_factory=ExecutionSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
@@ -3154,6 +3167,10 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         default=1000.0,
         help="simulated bankroll for dry runs, where there is no wallet to read",
     )
+    parser.add_argument("--log-dir", default="logs",
+                        help="directory for per-run log files (L_MMDDYY_HHMMSS.log)")
+    parser.add_argument("--no-log", action="store_true",
+                        help="console only, write no log file")
     parser.add_argument("--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -3173,6 +3190,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         signal_cooldown=args.cooldown,
         book_poll_interval=args.book_interval,
         enforce_ask_ceiling=not args.no_ask_ceiling,
+        log_dir=args.log_dir,
+        log_dir_disabled=args.no_log,
         ws_endpoints=tuple(args.ws_url) if args.ws_url else BINANCE_WS_FALLBACKS,
         execution=ExecutionSettings(
             dry_run=not args.live,
@@ -3233,6 +3252,23 @@ def _ecc_backend() -> str:
 
 def main() -> None:
     cfg = parse_args()
+    run_log = None
+    if not cfg.log_dir_disabled:
+        from run_log import start_run_log
+
+        run_log = start_run_log(
+            log,
+            directory=cfg.log_dir,
+            title="POLYMARKET SCANNER (%s)" % ("DRY RUN" if cfg.execution.dry_run else "LIVE"),
+            context=[
+                f"mode     : {'DRY RUN' if cfg.execution.dry_run else '*** LIVE TRADING ***'}",
+                f"spike    : >{cfg.spike_bps:g} bps in {cfg.spike_lookback:g}s",
+                f"min edge : {cfg.min_edge:.4f}",
+                f"risk     : {cfg.risk.max_risk_pct:.1%} per trade, "
+                f"drawdown stop {cfg.risk.max_drawdown_pct:.1%}/"
+                f"${cfg.risk.max_drawdown_usd:.0f}",
+            ],
+        )
     tuned = tune_clob_http_client()
     log.info(
         "Runtime | json=%s | ecc=%s | clob-http=%s",
@@ -3248,9 +3284,13 @@ def main() -> None:
         cfg.max_yes_ask,
         cfg.min_edge,
     )
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(amain(cfg))
-    log.info("Scanner stopped")
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(amain(cfg))
+    finally:
+        if run_log is not None:
+            run_log.close([f"mode : {'DRY RUN' if cfg.execution.dry_run else 'LIVE'}"])
+        log.info("Scanner stopped")
 
 
 if __name__ == "__main__":

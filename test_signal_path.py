@@ -1621,6 +1621,76 @@ async def test_kalshi() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Run logging
+# --------------------------------------------------------------------------- #
+
+
+async def test_run_log() -> None:
+    print("\n--- per-run log files ---")
+
+    import datetime as dt
+    import tempfile
+    from pathlib import Path
+
+    from run_log import run_log_name, start_run_log
+
+    cases = [
+        ("2026-08-13T06:32:45+00:00", "L_081326_063245.log"),
+        ("2026-01-05T00:00:00+00:00", "L_010526_000000.log"),
+        ("2026-12-31T23:59:59+00:00", "L_123126_235959.log"),
+    ]
+    ok = all(run_log_name(dt.datetime.fromisoformat(iso)) == want for iso, want in cases)
+    check("filename is L_MMDDYY_HHMMSS.log", ok, cases[0][1])
+
+    # A non-UTC instant must be converted, not formatted as-is.
+    local = dt.datetime(2026, 8, 13, 6, 32, 45, tzinfo=dt.timezone(dt.timedelta(hours=-5)))
+    check(
+        "the timestamp is UTC even when given a local-time instant",
+        run_log_name(local) == "L_081326_113245.log",
+        f"06:32:45 UTC-5 -> {run_log_name(local)}",
+    )
+
+    logger = logging.getLogger("run-log-test")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # keep the suite's own output clean
+    with tempfile.TemporaryDirectory() as tmp:
+        run = start_run_log(logger, directory=tmp, title="TEST RUN", context=["ctx : value"])
+        check("a log file is created on start", run is not None and run.path.is_file())
+        logger.info("a recorded line")
+        logger.warning("a warning line")
+        run.close(["summary : 42"])
+
+        text = run.path.read_text(encoding="utf-8")
+        check("the header names the run", "TEST RUN" in text and "ctx : value" in text)
+        check("the command line is recorded", "command :" in text)
+        check("records are captured", "a recorded line" in text and "a warning line" in text)
+        check("the footer holds the summary", "SESSION SUMMARY" in text and "summary : 42" in text)
+        check("elapsed time is reported", "elapsed :" in text)
+        check(
+            "timestamps are full dates, readable without context",
+            any(line.startswith("2") and "-" in line[:10] for line in text.splitlines()),
+        )
+        check("close() is idempotent", (run.close(), True)[1])
+        check(
+            "the handler is detached after close",
+            run.handler not in logger.handlers,
+        )
+
+        # A second run in the same second must not clobber the first.
+        again = start_run_log(logger, directory=tmp, title="SECOND")
+        check("a second run opens its own handler", again is not None)
+        again.close()
+        check(
+            "log files land in the requested directory",
+            len(list(Path(tmp).glob("L_*.log"))) >= 1,
+        )
+
+    # Logging must never be the reason a run fails.
+    broken = start_run_log(logger, directory="/proc/definitely-not-writable")
+    check("an unwritable directory degrades to console-only", broken is None)
+
+
+# --------------------------------------------------------------------------- #
 
 
 async def main() -> None:
@@ -1634,6 +1704,7 @@ async def main() -> None:
     await test_risk_breakers()
     await test_kalshi()
     await test_polymarket_us()
+    await test_run_log()
 
     if POLYMARKET_SDK:
         await test_signals()

@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Per-run log files
+logs/
+*.log
+
 __pycache__/
 *.py[cod]
 .venv/

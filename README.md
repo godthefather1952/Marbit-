@@ -35,6 +35,45 @@ credentials at all and streams a real 15-minute BTC market immediately.
 
 Nothing in `.vscode/launch.json` can place an order.
 
+### Run logs
+
+Every run writes a readable log to `logs/`, named on the UTC instant it started:
+
+```
+L_MMDDYY_HHMMSS.log      e.g. logs/L_081326_063245.log
+```
+
+The file is created at startup (not on exit), so you can tail it while a long
+monitor is still running. It carries a header naming the run and its arguments,
+the full record stream with UTC timestamps, and a footer summary written **even
+if you Ctrl+C** — which is how a monitoring run normally ends.
+
+The Kalshi summary is built to answer the only question that matters:
+
+```
+ observations  : 342
+ signals       : 9
+
+ net edge per observation (after fees), best of YES/NO:
+    p50  +0.0139
+    p90  +0.0381
+    p99  +0.0485
+    max  +0.0794
+
+ time with a tradeable edge : 32s of 71s (45.76%)
+```
+
+> **Read the volatility warning before believing any of it.** Until ~5 minutes
+> of tape has accumulated, σ is an *assumed* 45% annualized prior rather than a
+> measurement, and every fair value inherits that guess — which can manufacture
+> a steady, entirely fictional edge. The summary states what fraction of
+> observations were priced that way, and the heartbeat says so live. A short run
+> showing "45% tradeable" is an artifact, not a discovery.
+
+`--log-dir DIR` changes the destination, `--no-log` disables it. `logs/` is
+gitignored. An unwritable directory degrades to console-only rather than
+failing the run.
+
 ### Two install tiers
 
 `requirements.txt` covers Kalshi and everything shared — four packages, quick
