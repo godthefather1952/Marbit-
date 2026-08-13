@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Trading strategies for Kalshi's 15-minute BTC up/down markets.
+
+Three strategies, ordered by how much they depend on our model being right.
+That ordering matters: the two live bugs so far (a USDT-quoted feed, then an
+unreliable volatility estimate) were both *model* errors that manufactured
+edge. A strategy that needs less of the model is worth more than one whose
+backtest looks better.
+
+    CROSS     model-free. Buys both sides when the book's own bids cross,
+              locking a profit at settlement regardless of what BTC does.
+              Cannot be wrong; can only be rare.
+
+    STALE     the original latency thesis, rebuilt to be immune to the two
+              bugs. It anchors on the MARKET's price and the MARKET's implied
+              volatility, and trades only the *change* implied by a spot move.
+              Feed level errors and sigma errors cancel out of a difference.
+
+    ENDGAME   near expiry, when the settlement average is largely locked in
+              and the outcome is close to decided, buys the near-certain side
+              if it is still offered below its true worth.
+
+Every signal carries the numbers needed to grade it later against actual
+settlement, which is what `kalshi_score.py` does. Until a strategy has been
+graded on real outcomes, its "edge" is a hypothesis.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from statistics import NormalDist
+
+from kalshi import KalshiBook, KalshiMarket, fee_per_contract, trading_fee
+
+_N = NormalDist()
+
+
+def _clamp(p: float, lo: float = 0.001, hi: float = 0.999) -> float:
+    return min(max(p, lo), hi)
+
+
+# --------------------------------------------------------------------------- #
+# Signals
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class Leg:
+    side: str  # "YES" | "NO"
+    price: float  # the ask we would pay
+    size: float
+
+
+@dataclass(slots=True)
+class Signal:
+    strategy: str
+    ticker: str
+    legs: list[Leg]
+    #: Model probability that the YES side settles yes, at signal time.
+    fair_yes: float
+    #: Expected profit in dollars, already net of Kalshi's taker fee.
+    expected_net: float
+    #: Worst case in dollars, if every leg loses.
+    max_loss: float
+    spot: float
+    strike: float
+    seconds_left: float
+    sigma_used: float
+    note: str = ""
+    ts: float = field(default_factory=time.time)
+
+    def describe(self) -> str:
+        legs = ", ".join(f"{leg.side} {leg.size:g} @ {leg.price:.3f}" for leg in self.legs)
+        return (
+            f"[{self.strategy}] {self.ticker} | {legs} | "
+            f"exp net ${self.expected_net:+.2f} | risk ${self.max_loss:.2f} | "
+            f"{self.seconds_left:.0f}s left"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Market-implied volatility - the key robustness tool
+# --------------------------------------------------------------------------- #
+
+
+def implied_sigma(market: KalshiMarket, book: KalshiBook, spot: float) -> float | None:
+    """Back the volatility out of the market's own quote.
+
+    Our realized-vol estimator has been wrong by 2-4x, and the model is acutely
+    sensitive to it. The market, quoting a 1c spread with hundreds of thousands
+    of contracts traded, has a far better estimate than five minutes of
+    one-second bars from a single venue.
+
+    Taking sigma from the quote turns the model from "what should this be
+    worth" into "given what the market believes, what does a spot move imply" -
+    a much smaller, much safer claim.
+    """
+    mid = book.yes_mid
+    if mid is None or spot <= 0 or market.strike <= 0:
+        return None
+    tau = market.effective_tau()
+    if tau <= 0:
+        return None
+    lm = math.log(spot / market.strike)
+    z = _N.inv_cdf(_clamp(mid))
+    if abs(z) < 0.05 or abs(lm) < 1e-7:
+        return None  # too close to the money to invert reliably
+    sigma = lm / (z * math.sqrt(tau))
+    return sigma if 1e-6 < sigma < 1e-2 else None
+
+
+# --------------------------------------------------------------------------- #
+# CROSS - model-free
+# --------------------------------------------------------------------------- #
+
+
+def scan_cross(
+    market: KalshiMarket, book: KalshiBook, size: float, min_profit: float = 0.01
+) -> Signal | None:
+    """Buy YES and NO together when the pair costs less than the $1 they pay.
+
+    On Kalshi both ladders are bids, so the YES ask is `1 - best NO bid`. The
+    pair costs `2 - (yes_bid + no_bid)`, which drops below $1 exactly when the
+    two bids cross. Settlement always pays one side $1, so the profit is locked
+    the moment both fills happen - no view on BTC, no volatility estimate, no
+    reliance on our spot feed being right.
+
+    The fee is what makes this rare: at the money it costs ~1.75c per contract
+    per leg, so the bids must cross by more than ~3.5c to be worth taking.
+    """
+    if book.yes_ask is None or book.no_ask is None:
+        return None
+    cost_per_pair = book.yes_ask + book.no_ask
+    fees = trading_fee(book.yes_ask, size) + trading_fee(book.no_ask, size)
+    profit = size * (1.0 - cost_per_pair) - fees
+    if profit < min_profit:
+        return None
+
+    return Signal(
+        strategy="CROSS",
+        ticker=market.ticker,
+        legs=[Leg("YES", book.yes_ask, size), Leg("NO", book.no_ask, size)],
+        fair_yes=book.yes_mid or 0.5,
+        expected_net=profit,
+        max_loss=0.0,  # one side always pays $1
+        spot=0.0,
+        strike=market.strike,
+        seconds_left=market.seconds_remaining(),
+        sigma_used=0.0,
+        note=f"pair costs {cost_per_pair:.4f}, pays 1.0000",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# STALE - the latency thesis, made robust
+# --------------------------------------------------------------------------- #
+
+
+def scan_stale(
+    market: KalshiMarket,
+    book: KalshiBook,
+    anchor_price: float,
+    anchor_mid: float,
+    spot: float,
+    size: float,
+    min_edge: float,
+    fallback_sigma: float,
+) -> Signal | None:
+    """Trade the repricing a spot move implies, not the level.
+
+    `anchor_mid` is the market's own mid from before the move, and `anchor_price`
+    the spot at that same moment. Both the starting probability and the
+    volatility come from the market, so:
+
+      * a constant error in our spot feed cancels in ln(spot / anchor_price)
+      * an error in our volatility estimate mostly cancels, because sigma is
+        taken from the quote rather than measured
+
+    What is left is the honest question: BTC moved this much, the market has
+    not repriced yet, and is the gap bigger than the fee.
+    """
+    if anchor_price <= 0 or spot <= 0:
+        return None
+    delta = math.log(spot / anchor_price)
+    if abs(delta) < 1e-9:
+        return None
+
+    sigma = implied_sigma(market, book, spot) or fallback_sigma
+    tau = market.effective_tau()
+    denom = sigma * math.sqrt(tau)
+    if denom <= 0:
+        return None
+
+    z0 = _N.inv_cdf(_clamp(anchor_mid))
+    fair_yes = _clamp(_N.cdf(z0 + delta / denom))
+
+    if delta > 0:
+        side, ask, fair_side = "YES", book.yes_ask, fair_yes
+    else:
+        side, ask, fair_side = "NO", book.no_ask, 1.0 - fair_yes
+    if ask is None or not (0.0 < ask < 1.0):
+        return None
+
+    edge = fair_side - ask - fee_per_contract(ask)
+    if edge < min_edge:
+        return None
+
+    return Signal(
+        strategy="STALE",
+        ticker=market.ticker,
+        legs=[Leg(side, ask, size)],
+        fair_yes=fair_yes,
+        expected_net=edge * size,
+        max_loss=size * ask + trading_fee(ask, size),
+        spot=spot,
+        strike=market.strike,
+        seconds_left=market.seconds_remaining(),
+        sigma_used=sigma,
+        note=(
+            f"spot {delta * 1e4:+.1f} bps vs anchor, market mid was {anchor_mid:.3f}, "
+            f"implied sigma {sigma * 1e4:.2f} bps/s"
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ENDGAME - buy near-certainty into expiry
+# --------------------------------------------------------------------------- #
+
+
+def scan_endgame(
+    market: KalshiMarket,
+    book: KalshiBook,
+    spot: float,
+    size: float,
+    sigma: float,
+    max_seconds_left: float = 120.0,
+    min_z: float = 3.0,
+    min_edge: float = 0.005,
+    max_price: float = 0.99,
+) -> Signal | None:
+    """Late in the window, buy the side that is nearly decided.
+
+    As expiry approaches, `effective_tau` collapses and a given distance from
+    the strike becomes an ever larger number of standard deviations. At 3 sigma
+    the outcome is ~99.9% settled, yet the favoured side often still trades a
+    cent or two below $1.
+
+    The economics are deliberately unglamorous: many small wins and rare, large
+    losses. A 2c gain on a 98c contract is +2%, but the loss when it turns is
+    -98%, so roughly one reversal in fifty wipes out the profit. This needs the
+    strictest sizing of the three, and a `min_z` well above what feels
+    necessary.
+    """
+    left = market.seconds_remaining()
+    if left > max_seconds_left or left <= 0 or spot <= 0 or market.strike <= 0:
+        return None
+
+    tau = market.effective_tau()
+    denom = sigma * math.sqrt(tau)
+    if denom <= 0:
+        return None
+    z = math.log(spot / market.strike) / denom
+    if abs(z) < min_z:
+        return None
+
+    fair_yes = _clamp(_N.cdf(z))
+    if z > 0:
+        side, ask, fair_side = "YES", book.yes_ask, fair_yes
+    else:
+        side, ask, fair_side = "NO", book.no_ask, 1.0 - fair_yes
+    if ask is None or not (0.0 < ask <= max_price):
+        return None
+
+    edge = fair_side - ask - fee_per_contract(ask)
+    if edge < min_edge:
+        return None
+
+    return Signal(
+        strategy="ENDGAME",
+        ticker=market.ticker,
+        legs=[Leg(side, ask, size)],
+        fair_yes=fair_yes,
+        expected_net=edge * size,
+        max_loss=size * ask + trading_fee(ask, size),
+        spot=spot,
+        strike=market.strike,
+        seconds_left=left,
+        sigma_used=sigma,
+        note=f"{abs(z):.1f} sigma from the strike with {left:.0f}s left",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Paper ledger - what turns a run into evidence
+# --------------------------------------------------------------------------- #
+
+
+class PaperLedger:
+    """Append-only record of every signal, for grading against settlement.
+
+    One JSON object per line so a run can be scored while it is still going,
+    and so a crash costs at most the last line.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.count = 0
+        self._seen: set[tuple[str, str]] = set()
+
+    def record(self, signal: Signal, once_per_market: bool = True) -> bool:
+        """Log a paper trade. Returns False if skipped as a duplicate.
+
+        One entry per (strategy, market) by default: the same edge persists for
+        many evaluation passes, and counting it fifty times would make an
+        hour's data look like fifty independent successes when it is one.
+        """
+        key = (signal.strategy, signal.ticker)
+        if once_per_market and key in self._seen:
+            return False
+        self._seen.add(key)
+
+        row = asdict(signal)
+        row["legs"] = [asdict(leg) for leg in signal.legs]
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+        self.count += 1
+        return True

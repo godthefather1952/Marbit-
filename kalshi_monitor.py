@@ -18,13 +18,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from pathlib import Path
 import logging
 import signal
 import time
 
 import aiohttp
+from collections import deque
 
-from run_log import start_run_log
+from run_log import run_log_name, start_run_log
+from strategies import (
+    PaperLedger,
+    implied_sigma,
+    scan_cross,
+    scan_endgame,
+    scan_stale,
+)
 from btc_polymarket_arb import (
     BINANCE_WS_FALLBACKS,
     BinanceTradeStream,
@@ -74,6 +83,11 @@ class Monitor:
         self._start_mono = 0.0
         self._fallback_vol_obs = 0
         self.run_log = None
+        self.ledger: PaperLedger | None = None
+        # Rolling anchor for STALE: the market's own mid and our spot at the
+        # same instant, from `--anchor-age` seconds ago.
+        self._anchors: deque[tuple[float, float, float]] = deque(maxlen=600)
+        self._strategy_hits: dict[str, int] = {}
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -188,6 +202,13 @@ class Monitor:
             self._fallback_vol_obs += 1
         best_this_pass = -1.0
 
+        # Keep a rolling (time, spot, market mid) anchor for the STALE model.
+        now_mono = time.monotonic()
+        mid = book.yes_mid
+        if mid is not None:
+            self._anchors.append((now_mono, tick.price, mid))
+        self._run_strategies(market, book, tick.price, sigma, now_mono)
+
         for side, ask, fair_side in (
             ("YES", book.yes_ask, fair),
             ("NO", book.no_ask, 1.0 - fair),
@@ -269,6 +290,9 @@ class Monitor:
             f"min net edge  : {self._args.min_edge:+.4f}/contract",
             f"feed basis    : {('%+.2f USD (n=%d polls)' % (self._basis.offset, self._basis.samples)) if self._basis else 'not corrected'}",
             f"markets seen  : {len(self._markets_seen)}",
+            f"paper trades  : {self.ledger.count if self.ledger else 0} "
+            f"(score with: python kalshi_score.py)",
+            f"strategy hits : {self._strategy_hits or 'none'}",
             f"observations  : {self._observations:,}",
             f"signals       : {self._signals}",
         ]
@@ -319,6 +343,54 @@ class Monitor:
                 "      value against the quote before believing it.",
             ]
         return lines
+
+    def _run_strategies(self, market, book, spot, sigma, now_mono) -> None:
+        """Run every enabled strategy and record what each would have traded."""
+        args = self._args
+        found = []
+
+        if not args.no_cross:
+            sig = scan_cross(market, book, args.size, args.min_profit)
+            if sig:
+                found.append(sig)
+
+        if not args.no_stale:
+            # An anchor from `--anchor-age` seconds ago: the market's mid and
+            # our spot at the same moment, so only the CHANGE is used.
+            cutoff = now_mono - args.anchor_age
+            anchor = None
+            for ts, price, mid in self._anchors:
+                if ts <= cutoff:
+                    anchor = (price, mid)
+                else:
+                    break
+            if anchor:
+                sig = scan_stale(
+                    market, book, anchor[0], anchor[1], spot, args.size,
+                    args.min_edge, sigma,
+                )
+                if sig:
+                    found.append(sig)
+
+        if not args.no_endgame:
+            sig = scan_endgame(
+                market, book, spot, args.size,
+                implied_sigma(market, book, spot) or sigma,
+                max_seconds_left=args.endgame_window,
+                min_z=args.endgame_z,
+            )
+            if sig:
+                found.append(sig)
+
+        for sig in found:
+            self._strategy_hits[sig.strategy] = self._strategy_hits.get(sig.strategy, 0) + 1
+            if self.ledger is not None and self.ledger.record(sig):
+                log.warning(
+                    "\n---- PAPER TRADE ----\n %s\n %s\n"
+                    " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
+                    "---------------------",
+                    sig.describe(), sig.note, sig.fair_yes, sig.max_loss,
+                )
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -376,6 +448,17 @@ def parse_args() -> argparse.Namespace:
                    help="use Binance BTCUSDT instead of Coinbase BTC-USD. WRONG for this "
                         "venue - Kalshi settles in USD and Binance quotes USDT, a basis "
                         "as large as the signal. Provided to demonstrate the error.")
+    p.add_argument("--min-profit", type=float, default=0.01,
+                   help="CROSS: minimum locked dollar profit per pair")
+    p.add_argument("--anchor-age", type=float, default=20.0,
+                   help="STALE: how far back the market anchor is taken, seconds")
+    p.add_argument("--endgame-window", type=float, default=120.0,
+                   help="ENDGAME: only consider markets closing within this many seconds")
+    p.add_argument("--endgame-z", type=float, default=3.0,
+                   help="ENDGAME: sigmas from the strike required to call it decided")
+    p.add_argument("--no-cross", action="store_true", help="disable the CROSS strategy")
+    p.add_argument("--no-stale", action="store_true", help="disable the STALE strategy")
+    p.add_argument("--no-endgame", action="store_true", help="disable the ENDGAME strategy")
     p.add_argument("--no-basis", action="store_true",
                    help="do not correct the tape toward the USD composite. The raw "
                         "venue carries a persistent premium/discount worth several "
@@ -433,6 +516,10 @@ def main() -> None:
             ],
         )
     monitor.run_log = run_log
+    if not args.no_log:
+        stem = (run_log.path.stem if run_log else run_log_name().replace(".log", ""))
+        monitor.ledger = PaperLedger(Path(args.log_dir) / f"paper_{stem}.jsonl")
+        log.info("Recording paper trades to %s", monitor.ledger.path)
 
     try:
         with contextlib.suppress(KeyboardInterrupt):
