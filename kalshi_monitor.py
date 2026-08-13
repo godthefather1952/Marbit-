@@ -27,6 +27,7 @@ import aiohttp
 from collections import deque
 
 from run_log import run_log_name, start_run_log
+from kalshi_execution import KalshiTrader, RiskLimits
 from strategies import (
     PaperLedger,
     implied_sigma,
@@ -88,6 +89,10 @@ class Monitor:
         # same instant, from `--anchor-age` seconds ago.
         self._anchors: deque[tuple[float, float, float]] = deque(maxlen=600)
         self._strategy_hits: dict[str, int] = {}
+        self.trader: KalshiTrader | None = None
+        self._settled: set[str] = set()
+        self._pending_orders: list = []
+        self._client_ref = None
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -95,6 +100,20 @@ class Monitor:
             headers={"User-Agent": "kalshi-monitor/1.0"}
         ) as session:
             client = KalshiClient(session, KalshiCredentials.from_env())
+            self._client_ref = client
+            self.trader = KalshiTrader(
+                client,
+                RiskLimits(
+                    max_stake_pct=self._args.max_stake_pct / 100.0,
+                    max_exposure_pct=self._args.max_exposure_pct / 100.0,
+                    daily_loss_pct=self._args.daily_loss_pct / 100.0,
+                    max_trades=self._args.max_trades,
+                ),
+                dry_run=not self._args.live,
+            )
+            if not await self.trader.arm():
+                log.error("Execution layer failed to arm; stopping before any market data")
+                return
             if self._args.binance:
                 self._stream = BinanceTradeStream(self._buffer, BINANCE_WS_FALLBACKS)
             else:
@@ -124,6 +143,7 @@ class Monitor:
                 asyncio.create_task(self._discovery_loop(client), name="discovery"),
                 asyncio.create_task(self._book_loop(client), name="book"),
                 asyncio.create_task(self._eval_loop(), name="eval"),
+                asyncio.create_task(self._execution_loop(), name="execution"),
                 asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
             ]
             try:
@@ -293,6 +313,7 @@ class Monitor:
             f"paper trades  : {self.ledger.count if self.ledger else 0} "
             f"(score with: python kalshi_score.py)",
             f"strategy hits : {self._strategy_hits or 'none'}",
+            f"execution     : {self.trader.stats() if self.trader else 'none'}",
             f"observations  : {self._observations:,}",
             f"signals       : {self._signals}",
         ]
@@ -385,12 +406,56 @@ class Monitor:
         for sig in found:
             self._strategy_hits[sig.strategy] = self._strategy_hits.get(sig.strategy, 0) + 1
             if self.ledger is not None and self.ledger.record(sig):
+                self._pending_orders.append(sig)
                 log.warning(
                     "\n---- PAPER TRADE ----\n %s\n %s\n"
                     " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
                     "---------------------",
                     sig.describe(), sig.note, sig.fair_yes, sig.max_loss,
                 )
+
+    async def _execution_loop(self) -> None:
+        """Turn recorded signals into orders, and settle finished markets."""
+        while True:
+            try:
+                trader = self.trader
+                while self._pending_orders and trader is not None:
+                    sig = self._pending_orders.pop(0)
+                    if trader.check_halt():
+                        continue
+                    for leg in sig.legs:
+                        count = trader.size_for(leg.price)
+                        if count < 1:
+                            log.warning(
+                                " execution: SKIPPED %s %s - no legal size at %.4f "
+                                "(max stake $%.2f)",
+                                sig.strategy, leg.side, leg.price, trader.max_stake(),
+                            )
+                            continue
+                        result = await trader.place(sig.ticker, leg.side, leg.price, count)
+                        log.warning(" execution: [%s] %s", sig.strategy, result.summary())
+                await self._settle_finished()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Execution loop error: %s", exc)
+            await asyncio.sleep(1.0)
+
+    async def _settle_finished(self) -> None:
+        """Book the real outcome of any market we traded that has now settled."""
+        trader = self.trader
+        if trader is None:
+            return
+        traded = {o.ticker for o in trader._orders if o.ok} - self._settled
+        for ticker in traded:
+            try:
+                payload = await self._client_ref._get(f"/markets/{ticker}")
+            except Exception:  # noqa: BLE001 - not settled yet is normal
+                continue
+            result = str(((payload or {}).get("market") or {}).get("result", "")).lower()
+            if result in ("yes", "no"):
+                trader.settle(ticker, result)
+                self._settled.add(ticker)
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -448,6 +513,16 @@ def parse_args() -> argparse.Namespace:
                    help="use Binance BTCUSDT instead of Coinbase BTC-USD. WRONG for this "
                         "venue - Kalshi settles in USD and Binance quotes USDT, a basis "
                         "as large as the signal. Provided to demonstrate the error.")
+    p.add_argument("--live", action="store_true",
+                   help="PLACE REAL ORDERS WITH REAL MONEY. Off by default.")
+    p.add_argument("--max-stake-pct", type=float, default=8.0,
+                   help="percent of starting balance staked per trade")
+    p.add_argument("--max-exposure-pct", type=float, default=25.0,
+                   help="percent of balance open across all positions at once")
+    p.add_argument("--daily-loss-pct", type=float, default=20.0,
+                   help="session loss that halts trading, percent of balance")
+    p.add_argument("--max-trades", type=int, default=40,
+                   help="hard cap on orders in one session")
     p.add_argument("--min-profit", type=float, default=0.01,
                    help="CROSS: minimum locked dollar profit per pair")
     p.add_argument("--anchor-age", type=float, default=20.0,

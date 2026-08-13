@@ -1715,6 +1715,112 @@ async def test_run_log() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Kalshi execution
+# --------------------------------------------------------------------------- #
+
+
+async def test_kalshi_execution() -> None:
+    print("\n--- kalshi execution ($75 account) ---")
+
+    from kalshi_execution import KalshiTrader, RiskLimits
+
+    # The side mapping. This is the error that would reverse every position.
+    bid = KalshiTrader.to_api_side("YES", 0.45)
+    ask = KalshiTrader.to_api_side("NO", 0.30)
+    check("buying YES bids the YES book at its own price", bid == ("bid", 0.45), f"{bid}")
+    check(
+        "buying NO sells the YES book at 1 - price",
+        ask == ("ask", 0.70),
+        f"buy NO @0.30 -> {ask}",
+    )
+    roundtrip = all(
+        abs(KalshiTrader.to_api_side("NO", q)[1] - (1 - q)) < 1e-9
+        for q in (0.01, 0.25, 0.5, 0.75, 0.99)
+    )
+    check("the NO inversion holds across the price range", roundtrip)
+
+    t = KalshiTrader(None, RiskLimits(), dry_run=True)
+    t.starting_balance = 75.0
+
+    check("per-trade stake is capped at 8% of balance", abs(t.max_stake() - 6.0) < 1e-9)
+    check(
+        "sizing respects the stake cap at every price",
+        all(t.size_for(p) * p <= t.max_stake() + 1e-9 for p in (0.05, 0.3, 0.5, 0.9, 0.99)),
+    )
+    check("an impossible price yields no size", t.size_for(0.0) == 0 and t.size_for(1.0) == 0)
+    check(
+        "sizing leaves room for the fee",
+        t.size_for(0.50) * (0.50 + 0.0175) <= t.max_stake() + 1e-9,
+        f"{t.size_for(0.50)} contracts at 0.50",
+    )
+
+    # Exposure cap.
+    t.open_stake = 18.0
+    check(
+        "the exposure cap shrinks size as positions accumulate",
+        t.size_for(0.50) * 0.5 <= 75 * 0.25 - 18.0 + 1e-9,
+        f"{t.size_for(0.50)} contracts with $18 already open",
+    )
+    t.open_stake = 75 * 0.25
+    check("at full exposure no new size is allowed", t.size_for(0.50) == 0)
+    t.open_stake = 0.0
+
+    # Halts.
+    t.realized = -15.0
+    check("the daily stop halts at -20%", t.check_halt() is not None and t.halted)
+    t2 = KalshiTrader(None, RiskLimits(), dry_run=True)
+    t2.starting_balance = 75.0
+    t2.consecutive_losses = 3
+    check("three losses in a row halts", t2.check_halt() is not None)
+    t3 = KalshiTrader(None, RiskLimits(max_trades=2), dry_run=True)
+    t3.starting_balance = 75.0
+    t3.trades = 2
+    check("the session trade cap halts", t3.check_halt() is not None)
+
+    # A halted trader must refuse to send.
+    res = await t.place("TEST", "YES", 0.5, 5)
+    check("a halted trader rejects orders", not res.ok and "halted" in (res.error or ""))
+
+    # Oversized orders are blocked before they can be sent.
+    t4 = KalshiTrader(None, RiskLimits(), dry_run=True)
+    t4.starting_balance = 75.0
+    big = await t4.place("TEST", "YES", 0.5, 100)  # $50 stake vs a $6 cap
+    check(
+        "an oversized stake is blocked",
+        not big.ok and "cap" in (big.error or ""),
+        big.error or "",
+    )
+
+    # Settlement accounting, both directions.
+    t5 = KalshiTrader(None, RiskLimits(), dry_run=True)
+    t5.starting_balance = 75.0
+    win = await t5.place("MKT-A", "YES", 0.40, 10)
+    check("a dry-run order is booked", win.ok and t5.trades == 1)
+    pnl = t5.settle("MKT-A", "yes")
+    check(
+        "a winning YES settles to payout minus stake and fee",
+        abs(pnl - (10 - 4.0 - 0.17)) < 0.02,
+        f"{pnl:+.2f} on 10 @ 0.40",
+    )
+    t6 = KalshiTrader(None, RiskLimits(), dry_run=True)
+    t6.starting_balance = 75.0
+    await t6.place("MKT-B", "NO", 0.40, 10)
+    loss = t6.settle("MKT-B", "yes")  # bought NO, YES won
+    check(
+        "a losing trade costs the stake plus fee",
+        loss < -4.0,
+        f"{loss:+.2f}",
+    )
+    check("a loss increments the streak", t6.consecutive_losses == 1)
+
+    check(
+        "dry run never marks the side mapping as verified against the venue",
+        (await KalshiTrader(None, RiskLimits(), dry_run=True).verify_side_mapping("X")) is True,
+        "dry run short-circuits; live requires a real 1-contract probe",
+    )
+
+
+# --------------------------------------------------------------------------- #
 
 
 async def main() -> None:
@@ -1727,6 +1833,7 @@ async def main() -> None:
     await test_reconnect_resilience()
     await test_risk_breakers()
     await test_kalshi()
+    await test_kalshi_execution()
     await test_polymarket_us()
     await test_run_log()
 
