@@ -35,6 +35,7 @@ from btc_polymarket_arb import (
 from kalshi import (
     BTC_15M_SERIES,
     CoinbaseSpotStream,
+    CompositeBasis,
     usd_spot_rest,
     KalshiBook,
     KalshiClient,
@@ -54,11 +55,8 @@ class Monitor:
         # Kalshi settles on CF Benchmarks BRTI, a USD index. Binance quotes in
         # USDT, and that basis is as large as the signal, so the reference tape
         # must be USD-quoted. --binance exists only to demonstrate the error.
-        self._stream = (
-            BinanceTradeStream(self._buffer, BINANCE_WS_FALLBACKS)
-            if args.binance
-            else CoinbaseSpotStream(self._buffer)
-        )
+        self._basis: CompositeBasis | None = None
+        self._stream = None  # built in run(), once a session exists
         self._market: KalshiMarket | None = None
         self._book: KalshiBook | None = None
         self._signals = 0
@@ -83,6 +81,12 @@ class Monitor:
             headers={"User-Agent": "kalshi-monitor/1.0"}
         ) as session:
             client = KalshiClient(session, KalshiCredentials.from_env())
+            if self._args.binance:
+                self._stream = BinanceTradeStream(self._buffer, BINANCE_WS_FALLBACKS)
+            else:
+                if not self._args.no_basis:
+                    self._basis = CompositeBasis(session)
+                self._stream = CoinbaseSpotStream(self._buffer, basis=self._basis)
 
             try:
                 status = await client.exchange_status()
@@ -101,6 +105,8 @@ class Monitor:
 
             tasks = [
                 asyncio.create_task(self._stream.run(), name="spot"),
+                *([asyncio.create_task(self._basis.run(self._buffer), name="basis")]
+                  if self._basis is not None else []),
                 asyncio.create_task(self._discovery_loop(client), name="discovery"),
                 asyncio.create_task(self._book_loop(client), name="book"),
                 asyncio.create_task(self._eval_loop(), name="eval"),
@@ -261,6 +267,7 @@ class Monitor:
             f"series        : {self._args.series}",
             f"reference     : {'Binance BTCUSDT (USDT - MISPRICED)' if self._args.binance else 'Coinbase BTC-USD (USD, BRTI constituent)'}",
             f"min net edge  : {self._args.min_edge:+.4f}/contract",
+            f"feed basis    : {('%+.2f USD (n=%d polls)' % (self._basis.offset, self._basis.samples)) if self._basis else 'not corrected'}",
             f"markets seen  : {len(self._markets_seen)}",
             f"observations  : {self._observations:,}",
             f"signals       : {self._signals}",
@@ -369,6 +376,10 @@ def parse_args() -> argparse.Namespace:
                    help="use Binance BTCUSDT instead of Coinbase BTC-USD. WRONG for this "
                         "venue - Kalshi settles in USD and Binance quotes USDT, a basis "
                         "as large as the signal. Provided to demonstrate the error.")
+    p.add_argument("--no-basis", action="store_true",
+                   help="do not correct the tape toward the USD composite. The raw "
+                        "venue carries a persistent premium/discount worth several "
+                        "points of probability on a 15-minute contract.")
     p.add_argument("--log-dir", default="logs",
                    help="directory for per-run log files (L_MMDDYY_HHMMSS.log)")
     p.add_argument("--no-log", action="store_true", help="console only, write no log file")

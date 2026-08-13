@@ -1577,6 +1577,30 @@ async def test_kalshi() -> None:
         f"fair {fair_right:.3f} vs market 0.475",
     )
 
+    # Feed basis correction. This was the dominant source of phantom edge in
+    # the first hour-long run: a single venue sits ~1.7 bps off the composite,
+    # which on a 15-minute contract is ~5 points of probability.
+    from kalshi import CompositeBasis
+
+    basis = CompositeBasis.__new__(CompositeBasis)
+    basis.offset, basis.samples, basis.last_composite = 0.0, 0, None
+    basis._alpha = 0.5
+    check("an unmeasured basis is a no-op", basis.correct(63_000.0) == 63_000.0)
+    basis.offset = 10.41
+    check(
+        "a measured basis lifts the tape toward the composite",
+        abs(basis.correct(63_000.0) - 63_010.41) < 1e-9,
+    )
+
+    m_off = parse_market(raw)
+    at_raw = m_off.fair_value(63_777.35, sigma, now)
+    at_corrected = m_off.fair_value(63_777.35 + 10.41, sigma, now)
+    check(
+        "a 1.7 bps feed error is worth several points of probability",
+        (at_corrected - at_raw) > 0.03,
+        f"{at_raw:.3f} -> {at_corrected:.3f} = {(at_corrected - at_raw) * 100:.1f} points",
+    )
+
     # Credentials.
     check("missing Kalshi credentials are reported", len(KalshiCredentials().problems()) == 2)
     check(

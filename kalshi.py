@@ -432,6 +432,106 @@ class RsaPssSigner:
 # --------------------------------------------------------------------------- #
 
 
+class CompositeBasis:
+    """Tracks how far one venue sits from a multi-venue USD composite.
+
+    BRTI is a composite of several USD spot venues, so any single venue carries
+    a persistent premium or discount to it. Measured over an hour of live data,
+    Coinbase ran about 1.7 bps *below* a Kraken/Bitstamp/Gemini median - small
+    in absolute terms, but for a 15-minute contract sigma*sqrt(tau) is only
+    ~13 bps, so a 1.7 bps offset is ~13% of a standard deviation and moves fair
+    value by roughly five points of probability. That was the dominant source
+    of phantom edge in the first long run: the model sat 2.5c below market mid
+    on 59% of samples.
+
+    The basis moves on the timescale of exchange flow, not ticks, so polling it
+    every 20s over REST and smoothing is plenty. The websocket tape stays the
+    low-latency source; this only removes its level error.
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, halflife_polls: float = 5.0) -> None:
+        self._session = session
+        self._alpha = 1.0 - 0.5 ** (1.0 / max(halflife_polls, 1.0))
+        self.offset: float = 0.0  # add this to the venue tick to reach composite
+        self.samples: int = 0
+        self.last_composite: float | None = None
+
+    async def poll_once(self) -> float | None:
+        """One composite reading, as the median of the reachable USD venues."""
+        prices: list[float] = []
+        for name, url in COMPOSITE_SOURCES:
+            try:
+                async with self._session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=8)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = json_loads(await resp.read())
+                prices.append(_extract_price(name, data))
+            except Exception:  # noqa: BLE001 - a venue being down is routine
+                continue
+        prices = [p for p in prices if p and p > 0]
+        if len(prices) < 2:
+            return None
+        prices.sort()
+        mid = len(prices) // 2
+        composite = prices[mid] if len(prices) % 2 else (prices[mid - 1] + prices[mid]) / 2.0
+        self.last_composite = composite
+        return composite
+
+    async def run(self, buffer, interval: float = 20.0) -> None:
+        while True:
+            try:
+                composite = await self.poll_once()
+                tick = buffer.last()
+                if composite is not None and tick is not None and tick.price > 0:
+                    raw = composite - tick.price
+                    # Seed on the first reading, then smooth.
+                    self.offset = raw if self.samples == 0 else (
+                        self.offset + self._alpha * (raw - self.offset)
+                    )
+                    self.samples += 1
+                    if self.samples == 1 or self.samples % 15 == 0:
+                        log.info(
+                            "Feed basis vs USD composite: %+.2f USD (%+.1f bps), n=%d",
+                            self.offset,
+                            self.offset / composite * 1e4,
+                            self.samples,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Basis poll failed: %s", exc)
+            await asyncio.sleep(interval)
+
+    def correct(self, price: float) -> float:
+        return price + self.offset
+
+
+def _extract_price(name: str, data) -> float | None:
+    try:
+        if name == "coinbase":
+            return float(data["data"]["amount"])
+        if name == "kraken":
+            return float(list(data["result"].values())[0]["c"][0])
+        if name == "bitstamp":
+            return float(data["last"])
+        if name == "gemini":
+            return float(data["last"])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+#: USD spot venues used to approximate the BRTI composite.
+COMPOSITE_SOURCES = (
+    ("coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot"),
+    ("kraken", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"),
+    ("bitstamp", "https://www.bitstamp.net/api/v2/ticker/btcusd/"),
+    ("gemini", "https://api.gemini.com/v1/pubticker/btcusd"),
+)
+
+
 class CoinbaseSpotStream:
     """USD-quoted BTC tape, aligned with what Kalshi actually settles on.
 
@@ -441,11 +541,21 @@ class CoinbaseSpotStream:
     detection, volatility, the tripwire - is unchanged.
     """
 
-    def __init__(self, buffer, url: str = COINBASE_WS, product: str = COINBASE_PRODUCT) -> None:
+    def __init__(
+        self,
+        buffer,
+        url: str = COINBASE_WS,
+        product: str = COINBASE_PRODUCT,
+        basis: "CompositeBasis | None" = None,
+    ) -> None:
         self._buffer = buffer
         self._url = url
         self._product = product
         self._connected = False
+        #: Optional level correction toward the BRTI-like composite. Without it
+        #: the tape carries this venue's persistent premium or discount, which
+        #: on a 15-minute contract is worth several points of probability.
+        self._basis = basis
 
     @property
     def connected(self) -> bool:
@@ -480,6 +590,8 @@ class CoinbaseSpotStream:
                         except (ValueError, KeyError, TypeError):
                             continue
                         if price > 0:
+                            if self._basis is not None:
+                                price = self._basis.correct(price)
                             self._buffer.add(price, 0, t1)
             except asyncio.CancelledError:
                 raise
