@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+*.pem
 
 # Per-run log files
 logs/

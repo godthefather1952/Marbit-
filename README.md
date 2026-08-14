@@ -353,9 +353,47 @@ for Polymarket transfers unchanged. And Kalshi **publishes the strike**
 strike-free delta-shift workaround Polymarket forced.
 
 ```bash
-python kalshi_monitor.py                 # read-only, no orders, no credentials
+python kalshi_monitor.py                 # dry run: no orders, no credentials
 python kalshi_monitor.py --min-edge 0.02
 ```
+
+### Going live
+
+```bash
+python kalshi_monitor.py --live
+```
+
+On first `--live` run the monitor walks through credential setup itself — there
+is nothing to pre-configure:
+
+1. It prompts for the **API key ID** and the **RSA private key** (a path to the
+   downloaded `.pem`, or paste the PEM directly — it reads to the `-----END`
+   line, since a PEM is multi-line).
+2. It proves the pair with a **signed balance request** against the live API. A
+   PEM that merely parses is not a key that works.
+3. It shows the balance and asks you to **confirm it is yours** — the one check
+   that catches a valid key for the wrong account.
+4. Only then does it write `.env`. A pasted PEM goes into `kalshi_key.pem`
+   (chmod 600, gitignored) rather than inline — the `.env` parser is line-based
+   and would silently truncate a multi-line key. Any failure at any step
+   re-prompts from the top; nothing broken is ever saved.
+
+`python kalshi_setup.py` runs the same flow standalone; `--check` verifies
+what `.env` already holds without prompting.
+
+Before any real size goes out, the trader also proves the **side mapping** with
+a single 1-contract NO order read back as a position — Kalshi's API models
+every market as one YES book (`buy NO @ q` = `sell YES @ 1-q`), and getting
+that inversion backwards would take the opposite of every intended trade.
+
+**An edge must survive being watched before it is traded.** One evaluation pass
+is one glance at one book snapshot; a stale poll or a fleeting quote looks
+identical to a real edge for 200ms. `--confirm-seconds` (default 3s, minimum
+`--confirm-passes` sightings) holds every signal — paper and live — until it
+has persisted, then executes at the *latest* price, not the first one. Sizing
+is proportional to the account: `--max-stake-pct` (default 8% per trade) with
+`--max-exposure-pct`, a `--daily-loss-pct` session stop, a consecutive-loss
+halt, and a hard `--max-trades` cap behind it.
 
 ### The two things that decide viability
 

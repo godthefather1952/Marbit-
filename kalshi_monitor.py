@@ -105,6 +105,10 @@ class Monitor:
         self._settled: set[str] = set()
         self._pending_orders: list = []
         self._client_ref = None
+        # Confirmation state: an edge must be re-seen across passes spanning
+        # `--confirm-seconds` before it is recorded or traded. Key is
+        # (strategy, ticker, leg sides); value tracks first/last sighting.
+        self._candidates: dict[tuple, dict] = {}
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -538,10 +542,46 @@ class Monitor:
             self._emit(sig)
 
     def _emit(self, sig) -> None:
-        """Record a signal once per (strategy, market) and queue it for execution."""
+        """Hold a signal until it has been confirmed over time, then queue it.
+
+        One evaluation pass is one glance at one book snapshot: a stale poll, a
+        fleeting quote, or a single bad tick all look identical to a real edge
+        for 200ms. Requiring the same signal to recur across passes spanning
+        `--confirm-seconds` filters those out. The trade-off is honest and
+        deliberate: a real edge that vanishes inside the window was never
+        capturable at our polling cadence anyway - the book updates at
+        `--book-interval`, so an edge we cannot see twice is an edge we would
+        have been filled on late or not at all.
+
+        The queued signal is the LATEST sighting, so execution prices at the
+        current ask rather than the one from the start of the window.
+        """
         if sig is None:
             return
         self._strategy_hits[sig.strategy] = self._strategy_hits.get(sig.strategy, 0) + 1
+        now = time.monotonic()
+        need_s = self._args.confirm_seconds
+        need_n = max(self._args.confirm_passes, 1)
+
+        if need_s > 0.0 or need_n > 1:
+            key = (sig.strategy, sig.ticker, tuple(leg.side for leg in sig.legs))
+            cand = self._candidates.get(key)
+            # A gap longer than the window means the edge closed and reopened;
+            # that is a new candidate, not a continuation of the old one.
+            if cand is None or now - cand["last"] > max(need_s, 2.0):
+                self._candidates[key] = {"first": now, "last": now, "passes": 1}
+                log.info(
+                    "candidate [%s] %s: confirming over %.1fs (%d passes)...",
+                    sig.strategy, sig.ticker, need_s, need_n,
+                )
+                return
+            cand["last"] = now
+            cand["passes"] += 1
+            if now - cand["first"] < need_s or cand["passes"] < need_n:
+                return
+            held = now - cand["first"]
+            sig.note = f"{sig.note} | confirmed over {held:.1f}s / {cand['passes']} passes"
+
         if self.ledger is not None and self.ledger.record(sig):
             self._pending_orders.append(sig)
             log.warning(
@@ -560,6 +600,15 @@ class Monitor:
                     sig = self._pending_orders.pop(0)
                     if trader.check_halt():
                         continue
+                    if not trader.side_mapping_verified:
+                        # One 1-contract NO order, read back as a position,
+                        # before any real size: getting the YES-book inversion
+                        # backwards would take the opposite of every trade.
+                        if not await trader.verify_side_mapping(sig.ticker):
+                            trader.halted = True
+                            trader.halt_reason = "side mapping verification failed"
+                            log.error("TRADING HALTED: %s", trader.halt_reason)
+                            continue
                     for leg in sig.legs:
                         count = trader.size_for(leg.price)
                         if count < 1:
@@ -661,7 +710,15 @@ def parse_args() -> argparse.Namespace:
                         "venue - Kalshi settles in USD and Binance quotes USDT, a basis "
                         "as large as the signal. Provided to demonstrate the error.")
     p.add_argument("--live", action="store_true",
-                   help="PLACE REAL ORDERS WITH REAL MONEY. Off by default.")
+                   help="PLACE REAL ORDERS WITH REAL MONEY. Off by default. Prompts "
+                        "for and verifies Kalshi credentials on startup if .env "
+                        "does not already hold a working pair.")
+    p.add_argument("--confirm-seconds", type=float, default=3.0,
+                   help="an edge must persist this long, re-seen across passes, "
+                        "before it is recorded or traded. 0 disables. One glance at "
+                        "one book snapshot is not a verified edge.")
+    p.add_argument("--confirm-passes", type=int, default=3,
+                   help="minimum number of sightings inside --confirm-seconds")
     p.add_argument("--max-stake-pct", type=float, default=8.0,
                    help="percent of starting balance staked per trade")
     p.add_argument("--max-exposure-pct", type=float, default=25.0,
@@ -733,6 +790,18 @@ async def amain(args: argparse.Namespace, monitor: "Monitor") -> None:
 
 def main() -> None:
     args = parse_args()
+
+    if args.live:
+        # Interactive, synchronous, and BEFORE any market task exists: prompt
+        # for keys if needed, prove them with a signed balance call, have the
+        # human recognise the balance, and only then persist to .env. A live
+        # session must never start on unverified credentials.
+        from kalshi_setup import ensure_credentials
+
+        if ensure_credentials(args.env_file) is None:
+            log.error("Credential setup failed; not starting a live session.")
+            return
+
     monitor = Monitor(args)
 
     run_log = None
@@ -740,7 +809,11 @@ def main() -> None:
         run_log = start_run_log(
             log,
             directory=args.log_dir,
-            title="KALSHI MONITOR (READ-ONLY, NO ORDERS)",
+            title=(
+                "KALSHI MONITOR (LIVE - REAL ORDERS ENABLED)"
+                if args.live
+                else "KALSHI MONITOR (DRY RUN, NO ORDERS)"
+            ),
             context=[
                 f"series  : {args.series}",
                 f"feed    : {'Binance BTCUSDT (USDT - MISPRICED)' if args.binance else 'Coinbase BTC-USD (USD, BRTI constituent)'}",

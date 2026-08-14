@@ -1853,6 +1853,123 @@ async def test_strategies() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Credential setup and the confirm-over-time gate
+# --------------------------------------------------------------------------- #
+
+
+async def test_setup_and_confirmation() -> None:
+    print("\n--- credential setup and edge confirmation ---")
+
+    import argparse as _ap
+    import os
+    import stat as _stat
+    import tempfile
+    import time as _time
+    from pathlib import Path
+
+    from kalshi_setup import PEM_FILE, save_credentials
+    from strategies import Leg, PaperLedger, Signal
+
+    # -- .env persistence ---------------------------------------------------- #
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Path(tmp) / ".env"
+        env.write_text(
+            "# comment survives\nOTHER_KEY=untouched\nKALSHI_API_KEY_ID=old-id\n",
+            encoding="utf-8",
+        )
+        save_credentials(env, "new-id", pem_text="-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n")
+        text = env.read_text(encoding="utf-8")
+        check("an existing key line is replaced, not duplicated",
+              text.count("KALSHI_API_KEY_ID") == 1 and "new-id" in text and "old-id" not in text)
+        check("unrelated lines and comments survive the rewrite",
+              "# comment survives" in text and "OTHER_KEY=untouched" in text)
+        key_file = Path(tmp) / PEM_FILE
+        check("a pasted PEM lands in its own file, referenced by path",
+              key_file.is_file() and str(key_file) in text)
+        mode = _stat.S_IMODE(key_file.stat().st_mode)
+        check("the key file is owner-only (600)", mode == 0o600, oct(mode))
+        check("the process environment is updated without a restart",
+              os.environ.get("KALSHI_API_KEY_ID") == "new-id")
+
+        # A path-based key must not create a copy of the PEM.
+        save_credentials(env, "path-id", pem_path="/somewhere/key.pem")
+        text = env.read_text(encoding="utf-8")
+        check("a path-based key is stored as the path alone",
+              "KALSHI_PRIVATE_KEY_PATH=/somewhere/key.pem" in text
+              and text.count("KALSHI_PRIVATE_KEY_PATH") == 1)
+    for var in ("KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH"):
+        os.environ.pop(var, None)
+
+    # -- the confirm-over-time gate ------------------------------------------ #
+    from kalshi_monitor import Monitor
+
+    def fresh_monitor(confirm_seconds: float, confirm_passes: int, tmp: str) -> Monitor:
+        args = _ap.Namespace(
+            confirm_seconds=confirm_seconds, confirm_passes=confirm_passes,
+            series="KXBTC15M", min_edge=0.02, spike_bps=12.0, size=20.0,
+            min_seconds_left=20.0, book_interval=1.0, discovery_interval=10.0,
+            cooldown=5.0, heartbeat=15.0, binance=False, live=False,
+            max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
+            max_trades=40, min_profit=0.01, anchor_age=20.0,
+            endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
+            allow_unvalidated_vol=False, no_cross=False, no_stale=False,
+            no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
+            env_file=".env", verbose=False,
+        )
+        mon = Monitor(args)
+        mon.ledger = PaperLedger(Path(tmp) / "paper_test.jsonl")
+        return mon
+
+    def sig(side: str = "YES") -> Signal:
+        return Signal(
+            strategy="STALE", ticker="KXBTC15M-TEST-15",
+            legs=[Leg(side, 0.40, 20.0)], fair_yes=0.48, expected_net=0.60,
+            max_loss=8.0, spot=63_400.0, strike=63_380.0, seconds_left=500.0,
+            sigma_used=1.2e-4,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.05, 3, tmp)
+        mon._emit(sig())
+        check("a first sighting is held, not recorded", not mon._pending_orders)
+        mon._emit(sig())
+        check("a second sighting inside the window is still held",
+              not mon._pending_orders)
+        _time.sleep(0.06)
+        mon._emit(sig())
+        check("the third sighting past the window confirms and queues",
+              len(mon._pending_orders) == 1)
+        check("the confirmation is stamped into the signal's note",
+              "confirmed over" in mon._pending_orders[0].note)
+        mon._emit(sig())
+        check("re-confirmation does not double-queue (ledger dedupes)",
+              len(mon._pending_orders) == 1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.05, 3, tmp)
+        mon._emit(sig("YES"))
+        mon._emit(sig("NO"))
+        check("YES and NO edges confirm independently",
+              len(mon._candidates) == 2 and not mon._pending_orders)
+
+        # A gap longer than the window restarts the clock: the edge closed and
+        # reopened, which is a new event, not persistence.
+        key = ("STALE", "KXBTC15M-TEST-15", ("YES",))
+        mon._candidates[key]["last"] -= 10.0
+        mon._candidates[key]["first"] -= 10.0
+        mon._candidates[key]["passes"] = 99
+        mon._emit(sig("YES"))
+        check("a lapsed candidate restarts instead of confirming stale history",
+              mon._candidates[key]["passes"] == 1 and not mon._pending_orders)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        mon._emit(sig())
+        check("confirm-seconds 0 restores immediate recording",
+              len(mon._pending_orders) == 1)
+
+
+# --------------------------------------------------------------------------- #
 # Kalshi execution
 # --------------------------------------------------------------------------- #
 
@@ -1972,6 +2089,7 @@ async def main() -> None:
     await test_risk_breakers()
     await test_kalshi()
     await test_strategies()
+    await test_setup_and_confirmation()
     await test_kalshi_execution()
     await test_polymarket_us()
     await test_run_log()
