@@ -151,6 +151,35 @@ class KalshiTrader:
         )
         return True
 
+    async def go_live(self) -> bool:
+        """Promote a dry trader to live, after the warm-up gates have passed.
+
+        The paper phase's numbers are simulations: carrying them into the live
+        risk state would either eat the daily-loss budget with fake losses or
+        pad it with fake wins. So everything resets - counters, halt state,
+        simulated orders - and the live session starts clean from the real
+        balance, re-proving the side mapping with a real order before size.
+
+        On any arming failure the trader falls back to dry rather than being
+        left half-armed with dry_run=False and no balance.
+        """
+        if not self.dry_run:
+            return True
+        self.dry_run = False
+        self.realized = 0.0
+        self.open_stake = 0.0
+        self.trades = 0
+        self.consecutive_losses = 0
+        self.halted = False
+        self.halt_reason = ""
+        self.side_mapping_verified = False
+        self._orders.clear()
+        ok = await self.arm()
+        if not ok:
+            self.dry_run = True
+            log.error("Promotion to live failed; staying on paper")
+        return ok
+
     # -- sizing and gates --------------------------------------------------- #
 
     def max_stake(self) -> float:

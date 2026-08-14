@@ -1970,6 +1970,132 @@ async def test_setup_and_confirmation() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Autopilot: promotion and quality gates
+# --------------------------------------------------------------------------- #
+
+
+async def test_autopilot() -> None:
+    print("\n--- autopilot: promotion and quality gates ---")
+
+    import tempfile
+    import time as _time
+    from types import SimpleNamespace
+
+    from kalshi import KalshiClient
+    from kalshi_execution import KalshiTrader, RiskLimits
+    from kalshi_main import evaluate_gates
+    from kalshi_monitor import Monitor
+
+    # -- go_live: the paper phase must not leak into the live risk state ----- #
+    class FakeClient(KalshiClient):
+        def __init__(self, balance_cents=7500, fail=False):  # noqa: super-init-not-called
+            self._cents, self._fail = balance_cents, fail
+
+        def authenticate(self):
+            if self._fail:
+                from kalshi import KalshiAuthError
+
+                raise KalshiAuthError("bad key")
+
+        async def balance(self):
+            return {"balance": self._cents}
+
+    trader = KalshiTrader(FakeClient(), RiskLimits(), dry_run=True)
+    await trader.arm()
+    trader.realized = -10.0
+    trader.trades = 7
+    trader.consecutive_losses = 3
+    trader.halted = True
+    trader.halt_reason = "paper losses"
+    trader.side_mapping_verified = True
+    ok = await trader.go_live()
+    check("go_live arms against the real balance", ok and not trader.dry_run
+          and abs(trader.starting_balance - 75.0) < 1e-9)
+    check("paper-phase PnL, halts and counters do not leak into live",
+          trader.realized == 0.0 and trader.trades == 0
+          and trader.consecutive_losses == 0 and not trader.halted)
+    check("the side mapping must be re-proven with a real order",
+          not trader.side_mapping_verified)
+    check("go_live on an already-live trader is a no-op", await trader.go_live())
+
+    failing = KalshiTrader(FakeClient(fail=True), RiskLimits(), dry_run=True)
+    await failing.arm()
+    check("a failed promotion falls back to paper, not half-armed",
+          not await failing.go_live() and failing.dry_run)
+
+    # -- evaluate_gates ------------------------------------------------------ #
+    def ready_monitor(tmp: str) -> Monitor:
+        import argparse as _ap
+
+        mon = Monitor(_ap.Namespace(
+            confirm_seconds=3.0, confirm_passes=3, series="KXBTC15M",
+            min_edge=0.02, size=20.0, no_basis=True, binance=False,
+            vol_ratio_max=1.5, allow_unvalidated_vol=False, live=False,
+            min_seconds_left=20.0, spike_bps=12.0, book_interval=1.0,
+            discovery_interval=10.0, cooldown=5.0, heartbeat=15.0,
+            max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
+            max_trades=40, min_profit=0.01, anchor_age=20.0,
+            endgame_window=120.0, endgame_z=3.0, no_cross=False,
+            no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
+            env_file=".env", verbose=False,
+        ))
+        mon._stream = SimpleNamespace(connected=True)
+        mon._basis = None
+        mon._market = SimpleNamespace(ticker="KXBTC15M-T", strike_known=True)
+        now = _time.monotonic()
+        for i in range(35):  # past the 31-bar vol_is_measured threshold
+            mon._buffer._bars.append((now - 35 + i, 63_000.0))
+        mon._observations = 500
+        mon._vol_ratios = [1.1] * 60
+        return mon
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = ready_monitor(tmp)
+        passed, lines = evaluate_gates(mon, 1.5)
+        check("a healthy warm-up passes every gate", passed, lines[-1].strip())
+
+        mon = ready_monitor(tmp)
+        mon._vol_ratios = [2.4] * 60
+        passed, lines = evaluate_gates(mon, 1.5)
+        check("a sigma disagreement fails promotion",
+              not passed and any("sigma agrees" in l and "FAIL" in l for l in lines))
+
+        mon = ready_monitor(tmp)
+        mon._vol_ratios = [1.1] * 5  # too few to validate
+        passed, _ = evaluate_gates(mon, 1.5)
+        check("an unvalidatable sigma fails closed, not open", not passed)
+
+        mon = ready_monitor(tmp)
+        mon._market = SimpleNamespace(ticker="X", strike_known=False)
+        passed, _ = evaluate_gates(mon, 1.5)
+        check("a market without a published strike fails promotion", not passed)
+
+        mon = ready_monitor(tmp)
+        mon._stream = SimpleNamespace(connected=False)
+        passed, _ = evaluate_gates(mon, 1.5)
+        check("a dead spot feed fails promotion", not passed)
+
+    # -- reset_for_live ------------------------------------------------------ #
+    from strategies import Leg, PaperLedger, Signal
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = ready_monitor(tmp)
+        mon.ledger = PaperLedger(Path(tmp) / "p.jsonl")
+        sig = Signal(strategy="STALE", ticker="T", legs=[Leg("YES", 0.4, 20.0)],
+                     fair_yes=0.5, expected_net=1.0, max_loss=8.0, spot=1.0,
+                     strike=1.0, seconds_left=100.0, sigma_used=1e-4)
+        mon.ledger.record(sig)
+        mon._pending_orders.append(sig)
+        mon._candidates[("STALE", "T", ("YES",))] = {"first": 0, "last": 0, "passes": 1}
+        mon.reset_for_live()
+        check("promotion clears stale paper-phase queues",
+              not mon._pending_orders and not mon._candidates)
+        check("a market that signalled on paper can trade live",
+              mon.ledger.record(sig))
+
+
+# --------------------------------------------------------------------------- #
 # Kalshi execution
 # --------------------------------------------------------------------------- #
 
@@ -2090,6 +2216,7 @@ async def main() -> None:
     await test_kalshi()
     await test_strategies()
     await test_setup_and_confirmation()
+    await test_autopilot()
     await test_kalshi_execution()
     await test_polymarket_us()
     await test_run_log()

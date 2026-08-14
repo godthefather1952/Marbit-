@@ -541,6 +541,18 @@ class Monitor:
         for sig in found:
             self._emit(sig)
 
+    def reset_for_live(self) -> None:
+        """Drop paper-phase signal state at the moment of promotion.
+
+        Signals queued during warm-up are stale by the time the gates pass, and
+        the ledger's once-per-market dedupe would otherwise block any market
+        that signalled on paper from ever trading live.
+        """
+        self._pending_orders.clear()
+        self._candidates.clear()
+        if self.ledger is not None:
+            self.ledger.reset_dedupe()
+
     def _emit(self, sig) -> None:
         """Hold a signal until it has been confirmed over time, then queue it.
 
@@ -692,7 +704,7 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[idx]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--series", default=BTC_15M_SERIES, help="Kalshi series ticker")
     p.add_argument("--min-edge", type=float, default=0.02,
@@ -757,7 +769,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-log", action="store_true", help="console only, write no log file")
     p.add_argument("--env-file", default=".env")
     p.add_argument("--verbose", action="store_true")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

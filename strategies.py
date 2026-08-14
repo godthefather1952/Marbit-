@@ -372,3 +372,13 @@ class PaperLedger:
             fh.write(json.dumps(row) + "\n")
         self.count += 1
         return True
+
+    def reset_dedupe(self) -> None:
+        """Forget which (strategy, market) pairs have been recorded.
+
+        Used at the paper-to-live promotion: without this, a market that
+        signalled during warm-up could never trade live, because its key is
+        already marked seen. The file keeps both phases' rows; their
+        timestamps separate them.
+        """
+        self._seen.clear()

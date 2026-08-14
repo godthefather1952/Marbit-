@@ -357,7 +357,38 @@ python kalshi_monitor.py                 # dry run: no orders, no credentials
 python kalshi_monitor.py --min-edge 0.02
 ```
 
-### Going live
+### One command: the staged autopilot
+
+```bash
+python kalshi_main.py
+```
+
+The single entry point that runs a whole session, in phases:
+
+| phase | what happens | can it trade? |
+|---|---|---|
+| **preflight** | mode prompt (dry/LIVE), warm-up length; live mode prompts for and proves credentials | no |
+| **warm-up** | paper-only monitoring for your chosen minutes while volatility is measured from the tape | no |
+| **promotion** | live arms **only if the quality gates pass** — σ agreeing with the market's own quote, feed healthy, market live with a published strike. A failed gate stays paper, says why, re-checks every 5 min | after gates |
+| **session** | trades (live) or records (paper) until Ctrl+C or `--session-min` | yes |
+| **scorecard** | waits for traded markets to settle, grades every trade against the real outcome; second Ctrl+C skips the wait | — |
+
+The warm-up is a proving period, not a timer: twenty minutes that end with our
+volatility 3x off the market's quote is twenty minutes that proved the session
+should *not* go live, and the autopilot obeys that. Every phase, gate report
+and the final scorecard land in one session log (`logs/L_MMDDYY_HHMMSS.log`),
+printed at exit — that file is the run's record; send it for review.
+
+```bash
+python kalshi_main.py --mode live --warmup-min 20      # skip the prompts
+python kalshi_main.py --mode dry --min-edge 0.03       # extra flags pass through
+```
+
+The individual scripts still work standalone (`kalshi_monitor.py`,
+`kalshi_setup.py`, `kalshi_score.py`, `check_kalshi_account.py`) — the
+autopilot orchestrates them, it doesn't replace them.
+
+### Going live by hand
 
 ```bash
 python kalshi_monitor.py --live
