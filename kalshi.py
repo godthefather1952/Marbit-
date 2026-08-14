@@ -231,8 +231,29 @@ class KalshiMarket:
         now = now if now is not None else time.time()
         return self.status in ("active", "open") and self.open_ts <= now < self.close_ts
 
-    def fair_value(self, spot: float, sigma_per_sqrt_s: float, now: float | None = None) -> float:
+    @property
+    def strike_known(self) -> bool:
+        """False for the first ~30-45s of a window, before `floor_strike` posts.
+
+        Kalshi opens the contract before the 60s TWAP that defines the strike
+        has finished printing, so a freshly-discovered market arrives with
+        `floor_strike` absent and parses to 0.0. Every model price computed in
+        that gap is meaningless, and a monitor that quietly substitutes 0.5
+        turns the gap into a large fake edge against whichever side the book is
+        leaning. Callers must check this before pricing anything.
+        """
+        return self.strike > 0.0
+
+    def fair_value(
+        self, spot: float, sigma_per_sqrt_s: float, now: float | None = None
+    ) -> float | None:
         """P(settlement TWAP >= strike), from the PUBLISHED strike.
+
+        Returns None - not a neutral 0.5 - when the inputs cannot support a
+        price. 0.5 is a real probability and reads as "coin flip", so returning
+        it for "unknown" is indistinguishable downstream from a genuine
+        at-the-money quote, and any book trading away from 0.5 then looks like
+        free money.
 
         Kalshi publishing `floor_strike` is the material improvement over
         Polymarket: fair value is absolute rather than a shift relative to the
@@ -245,11 +266,11 @@ class KalshiMarket:
         error is small at 15-minute horizons and is bounded by staying out of
         the final seconds.
         """
-        if spot <= 0 or self.strike <= 0:
-            return 0.5
+        if spot <= 0 or not self.strike_known:
+            return None
         denom = sigma_per_sqrt_s * math.sqrt(self.effective_tau(now))
         if denom <= 0.0:
-            return 0.5
+            return None
         return clamp_prob(norm_cdf(math.log(spot / self.strike) / denom))
 
 

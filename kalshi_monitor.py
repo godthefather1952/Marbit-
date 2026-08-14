@@ -34,6 +34,7 @@ from strategies import (
     scan_cross,
     scan_endgame,
     scan_stale,
+    vol_agreement,
 )
 from btc_polymarket_arb import (
     BINANCE_WS_FALLBACKS,
@@ -77,12 +78,23 @@ class Monitor:
         # distribution rather than just the maximum. This is the number that
         # answers whether the strategy is worth funding.
         self._net_edges: list[float] = []
+        #: The subset where our volatility agreed with the market's. Only these
+        #: are candidates for being real; the rest are a sigma argument.
+        self._net_edges_validated: list[float] = []
         self._signal_by_market: dict[str, int] = {}
         self._markets_seen: set[str] = set()
         self._edge_seconds = 0.0
         self._last_eval_mono = 0.0
         self._start_mono = 0.0
         self._fallback_vol_obs = 0
+        # Volatility cross-check bookkeeping. The absolute model has no input
+        # the book lacks except sigma, so a persistent disagreement here is the
+        # whole of any "edge" it reports - tracked so the summary can say so.
+        self._vol_ratios: list[float] = []
+        self._sigma_pairs: list[tuple[float, float]] = []
+        self._no_strike_obs = 0
+        self._unvalidated_vol_obs = 0
+        self._vol_gated_obs = 0
         self.run_log = None
         self.ledger: PaperLedger | None = None
         # Rolling anchor for STALE: the market's own mid and our spot at the
@@ -214,20 +226,48 @@ class Monitor:
         if remaining < self._args.min_seconds_left:
             return
 
+        now_mono = time.monotonic()
         sigma = self._buffer.sigma_per_sqrt_second()
-        fair = market.fair_value(tick.price, sigma)
-        self._observations += 1
         self._markets_seen.add(market.ticker)
+
+        # Kalshi lists the contract before `floor_strike` posts, so the first
+        # ~30-45s of every window has no strike. Nothing model-based can be
+        # priced there; CROSS can, because it never looks at one.
+        if not market.strike_known:
+            self._no_strike_obs += 1
+            if not self._args.no_cross:
+                self._emit(scan_cross(market, book, self._args.size, self._args.min_profit))
+            return
+
+        self._observations += 1
         if not self._buffer.vol_is_measured:
             self._fallback_vol_obs += 1
+
+        # The one number that decides whether any of this is real. See
+        # strategies.vol_agreement.
+        sigma_implied = implied_sigma(market, book, tick.price)
+        ratio = vol_agreement(sigma, sigma_implied)
+        if sigma_implied is not None:
+            self._sigma_pairs.append((sigma, sigma_implied))
+        if ratio is None:
+            self._unvalidated_vol_obs += 1
+        else:
+            self._vol_ratios.append(ratio)
+        vol_ok = ratio is not None and ratio <= self._args.vol_ratio_max
+        if not vol_ok and not self._args.allow_unvalidated_vol:
+            self._vol_gated_obs += 1
+
+        fair = market.fair_value(tick.price, sigma)
         best_this_pass = -1.0
 
         # Keep a rolling (time, spot, market mid) anchor for the STALE model.
-        now_mono = time.monotonic()
         mid = book.yes_mid
         if mid is not None:
             self._anchors.append((now_mono, tick.price, mid))
-        self._run_strategies(market, book, tick.price, sigma, now_mono)
+        self._run_strategies(market, book, tick.price, sigma, now_mono, vol_ok)
+
+        if fair is None:
+            return
 
         for side, ask, fair_side in (
             ("YES", book.yes_ask, fair),
@@ -239,6 +279,12 @@ class Monitor:
             self._best_net = max(self._best_net, edge)
             best_this_pass = max(best_this_pass, edge)
             if edge < self._args.min_edge:
+                continue
+            if not vol_ok and not self._args.allow_unvalidated_vol:
+                # Suppressed on purpose. With the strike published and the
+                # clock public, a disagreement about sigma is the only thing
+                # that can produce this number, and ours is the side more
+                # likely to be wrong.
                 continue
             if time.monotonic() - self._last_signal_mono < self._args.cooldown:
                 continue
@@ -257,7 +303,8 @@ class Monitor:
                 "================ EDGE (net of fees) ================\n"
                 " market     : %s\n"
                 " spot       : %s   strike %s   (%+.2f%% vs strike)\n"
-                " expiry     : %.0fs remaining   tau_eff %.0fs   sigma %.2f bps/s\n"
+                " expiry     : %.0fs remaining   tau_eff %.0fs\n"
+                " sigma      : ours %.2f bps/s vs market %s bps/s  (ratio %s)\n"
                 " fair value : %.4f  (%s)\n"
                 " %-3s ask    : %.4f   size %s\n"
                 " gross edge : %+.4f/contract\n"
@@ -273,6 +320,8 @@ class Monitor:
                 remaining,
                 market.effective_tau(),
                 sigma * 10_000.0,
+                f"{sigma_implied * 10_000.0:.2f}" if sigma_implied else "n/a",
+                f"{ratio:.2f}x" if ratio else "unvalidated",
                 fair_side,
                 side,
                 side,
@@ -292,8 +341,10 @@ class Monitor:
         # Post-pass bookkeeping for the session summary.
         if best_this_pass > -1.0:
             self._net_edges.append(best_this_pass)
+            if vol_ok:
+                self._net_edges_validated.append(best_this_pass)
             now_mono = time.monotonic()
-            if self._last_eval_mono and best_this_pass >= self._args.min_edge:
+            if self._last_eval_mono and best_this_pass >= self._args.min_edge and vol_ok:
                 # Wall time spent with a tradeable edge on the screen - a far
                 # more useful figure than a raw signal count, because it says
                 # how long the window actually stays open.
@@ -318,6 +369,12 @@ class Monitor:
             f"signals       : {self._signals}",
         ]
 
+        if self._no_strike_obs:
+            lines.append(
+                f"no-strike     : {self._no_strike_obs:,} passes skipped while "
+                f"floor_strike had not posted"
+            )
+
         if self._fallback_vol_obs:
             share = self._fallback_vol_obs / max(self._observations, 1) * 100.0
             lines += [
@@ -329,23 +386,37 @@ class Monitor:
                 "         as trustworthy as that assumption - run longer before",
                 "         drawing any conclusion.",
             ]
+
+        lines += self._vol_lines()
+
         if edges:
+            validated = self._net_edges_validated
             lines += [
                 "",
-                "net edge per observation (after fees), best of YES/NO:",
-                f"   p50  {_fmt_edge(_percentile(edges, 50))}",
-                f"   p90  {_fmt_edge(_percentile(edges, 90))}",
-                f"   p99  {_fmt_edge(_percentile(edges, 99))}",
-                f"   max  {_fmt_edge(max(edges))}",
+                "net edge per observation (after fees), best of YES/NO.",
+                "  RAW is every observation. VALIDATED is the subset where our",
+                "  volatility agreed with the market's; only those can be real.",
+                f"                    {'RAW':>10}  {'VALIDATED':>10}",
+                f"   observations  {len(edges):>10,}  {len(validated):>10,}",
+                f"   p50           {_fmt_edge(_percentile(edges, 50)):>10}  "
+                f"{_fmt_edge(_percentile(validated, 50)):>10}",
+                f"   p90           {_fmt_edge(_percentile(edges, 90)):>10}  "
+                f"{_fmt_edge(_percentile(validated, 90)):>10}",
+                f"   p99           {_fmt_edge(_percentile(edges, 99)):>10}  "
+                f"{_fmt_edge(_percentile(validated, 99)):>10}",
+                f"   max           {_fmt_edge(max(edges)):>10}  "
+                f"{_fmt_edge(max(validated)) if validated else 'n/a':>10}",
                 "",
-                f"time with a tradeable edge : {self._edge_seconds:.0f}s of {elapsed:.0f}s "
-                f"({self._edge_seconds / elapsed * 100.0:.2f}%)",
+                f"time with a validated tradeable edge : {self._edge_seconds:.0f}s of "
+                f"{elapsed:.0f}s ({self._edge_seconds / elapsed * 100.0:.2f}%)",
             ]
-            positive = sum(1 for e in edges if e >= self._args.min_edge)
-            lines.append(
-                f"observations at or above the threshold : {positive:,} of "
-                f"{len(edges):,} ({positive / len(edges) * 100.0:.2f}%)"
-            )
+            raw_pos = sum(1 for e in edges if e >= self._args.min_edge)
+            val_pos = sum(1 for e in validated if e >= self._args.min_edge)
+            lines += [
+                f"observations at or above the threshold : {raw_pos:,} raw "
+                f"({raw_pos / len(edges) * 100.0:.2f}%), {val_pos:,} validated "
+                f"({val_pos / max(len(edges), 1) * 100.0:.2f}% of all)",
+            ]
         else:
             lines += ["", "no observations recorded - the market or tape never came up"]
 
@@ -360,13 +431,67 @@ class Monitor:
             lines += [
                 "",
                 "NOTE: a large, persistent edge on a liquid market usually means a",
-                "      model or feed error, not free money. Sanity-check the fair",
-                "      value against the quote before believing it.",
+                "      model or feed error, not free money. Read the VALIDATED",
+                "      column and the volatility block above before believing it.",
             ]
         return lines
 
-    def _run_strategies(self, market, book, spot, sigma, now_mono) -> None:
-        """Run every enabled strategy and record what each would have traded."""
+    def _vol_lines(self) -> list[str]:
+        """Report our volatility against the market's - the decisive comparison.
+
+        With the strike published and the clock public, our only conceivable
+        advantage over the book is the spot price, which the book sees at least
+        as fast. So on the absolute model, an "edge" and a sigma disagreement
+        are the same event described two ways. Printing the two side by side is
+        what makes that visible instead of flattering.
+        """
+        pairs = self._sigma_pairs
+        ratios = self._vol_ratios
+        total = max(self._observations, 1)
+        lines = ["", "volatility cross-check (ours vs the market's own quote):"]
+        if not pairs or not ratios:
+            lines += [
+                "   never invertible - the book sat too close to the money all run,",
+                "   so nothing model-based was validated and nothing was traded on it.",
+            ]
+            return lines
+
+        ours = sorted(s for s, _ in pairs)
+        theirs = sorted(i for _, i in pairs)
+        lines += [
+            f"   ours   (measured)  p50 {_percentile(ours, 50) * 1e4:.2f} bps/s"
+            f"   p10 {_percentile(ours, 10) * 1e4:.2f}   p90 {_percentile(ours, 90) * 1e4:.2f}",
+            f"   market (implied)   p50 {_percentile(theirs, 50) * 1e4:.2f} bps/s"
+            f"   p10 {_percentile(theirs, 10) * 1e4:.2f}   p90 {_percentile(theirs, 90) * 1e4:.2f}",
+            f"   disagreement       p50 {_percentile(ratios, 50):.2f}x"
+            f"   p90 {_percentile(ratios, 90):.2f}x   max {max(ratios):.2f}x",
+            f"   unvalidated passes {self._unvalidated_vol_obs:,} of {total:,} "
+            f"({self._unvalidated_vol_obs / total * 100.0:.0f}%) - quote too close to the money",
+            f"   suppressed passes  {self._vol_gated_obs:,} of {total:,} "
+            f"({self._vol_gated_obs / total * 100.0:.0f}%) - above the "
+            f"{self._args.vol_ratio_max:.2f}x limit",
+        ]
+        median_ratio = _percentile(ratios, 50)
+        if median_ratio > self._args.vol_ratio_max:
+            lines += [
+                "",
+                f"   Our volatility disagrees with the market's by {median_ratio:.1f}x at the",
+                "   median. That is not an opportunity, it is a broken estimator: the",
+                "   market quotes this book with a one-cent spread and real size, and",
+                "   we have five minutes of one-second bars from one venue. Any edge",
+                "   the absolute model reports here is that disagreement wearing a",
+                "   dollar sign. Fix the estimator before reading anything else.",
+            ]
+        return lines
+
+    def _run_strategies(self, market, book, spot, sigma, now_mono, vol_ok: bool) -> None:
+        """Run every enabled strategy and record what each would have traded.
+
+        `vol_ok` gates the two model-dependent strategies. CROSS is exempt: it
+        reads only the two bids and locks its profit at settlement, so it is
+        the one strategy that cannot be wrong about volatility because it never
+        forms an opinion about it.
+        """
         args = self._args
         found = []
 
@@ -374,6 +499,8 @@ class Monitor:
             sig = scan_cross(market, book, args.size, args.min_profit)
             if sig:
                 found.append(sig)
+
+        model_ok = vol_ok or args.allow_unvalidated_vol
 
         if not args.no_stale:
             # An anchor from `--anchor-age` seconds ago: the market's mid and
@@ -386,17 +513,21 @@ class Monitor:
                 else:
                     break
             if anchor:
+                # STALE takes sigma from the quote itself, so it needs no
+                # agreement check - it is already using the market's number.
                 sig = scan_stale(
                     market, book, anchor[0], anchor[1], spot, args.size,
                     args.min_edge, sigma,
+                    require_implied=not args.allow_unvalidated_vol,
                 )
                 if sig:
                     found.append(sig)
 
-        if not args.no_endgame:
+        if not args.no_endgame and model_ok:
+            # Measured sigma, deliberately: see scan_endgame. Feeding it the
+            # implied value would make its edge identically negative.
             sig = scan_endgame(
-                market, book, spot, args.size,
-                implied_sigma(market, book, spot) or sigma,
+                market, book, spot, args.size, sigma,
                 max_seconds_left=args.endgame_window,
                 min_z=args.endgame_z,
             )
@@ -404,15 +535,21 @@ class Monitor:
                 found.append(sig)
 
         for sig in found:
-            self._strategy_hits[sig.strategy] = self._strategy_hits.get(sig.strategy, 0) + 1
-            if self.ledger is not None and self.ledger.record(sig):
-                self._pending_orders.append(sig)
-                log.warning(
-                    "\n---- PAPER TRADE ----\n %s\n %s\n"
-                    " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
-                    "---------------------",
-                    sig.describe(), sig.note, sig.fair_yes, sig.max_loss,
-                )
+            self._emit(sig)
+
+    def _emit(self, sig) -> None:
+        """Record a signal once per (strategy, market) and queue it for execution."""
+        if sig is None:
+            return
+        self._strategy_hits[sig.strategy] = self._strategy_hits.get(sig.strategy, 0) + 1
+        if self.ledger is not None and self.ledger.record(sig):
+            self._pending_orders.append(sig)
+            log.warning(
+                "\n---- PAPER TRADE ----\n %s\n %s\n"
+                " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
+                "---------------------",
+                sig.describe(), sig.note, sig.fair_yes, sig.max_loss,
+            )
 
     async def _execution_loop(self) -> None:
         """Turn recorded signals into orders, and settle finished markets."""
@@ -465,21 +602,31 @@ class Monitor:
                 log.info("hb | no live %s market", self._args.series)
                 continue
             sigma = self._buffer.sigma_per_sqrt_second()
-            fair = market.fair_value(tick.price, sigma) if tick else float("nan")
+            fair = market.fair_value(tick.price, sigma) if tick else None
+            implied = (
+                implied_sigma(market, book, tick.price) if tick and book else None
+            )
+            ratio = vol_agreement(sigma, implied)
             log.info(
-                "hb | %s | spot=%s strike=%s | fair=%.3f | yes %s/%s | "
-                "%.0fs left | obs=%d signals=%d best_net=%+.4f",
+                "hb | %s | spot=%s strike=%s | fair=%s | yes %s/%s | "
+                "sigma %.2f vs mkt %s bps/s (%s) | %.0fs left | "
+                "obs=%d signals=%d best_net=%+.4f",
                 market.ticker.split("-")[-2] if "-" in market.ticker else market.ticker,
                 f"${tick.price:,.0f}" if tick else "n/a",
-                f"${market.strike:,.0f}",
-                fair,
+                f"${market.strike:,.0f}" if market.strike_known else "PENDING",
+                f"{fair:.3f}" if fair is not None else "n/a",
                 f"{book.yes_bid:.3f}" if book and book.yes_bid else "-",
                 f"{book.yes_ask:.3f}" if book and book.yes_ask else "-",
+                sigma * 10_000.0,
+                f"{implied * 10_000.0:.2f}" if implied else "n/a",
+                f"{ratio:.2f}x" if ratio else "unvalidated",
                 market.seconds_remaining(),
                 self._observations,
                 self._signals,
                 self._best_net,
             )
+            if not market.strike_known:
+                log.info("     (floor_strike has not posted yet - nothing model-based is priced)")
             if not self._buffer.vol_is_measured:
                 log.info("     (sigma is still the assumed prior, not measured from tape)")
 
@@ -531,6 +678,16 @@ def parse_args() -> argparse.Namespace:
                    help="ENDGAME: only consider markets closing within this many seconds")
     p.add_argument("--endgame-z", type=float, default=3.0,
                    help="ENDGAME: sigmas from the strike required to call it decided")
+    p.add_argument("--vol-ratio-max", type=float, default=1.50,
+                   help="how far our measured volatility may sit from the market's "
+                        "implied volatility before model-based signals are suppressed. "
+                        "The strike is published and the clock is public, so a sigma "
+                        "disagreement is the only thing the absolute model can turn "
+                        "into an 'edge' - and ours is the side more likely wrong.")
+    p.add_argument("--allow-unvalidated-vol", action="store_true",
+                   help="report and trade model-based signals even when our volatility "
+                        "cannot be checked against the market's. Every phantom edge this "
+                        "project has found came from exactly that. Diagnostics only.")
     p.add_argument("--no-cross", action="store_true", help="disable the CROSS strategy")
     p.add_argument("--no-stale", action="store_true", help="disable the STALE strategy")
     p.add_argument("--no-endgame", action="store_true", help="disable the ENDGAME strategy")

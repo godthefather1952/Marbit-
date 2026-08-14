@@ -1715,6 +1715,144 @@ async def test_run_log() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Strategies: the strike guard and the volatility cross-check
+# --------------------------------------------------------------------------- #
+
+
+async def test_strategies() -> None:
+    print("\n--- strategies: strike guard and volatility cross-check ---")
+
+    import math as _math
+    from statistics import NormalDist
+
+    from kalshi import KalshiBook, parse_market
+    from strategies import (
+        implied_sigma,
+        scan_cross,
+        scan_endgame,
+        scan_stale,
+        vol_agreement,
+    )
+
+    def market(strike: str, close: str = "2026-08-13T06:30:00Z"):
+        return parse_market({
+            "ticker": "KXBTC15M-TEST-15", "event_ticker": "KXBTC15M-TEST",
+            "title": "BTC price up in next 15 mins?", "floor_strike": strike,
+            "open_time": "2026-08-13T06:15:00Z", "close_time": close,
+            "status": "active", "volume_fp": "1000", "open_interest_fp": "500",
+        })
+
+    def book(yes_bid: float, yes_ask: float) -> KalshiBook:
+        # Kalshi publishes two bid ladders; the YES ask is 1 - best NO bid.
+        return KalshiBook.from_payload({"orderbook_fp": {
+            "yes_dollars": [[f"{yes_bid:.4f}", "500"]],
+            "no_dollars": [[f"{1.0 - yes_ask:.4f}", "500"]],
+        }})
+
+    # -- the strike guard ---------------------------------------------------- #
+    # Kalshi lists the contract before floor_strike posts. The log from a live
+    # run showed `Tracking KXBTC15M-26AUG132015-15 | strike $0.00` followed by
+    # 30-45s of heartbeats reading fair=0.500 against a book at 0.15/0.16 -
+    # a fabricated 34c edge on every one of those passes.
+    pending = market("")
+    check("a market with no published strike reports strike_known False",
+          pending is not None and not pending.strike_known, f"strike={pending.strike}")
+    check(
+        "fair_value returns None rather than a 0.5 that reads as a coin flip",
+        pending.fair_value(63_000.0, 0.8e-4) is None,
+    )
+    live = market("63777.35")
+    check("a published strike prices normally", live.strike_known
+          and live.fair_value(63_777.35, 0.8e-4, live.close_ts - 600.0) is not None)
+
+    # The scanners read the wall clock, so these fixtures need a close time in
+    # the real future rather than the fixed one used for the pricing checks.
+    import time as _time
+
+    def closing_in(seconds: float) -> str:
+        return _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() + seconds))
+
+    b = book(0.15, 0.16)
+    live_now = market("63777.35", close=closing_in(600.0))
+    pending_now = market("", close=closing_in(600.0))
+
+    check(
+        "STALE refuses to fire while the strike is unpublished",
+        scan_stale(pending_now, b, 63_000.0, 0.50, 63_400.0, 20.0, 0.01, 0.8e-4) is None,
+    )
+    check(
+        "ENDGAME refuses to fire while the strike is unpublished",
+        scan_endgame(pending_now, b, 63_400.0, 20.0, 0.8e-4,
+                     max_seconds_left=1e9, min_z=0.0) is None,
+    )
+    # CROSS is exempt: it never forms an opinion about the strike, so a missing
+    # one is no reason to sit out a locked profit.
+    crossed = book(0.60, 0.35)  # yes bid 0.60 > yes ask 0.35: the bids cross
+    check(
+        "CROSS still fires with no strike, because it never uses one",
+        scan_cross(pending_now, crossed, 20.0, 0.01) is not None,
+    )
+
+    # -- volatility agreement ------------------------------------------------ #
+    check("agreement is symmetric and >= 1",
+          abs(vol_agreement(2e-4, 1e-4) - 2.0) < 1e-9
+          and abs(vol_agreement(1e-4, 2e-4) - 2.0) < 1e-9)
+    check("perfect agreement is exactly 1.0", abs(vol_agreement(1e-4, 1e-4) - 1.0) < 1e-12)
+    check("an uninvertible quote counts as unvalidated, not as agreement",
+          vol_agreement(1e-4, None) is None)
+
+    # An implied sigma, recovered from a quote we construct at a known value.
+    tau = live_now.effective_tau()
+    true_sigma = 1.2e-4
+    spot = 63_777.35 * _math.exp(true_sigma * _math.sqrt(tau) * 0.8)  # z = +0.8
+    target_mid = NormalDist().cdf(0.8)
+    quote = book(target_mid - 0.005, target_mid + 0.005)
+    recovered = implied_sigma(live_now, quote, spot)
+    check(
+        "implied sigma inverts the quote back to the volatility that made it",
+        recovered is not None and abs(recovered / true_sigma - 1.0) < 0.02,
+        f"{recovered * 1e4:.3f} vs {true_sigma * 1e4:.3f} bps/s",
+    )
+
+    # The degeneracy that forces ENDGAME to use MEASURED sigma: feeding it the
+    # market's own implied value reproduces the market's own z, so fair value
+    # equals the mid and the edge is half the spread minus the fee - negative
+    # by construction. Worth a test, because the alternative looks reasonable.
+    em = market("63777.35", close=closing_in(90.0))
+    etau = em.effective_tau()
+    esigma = 1.0e-4
+    espot = 63_777.35 * _math.exp(esigma * _math.sqrt(etau) * 4.0)  # 4 sigma above
+    # A realistic late-window quote on a near-decided contract: 97/98, not the
+    # 0.9999 the model would like. That gap is exactly what ENDGAME buys.
+    ebook = book(0.97, 0.98)
+    eimplied = implied_sigma(em, ebook, espot)
+    check(
+        "ENDGAME on implied sigma is degenerate - no edge exists by construction",
+        eimplied is not None
+        and scan_endgame(em, ebook, espot, 20.0, eimplied, min_z=0.5, min_edge=0.0) is None,
+    )
+    with_measured = scan_endgame(em, ebook, espot, 20.0, esigma * 0.5, min_z=0.5, min_edge=0.0)
+    check(
+        "ENDGAME only finds an edge when our sigma differs from the market's",
+        with_measured is not None,
+        f"implied {eimplied * 1e4:.2f} vs measured {esigma * 0.5 * 1e4:.2f} bps/s",
+    )
+
+    # -- STALE without an invertible quote ----------------------------------- #
+    atm = book(0.495, 0.505)  # z ~ 0, cannot be inverted
+    check(
+        "STALE sits out when the quote cannot supply a volatility",
+        implied_sigma(live_now, atm, 63_777.40) is None
+        and scan_stale(live_now, atm, 63_000.0, 0.50, 63_600.0, 20.0, 0.01, 0.8e-4) is None,
+    )
+    check(
+        "the fallback is reachable only by opting in explicitly",
+        scan_stale(live_now, atm, 63_000.0, 0.50, 63_600.0, 20.0, 0.01, 0.8e-4,
+                   require_implied=False) is not None,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Kalshi execution
 # --------------------------------------------------------------------------- #
 
@@ -1833,6 +1971,7 @@ async def main() -> None:
     await test_reconnect_resilience()
     await test_risk_breakers()
     await test_kalshi()
+    await test_strategies()
     await test_kalshi_execution()
     await test_polymarket_us()
     await test_run_log()

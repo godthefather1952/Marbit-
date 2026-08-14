@@ -392,6 +392,57 @@ spot=$63,766 strike=$63,777 | fair=0.453 | market 0.470/0.480
 
 `kalshi_monitor.py --binance` reproduces the error deliberately.
 
+**3. The strike is not published when the contract opens.** Kalshi lists the
+market before the 60-second TWAP that *defines* `floor_strike` has finished
+printing, so the first 30–45 seconds of every window parse to `strike 0.00`. A
+94-minute run logged `Tracking KXBTC15M-26AUG132015-15 | strike $0.00` followed
+by heartbeats reading `fair=0.500` against a book quoting `0.150/0.160` — a
+fabricated 34c edge on every pass, for as long as the gap lasted.
+
+`fair_value` now returns `None` rather than `0.5` in that state, and the monitor
+skips the pass. `0.5` is a real probability that reads as "coin flip"; using it
+to mean "unknown" makes the two indistinguishable downstream, and any book
+trading away from the money then looks like free money. `CROSS` still runs,
+because it never looks at a strike.
+
+**4. A volatility disagreement is not an edge.** This is the one worth
+internalising. On this contract the strike is published, the clock is public,
+and the book sees spot at least as fast as we do. Subtract those and the *only*
+input where our absolute fair value can differ from the market's is σ — so on
+that model, "we found an edge" and "we disagree about volatility" are the same
+event described two ways, and ours is the side more likely to be wrong.
+
+The monitor now inverts the quote for the market's own implied σ on every pass
+and prints both:
+
+```
+volatility cross-check (ours vs the market's own quote):
+   ours   (measured)  p50 0.30 bps/s   p10 0.30   p90 0.30
+   market (implied)   p50 1.20 bps/s   p10 1.20   p90 1.20
+   disagreement       p50 4.00x   p90 4.00x   max 4.00x
+```
+
+Model-based signals are suppressed past `--vol-ratio-max` (default 1.50x), and
+the summary splits every edge distribution into **RAW** and **VALIDATED** —
+raw is every observation, validated is the subset where the two σ agreed. Only
+the validated column can be real. `--allow-unvalidated-vol` restores the old
+behaviour for diagnostics; it is not a trading mode.
+
+This changes what each strategy is allowed to lean on:
+
+| | needs our σ? | gated |
+|---|---|---|
+| `CROSS` | no — reads two bids, profit locked at settlement | never |
+| `STALE` | no — takes σ from the quote, requires it be invertible | sits out when it isn't |
+| `ENDGAME` | **yes** | only fires inside `--vol-ratio-max` |
+
+`ENDGAME` cannot be fixed by feeding it implied σ: implied σ is by definition
+the value that reproduces the quote, so `z` comes back as the market's own `z`,
+fair value equals the mid exactly, and the edge collapses to half the spread
+minus the fee — negative by construction, always. The suite asserts this. It
+means `ENDGAME` is irreducibly a bet that our volatility beats the market's,
+which is why it is the one strategy behind a gate.
+
 ### Read-only, enforced
 
 `kalshi.py` has no order-placing method and issues zero POST/PUT/DELETE

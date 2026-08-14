@@ -113,6 +113,27 @@ def implied_sigma(market: KalshiMarket, book: KalshiBook, spot: float) -> float 
     return sigma if 1e-6 < sigma < 1e-2 else None
 
 
+def vol_agreement(measured: float, implied: float | None) -> float | None:
+    """How far our measured volatility sits from the market's, as a ratio >= 1.
+
+    This is the single most load-bearing number in the project. Our only
+    possible informational advantage over the book is the spot price, and the
+    book sees that at least as fast as we do; the strike is published and the
+    clock is public. So on the absolute fair-value model there is nothing left
+    for an edge to come from *except* a difference of opinion about sigma - and
+    the market's opinion, backed by a one-cent spread and real size, is better
+    than five minutes of one-second bars from one venue.
+
+    That makes a large ratio the opposite of an opportunity: it is the
+    signature of a broken estimator, and every previous "edge" this project
+    found turned out to be exactly that. Returns None when the quote cannot be
+    inverted, which counts as unvalidated, not as agreement.
+    """
+    if implied is None or implied <= 0.0 or measured <= 0.0:
+        return None
+    return max(measured / implied, implied / measured)
+
+
 # --------------------------------------------------------------------------- #
 # CROSS - model-free
 # --------------------------------------------------------------------------- #
@@ -169,6 +190,7 @@ def scan_stale(
     size: float,
     min_edge: float,
     fallback_sigma: float,
+    require_implied: bool = True,
 ) -> Signal | None:
     """Trade the repricing a spot move implies, not the level.
 
@@ -182,14 +204,24 @@ def scan_stale(
 
     What is left is the honest question: BTC moved this much, the market has
     not repriced yet, and is the gap bigger than the fee.
+
+    `require_implied` defaults on. The fallback is our measured volatility, and
+    a measurement that reads low scales `delta / (sigma * sqrt(tau))` up, so
+    every spot wiggle is reported as a bigger repricing than it is. Falling
+    back reintroduces the exact error this strategy exists to be immune to, so
+    when the quote cannot be inverted the honest answer is no signal.
     """
-    if anchor_price <= 0 or spot <= 0:
+    if anchor_price <= 0 or spot <= 0 or not market.strike_known:
         return None
     delta = math.log(spot / anchor_price)
     if abs(delta) < 1e-9:
         return None
 
-    sigma = implied_sigma(market, book, spot) or fallback_sigma
+    sigma = implied_sigma(market, book, spot)
+    if sigma is None:
+        if require_implied:
+            return None
+        sigma = fallback_sigma
     tau = market.effective_tau()
     denom = sigma * math.sqrt(tau)
     if denom <= 0:
@@ -255,9 +287,18 @@ def scan_endgame(
     -98%, so roughly one reversal in fifty wipes out the profit. This needs the
     strictest sizing of the three, and a `min_z` well above what feels
     necessary.
+
+    `sigma` here must be MEASURED, not implied. Feeding it the market's own
+    implied volatility makes the strategy degenerate: implied sigma is defined
+    as the value that reproduces the quote, so z comes back as the market's own
+    z, fair value equals the mid exactly, and the edge collapses to half the
+    spread minus the fee - negative by construction, always. The consequence is
+    unavoidable and worth stating: ENDGAME is a bet that our volatility is
+    better than the market's. Only take it when the two are known to agree, and
+    size it as the tail risk deserves.
     """
     left = market.seconds_remaining()
-    if left > max_seconds_left or left <= 0 or spot <= 0 or market.strike <= 0:
+    if left > max_seconds_left or left <= 0 or spot <= 0 or not market.strike_known:
         return None
 
     tau = market.effective_tau()
