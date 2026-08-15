@@ -1838,6 +1838,39 @@ async def test_strategies() -> None:
         f"implied {eimplied * 1e4:.2f} vs measured {esigma * 0.5 * 1e4:.2f} bps/s",
     )
 
+    # -- the graded failure mode: no real spot move, no trade ---------------- #
+    # Session L_081426_195232 bought four STALE trades on spot moves of 0.1 to
+    # 2.7 bps - pure noise, with the whole "edge" being the book repricing away
+    # from its own stale anchor mid - and won one of four. These assert that
+    # class of trade is now structurally impossible.
+    rich_book = book(0.25, 0.26)  # book dropped from an anchor mid of 0.285
+    anchor_spot = 63_400.0
+    still_spot = anchor_spot * math.exp(0.2 / 10_000.0)  # spot moved 0.2 bps
+    check(
+        "STALE refuses to fade a book move when spot has not really moved",
+        scan_stale(live_now, rich_book, anchor_spot, 0.285, still_spot,
+                   20.0, 0.01, 0.8e-4) is None,
+    )
+    moved_spot = anchor_spot * math.exp(12.0 / 10_000.0)  # a real 12 bps jump
+    check(
+        "a real spot move past the threshold can still signal",
+        scan_stale(live_now, rich_book, anchor_spot, 0.285, moved_spot,
+                   20.0, 0.01, 0.8e-4) is not None,
+    )
+    check(
+        "the threshold is tunable and respected",
+        scan_stale(live_now, rich_book, anchor_spot, 0.285, moved_spot,
+                   20.0, 0.01, 0.8e-4, min_move_bps=15.0) is None,
+    )
+
+    # Trade 4's degenerate inversion: mid 0.535 (z = 0.09) produced sigma =
+    # 0.06 bps/s from two near-zero inputs and hypersensitised the model.
+    near_money = book(0.53, 0.54)
+    check(
+        "a near-the-money quote no longer yields a garbage implied sigma",
+        implied_sigma(live_now, near_money, 63_778.9) is None,
+    )
+
     # -- STALE without an invertible quote ----------------------------------- #
     atm = book(0.495, 0.505)  # z ~ 0, cannot be inverted
     check(
@@ -1910,7 +1943,7 @@ async def test_setup_and_confirmation() -> None:
             min_seconds_left=20.0, book_interval=1.0, discovery_interval=10.0,
             cooldown=5.0, heartbeat=15.0, binance=False, live=False,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
-            max_trades=40, min_profit=0.01, anchor_age=20.0,
+            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
             allow_unvalidated_vol=False, no_cross=False, no_stale=False,
             no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
@@ -2034,7 +2067,7 @@ async def test_autopilot() -> None:
             min_seconds_left=20.0, spike_bps=12.0, book_interval=1.0,
             discovery_interval=10.0, cooldown=5.0, heartbeat=15.0,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
-            max_trades=40, min_profit=0.01, anchor_age=20.0,
+            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0,
             endgame_window=120.0, endgame_z=3.0, no_cross=False,
             no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
             env_file=".env", verbose=False,

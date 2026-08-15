@@ -523,6 +523,7 @@ class Monitor:
                     market, book, anchor[0], anchor[1], spot, args.size,
                     args.min_edge, sigma,
                     require_implied=not args.allow_unvalidated_vol,
+                    min_move_bps=args.stale_min_move,
                 )
                 if sig:
                     found.append(sig)
@@ -743,6 +744,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CROSS: minimum locked dollar profit per pair")
     p.add_argument("--anchor-age", type=float, default=20.0,
                    help="STALE: how far back the market anchor is taken, seconds")
+    p.add_argument("--stale-min-move", type=float, default=8.0,
+                   help="STALE: minimum spot move vs the anchor, bps. Below this "
+                        "the 'edge' is the book repricing on its own information "
+                        "(which we should not fade) or amplified noise - a graded "
+                        "session bought four of those and won one.")
     p.add_argument("--endgame-window", type=float, default=120.0,
                    help="ENDGAME: only consider markets closing within this many seconds")
     p.add_argument("--endgame-z", type=float, default=3.0,

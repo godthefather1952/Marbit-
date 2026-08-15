@@ -107,7 +107,13 @@ def implied_sigma(market: KalshiMarket, book: KalshiBook, spot: float) -> float 
         return None
     lm = math.log(spot / market.strike)
     z = _N.inv_cdf(_clamp(mid))
-    if abs(z) < 0.05 or abs(lm) < 1e-7:
+    # Near the money the inversion is a ratio of two numbers that are both
+    # approximately zero, and the result is garbage with real consequences: a
+    # graded session produced sigma = 0.06 bps/s from a 0.535 mid (z = 0.09),
+    # which made a 0.1 bps spot wiggle read as a 2-point repricing and bought a
+    # losing trade with it. |z| >= 0.25 (mid outside roughly 0.40-0.60) is the
+    # region where the quote actually carries volatility information.
+    if abs(z) < 0.25 or abs(lm) < 1e-7:
         return None  # too close to the money to invert reliably
     sigma = lm / (z * math.sqrt(tau))
     return sigma if 1e-6 < sigma < 1e-2 else None
@@ -191,6 +197,7 @@ def scan_stale(
     min_edge: float,
     fallback_sigma: float,
     require_implied: bool = True,
+    min_move_bps: float = 8.0,
 ) -> Signal | None:
     """Trade the repricing a spot move implies, not the level.
 
@@ -210,11 +217,25 @@ def scan_stale(
     every spot wiggle is reported as a bigger repricing than it is. Falling
     back reintroduces the exact error this strategy exists to be immune to, so
     when the quote cannot be inverted the honest answer is no signal.
+
+    `min_move_bps` is what keeps this strategy being itself. Without a real
+    spot move there are two ways the numbers can still show "edge", and both
+    were bought and graded in a live session (1 winner in 4):
+
+      * the BOOK moved away from its own anchor mid while spot sat still, so
+        the model - anchored on the old mid - fades the book's repricing. The
+        book moves on order flow we cannot see; taking the other side of that
+        is adverse selection, the opposite of the latency thesis.
+      * a 1-3 bps wiggle of pure noise, amplified by sigma*sqrt(tau) in the
+        denominator, reads as a 10-point repricing.
+
+    Requiring the spot to have moved by more than noise makes the claim being
+    traded the honest one: BTC actually jumped, and the book has not caught up.
     """
     if anchor_price <= 0 or spot <= 0 or not market.strike_known:
         return None
     delta = math.log(spot / anchor_price)
-    if abs(delta) < 1e-9:
+    if abs(delta) < min_move_bps / 10_000.0:
         return None
 
     sigma = implied_sigma(market, book, spot)
