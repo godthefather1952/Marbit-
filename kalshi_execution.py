@@ -254,7 +254,9 @@ class KalshiTrader:
             return True
 
         log.warning("Verifying side mapping with a single 1-contract NO order on %s", ticker)
-        result = await self.place(ticker, "NO", 0.99, 1, tif="immediate_or_cancel")
+        result = await self.place(
+            ticker, "NO", 0.99, 1, tif="immediate_or_cancel", verification=True
+        )
         if not result.ok:
             log.error("Verification order rejected: %s", result.error)
             return False
@@ -297,8 +299,17 @@ class KalshiTrader:
         price: float,
         count: int,
         tif: str = "fill_or_kill",
+        verification: bool = False,
     ) -> OrderResult:
-        """Buy `count` contracts of `outcome`. Never raises."""
+        """Buy `count` contracts of `outcome`. Never raises.
+
+        `verification` marks the single 1-contract side-mapping probe. It is
+        exempt from the per-trade stake cap - and only from that cap - because
+        its worst case is bounded at a dollar and it IS the safety check: a
+        graded live session on a $9.80 balance had an 8% cap of $0.78 reject
+        the $0.99 probe, which halted trading before the first real order. The
+        halt, minimum-size and price checks still apply.
+        """
         api_side, api_price = self.to_api_side(outcome, price)
         result = OrderResult(
             ok=False,
@@ -318,7 +329,7 @@ class KalshiTrader:
             result.error = f"size {count} below the {self.limits.min_contracts}-contract minimum"
             return result
         stake = count * price
-        if stake > self.max_stake() + 1e-9:
+        if not (verification and count == 1) and stake > self.max_stake() + 1e-9:
             result.error = f"stake ${stake:.2f} exceeds the ${self.max_stake():.2f} per-trade cap"
             log.error("Order blocked: %s", result.error)
             return result

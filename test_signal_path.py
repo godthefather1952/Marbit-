@@ -2056,6 +2056,26 @@ async def test_autopilot() -> None:
     check("a failed promotion falls back to paper, not half-armed",
           not await failing.go_live() and failing.dry_run)
 
+    # -- the graded live halt: the stake cap must not block its own safety ---- #
+    # Session L_081526_012650 went live on a $9.80 balance; the 8% per-trade
+    # cap ($0.78) rejected the $0.99 side-mapping probe, halting the session
+    # before the first real order. The probe is a bounded ~$1 safety cost and
+    # is exempt from that one check - and only that one.
+    small = KalshiTrader(FakeClient(), RiskLimits(), dry_run=True)
+    await small.arm()
+    small.starting_balance = 9.80
+    blocked = await small.place("KXBTC15M-T", "NO", 0.99, 1)
+    check("a normal 1-lot above the cap is still blocked",
+          not blocked.ok and "per-trade cap" in (blocked.error or ""))
+    probe = await small.place("KXBTC15M-T", "NO", 0.99, 1, verification=True)
+    check("the verification probe is exempt from the per-trade cap", probe.ok)
+    sized = await small.place("KXBTC15M-T", "NO", 0.99, 2, verification=True)
+    check("the exemption is strictly 1 contract - size cannot ride on it",
+          not sized.ok)
+    small.halted, small.halt_reason = True, "test"
+    halted_probe = await small.place("KXBTC15M-T", "NO", 0.99, 1, verification=True)
+    check("a halt still stops the verification probe", not halted_probe.ok)
+
     # -- evaluate_gates ------------------------------------------------------ #
     def ready_monitor(tmp: str) -> Monitor:
         import argparse as _ap
