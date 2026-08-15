@@ -2076,6 +2076,72 @@ async def test_autopilot() -> None:
     halted_probe = await small.place("KXBTC15M-T", "NO", 0.99, 1, verification=True)
     check("a halt still stops the verification probe", not halted_probe.ok)
 
+    # -- fills decide, not order acceptance ----------------------------------- #
+    # Session L_081526_052800: on a book at 0.009/0.010 the NO ask was 0.991,
+    # the 0.99 probe limit could not cross, the IOC cancelled with zero fills -
+    # and came back WITH an order_id. That was booked as a phantom position and
+    # reported as "side mapping WRONG", halting a healthy session.
+    class VenueTrader(KalshiTrader):
+        def __init__(self, order_response, positions_response=None):
+            class _Client:
+                async def positions(self_inner, **kw):
+                    return positions_response
+
+            super().__init__(_Client(), RiskLimits(), dry_run=False)
+            self.starting_balance = 20.58
+            self._order_response = order_response
+
+        async def _post(self, path, body):
+            self._last_body = body
+            return self._order_response
+
+    killed = VenueTrader({"order": {"order_id": "abc", "status": "canceled"}})
+    res = await killed.place("T", "NO", 0.999, 1, tif="immediate_or_cancel")
+    check("a cancelled zero-fill is not a trade, despite its order_id",
+          not res.ok and killed.trades == 0 and "no fill" in (res.error or ""))
+
+    partial = VenueTrader({"order": {"order_id": "abc", "status": "canceled",
+                                     "taker_fill_count": 1}})
+    res = await partial.place("T", "NO", 0.999, 1, tif="immediate_or_cancel")
+    check("a cancelled order WITH taker fills is a trade", res.ok)
+
+    filled = VenueTrader({"order": {"order_id": "abc", "status": "executed"}})
+    res = await filled.place("T", "NO", 0.999, 1)
+    check("an executed order books normally", res.ok and filled.trades == 1)
+
+    # -- the probe's three outcomes ------------------------------------------- #
+    async def _noop(_s):  # verification sleeps 2s between order and read
+        return None
+
+    import asyncio as _aio
+    real_sleep = _aio.sleep
+    _aio.sleep = _noop
+    try:
+        nofill = VenueTrader({"order": {"order_id": "abc", "status": "canceled"}})
+        check("an unfilled probe is inconclusive, not a reversed mapping",
+              await nofill.verify_side_mapping("T") is None
+              and not nofill.side_mapping_verified)
+        check("the probe bids the top of the ladder so any book crosses",
+              float(nofill._last_body["price"]) < 0.0011)  # api ask = 1 - 0.999
+
+        empty = VenueTrader({"order": {"order_id": "a", "status": "executed"}},
+                            {"market_positions": [{"ticker": "T", "position": 0}]})
+        check("a filled claim with no visible position stays inconclusive",
+              await empty.verify_side_mapping("T") is None)
+
+        good = VenueTrader({"order": {"order_id": "a", "status": "executed"}},
+                           {"market_positions": [{"ticker": "T", "position": -1}]})
+        check("a short-YES position verifies the mapping",
+              await good.verify_side_mapping("T") is True
+              and good.side_mapping_verified)
+
+        reversed_ = VenueTrader({"order": {"order_id": "a", "status": "executed"}},
+                                {"market_positions": [{"ticker": "T", "position": 1}]})
+        check("a LONG-YES position after a NO buy is the definitive halt",
+              await reversed_.verify_side_mapping("T") is False)
+    finally:
+        _aio.sleep = real_sleep
+
     # -- evaluate_gates ------------------------------------------------------ #
     def ready_monitor(tmp: str) -> Monitor:
         import argparse as _ap

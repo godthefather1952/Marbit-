@@ -242,12 +242,28 @@ class KalshiTrader:
             return "bid", price
         return "ask", round(1.0 - price, 4)
 
-    async def verify_side_mapping(self, ticker: str) -> bool:
+    async def verify_side_mapping(self, ticker: str) -> bool | None:
         """Prove the mapping with one 1-contract order before risking size.
 
         Buys a single NO contract, then reads the position back. If the account
         ends up holding NO, the inversion is right. Costs at most a dollar and
         removes the one error that would reverse every trade.
+
+        Three outcomes, and the difference matters:
+
+            True   position is short YES = long NO -> mapping proven
+            False  position is LONG YES after a NO buy -> mapping reversed,
+                   the caller must halt
+            None   inconclusive - the probe did not fill, or the position
+                   could not be read. Not evidence of anything; retry on a
+                   later signal instead of halting.
+
+        A live session taught the inconclusive case the hard way: on a market
+        already at 0.009/0.010 the NO ask was 0.991, the old 0.99 probe limit
+        could not cross it, the IOC cancelled unfilled, and the empty position
+        was reported as "mapping WRONG" - halting a healthy session. The probe
+        now bids 0.999, the top of the venue's price ladder, so it crosses any
+        book that exists.
         """
         if self.dry_run:
             self.side_mapping_verified = True
@@ -255,40 +271,48 @@ class KalshiTrader:
 
         log.warning("Verifying side mapping with a single 1-contract NO order on %s", ticker)
         result = await self.place(
-            ticker, "NO", 0.99, 1, tif="immediate_or_cancel", verification=True
+            ticker, "NO", 0.999, 1, tif="immediate_or_cancel", verification=True
         )
         if not result.ok:
-            log.error("Verification order rejected: %s", result.error)
-            return False
+            log.warning(
+                "Verification probe did not fill (%s); inconclusive - will retry "
+                "on a later signal", result.error,
+            )
+            return None
 
         await asyncio.sleep(2.0)
         try:
             positions = await self._client.positions()
         except Exception as exc:  # noqa: BLE001
-            log.error("Could not read positions to verify: %s", exc)
-            return False
+            log.warning("Could not read positions to verify (%s); inconclusive", exc)
+            return None
 
         rows = (positions or {}).get("market_positions") or []
         row = next((r for r in rows if r.get("ticker") == ticker), None)
-        if row is None:
-            log.error("No position found after the verification order; not proceeding")
-            return False
-
-        # Kalshi reports a signed position: negative means short YES = long NO.
-        qty = row.get("position") or row.get("market_exposure") or 0
+        qty = (row or {}).get("position") or (row or {}).get("market_exposure") or 0
         try:
             qty = float(qty)
         except (TypeError, ValueError):
             qty = 0.0
-        ok = qty < 0
+
+        if qty == 0.0:
+            # The order claimed a fill but the book shows nothing: either the
+            # fill has not propagated or the claim was wrong. Unknown != wrong.
+            log.warning("No position visible after the probe; inconclusive - will retry")
+            return None
+        if qty > 0:
+            log.error(
+                "Side mapping WRONG - ABORTING: a NO buy produced a LONG YES "
+                "position (%s). Every order would be reversed.", qty,
+            )
+            self.side_mapping_verified = False
+            return False
         log.warning(
-            "Side mapping %s: a NO buy produced position %s (%s)",
-            "VERIFIED" if ok else "WRONG - ABORTING",
-            qty,
-            "short YES = long NO, as intended" if ok else "expected a short YES position",
+            "Side mapping VERIFIED: a NO buy produced position %s "
+            "(short YES = long NO, as intended)", qty,
         )
-        self.side_mapping_verified = ok
-        return ok
+        self.side_mapping_verified = True
+        return True
 
     # -- order placement ---------------------------------------------------- #
 
@@ -365,9 +389,27 @@ class KalshiTrader:
             order = (response or {}).get("order") or response or {}
             result.order_id = str(order.get("order_id") or "") or None
             result.status = str(order.get("status") or "")
-            result.ok = bool(result.order_id) or result.status.lower() in ("resting", "executed")
+            # An accepted order is not a filled order. A killed FOK and a
+            # zero-fill IOC both come back "canceled" WITH an order_id - a live
+            # session booked exactly that as a phantom 1-lot position, which
+            # then "settled" for money that was never at risk. Fills decide:
+            # executed or resting counts, canceled counts only if the venue
+            # reports taker fills on it (an IOC can partially fill, then
+            # cancel the rest).
+            fills = order.get("taker_fill_count")
+            try:
+                fills = int(fills) if fills is not None else None
+            except (TypeError, ValueError):
+                fills = None
+            status_l = result.status.lower()
+            if status_l:
+                result.ok = status_l in ("resting", "executed") or bool(fills)
+            else:
+                result.ok = bool(result.order_id)
             if not result.ok:
-                result.error = str(response)[:200]
+                result.error = result.error or (
+                    f"no fill (status {result.status or 'unknown'})"
+                )
             else:
                 self._book_trade(result)
             return result

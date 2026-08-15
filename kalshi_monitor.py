@@ -617,10 +617,20 @@ class Monitor:
                         # One 1-contract NO order, read back as a position,
                         # before any real size: getting the YES-book inversion
                         # backwards would take the opposite of every trade.
-                        if not await trader.verify_side_mapping(sig.ticker):
+                        verdict = await trader.verify_side_mapping(sig.ticker)
+                        if verdict is False:
+                            # Definitively reversed - the one unrecoverable case.
                             trader.halted = True
-                            trader.halt_reason = "side mapping verification failed"
+                            trader.halt_reason = "side mapping REVERSED on the venue"
                             log.error("TRADING HALTED: %s", trader.halt_reason)
+                            continue
+                        if verdict is not True:
+                            # Inconclusive (no fill / unreadable position) is
+                            # not evidence. Skip this signal, try on the next.
+                            log.warning(
+                                " execution: skipping %s - side mapping probe "
+                                "inconclusive, will retry", sig.ticker,
+                            )
                             continue
                     for leg in sig.legs:
                         count = trader.size_for(leg.price)
