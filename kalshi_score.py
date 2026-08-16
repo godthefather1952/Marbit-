@@ -46,6 +46,9 @@ async def settlement(client: KalshiClient, tickers: list[str]) -> dict[str, dict
 
 
 def score(rows: list[dict], settled: dict[str, dict]) -> None:
+    # Keyed by "ASSET/STRATEGY" when the ledger carries an asset tag, so a
+    # BTC+ETH session is graded as two experiments rather than one blended
+    # number that can hide a losing instrument behind a winning one.
     by_strategy: dict[str, list] = collections.defaultdict(list)
     pending = 0
 
@@ -65,7 +68,10 @@ def score(rows: list[dict], settled: dict[str, dict]) -> None:
             fees += trading_fee(price, size)
             won = (side == "YES" and result == "yes") or (side == "NO" and result == "no")
             gross += size * (1.0 if won else 0.0)
-        by_strategy[row["strategy"]].append(
+        note = str(row.get("note") or "")
+        asset = note[1:note.index("]")] if note.startswith("[") and "]" in note else ""
+        key = f"{asset}/{row['strategy']}" if asset else row["strategy"]
+        by_strategy[key].append(
             {
                 "ticker": row["ticker"],
                 "net": gross - cost - fees,

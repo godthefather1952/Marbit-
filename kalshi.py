@@ -470,8 +470,17 @@ class CompositeBasis:
     low-latency source; this only removes its level error.
     """
 
-    def __init__(self, session: aiohttp.ClientSession, halflife_polls: float = 5.0) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        halflife_polls: float = 5.0,
+        sources: tuple[tuple[str, str], ...] | None = None,
+        label: str = "BTC",
+    ) -> None:
         self._session = session
+        # Resolved lazily: the source tables are defined below this class.
+        self._sources = sources if sources is not None else COMPOSITE_SOURCES
+        self._label = label
         self._alpha = 1.0 - 0.5 ** (1.0 / max(halflife_polls, 1.0))
         self.offset: float = 0.0  # add this to the venue tick to reach composite
         self.samples: int = 0
@@ -480,7 +489,7 @@ class CompositeBasis:
     async def poll_once(self) -> float | None:
         """One composite reading, as the median of the reachable USD venues."""
         prices: list[float] = []
-        for name, url in COMPOSITE_SOURCES:
+        for name, url in self._sources:
             try:
                 async with self._session.get(
                     url, timeout=aiohttp.ClientTimeout(total=8)
@@ -514,7 +523,8 @@ class CompositeBasis:
                     self.samples += 1
                     if self.samples == 1 or self.samples % 15 == 0:
                         log.info(
-                            "Feed basis vs USD composite: %+.2f USD (%+.1f bps), n=%d",
+                            "%s feed basis vs USD composite: %+.2f USD (%+.1f bps), n=%d",
+                            self._label,
                             self.offset,
                             self.offset / composite * 1e4,
                             self.samples,
@@ -544,13 +554,75 @@ def _extract_price(name: str, data) -> float | None:
     return None
 
 
-#: USD spot venues used to approximate the BRTI composite.
+#: USD spot venues used to approximate the BRTI composite. BTC by default,
+#: kept as a module constant for the many callers that predate multi-asset.
 COMPOSITE_SOURCES = (
     ("coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot"),
     ("kraken", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"),
     ("bitstamp", "https://www.bitstamp.net/api/v2/ticker/btcusd/"),
     ("gemini", "https://api.gemini.com/v1/pubticker/btcusd"),
 )
+
+ETH_COMPOSITE_SOURCES = (
+    ("coinbase", "https://api.coinbase.com/v2/prices/ETH-USD/spot"),
+    ("kraken", "https://api.kraken.com/0/public/Ticker?pair=ETHUSD"),
+    ("bitstamp", "https://www.bitstamp.net/api/v2/ticker/ethusd/"),
+    ("gemini", "https://api.gemini.com/v1/pubticker/ethusd"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Asset:
+    """A tradeable underlying and every feed that must match it.
+
+    The series and the spot feed are bound together here on purpose. They are
+    the one pair in this system that must never be mixed: pricing an ETH
+    contract off the BTC tape compares a ~$63,000 spot against a ~$1,880
+    strike, concludes YES is certain, and reports a colossal edge on every
+    single observation. Making the pairing a single object means a caller
+    cannot express the mismatch, rather than being trusted not to.
+    """
+
+    name: str  # "BTC"
+    series: str  # "KXBTC15M"
+    coinbase_product: str  # "BTC-USD"
+    composite: tuple[tuple[str, str], ...]
+    rest: tuple[tuple[str, str], ...]
+
+
+ASSETS: dict[str, Asset] = {
+    "BTC": Asset("BTC", BTC_15M_SERIES, "BTC-USD", COMPOSITE_SOURCES, USD_SPOT_REST),
+    "ETH": Asset(
+        "ETH",
+        "KXETH15M",
+        "ETH-USD",
+        ETH_COMPOSITE_SOURCES,
+        (
+            ("Coinbase", "https://api.coinbase.com/v2/prices/ETH-USD/spot"),
+            ("Bitstamp", "https://www.bitstamp.net/api/v2/ticker/ethusd/"),
+        ),
+    ),
+}
+
+
+def asset_for(name_or_series: str) -> Asset:
+    """Resolve "BTC", "ETH" or a series ticker to its Asset.
+
+    Raises rather than guessing. A wrong guess here silently prices one
+    instrument off another's tape, which is the most expensive mistake this
+    codebase can make.
+    """
+    key = (name_or_series or "").strip().upper()
+    if key in ASSETS:
+        return ASSETS[key]
+    for asset in ASSETS.values():
+        if asset.series.upper() == key:
+            return asset
+    raise ValueError(
+        f"no spot feed is configured for {name_or_series!r}; "
+        f"known assets: {', '.join(sorted(ASSETS))}. Refusing to price a "
+        "contract off another instrument's tape."
+    )
 
 
 class CoinbaseSpotStream:
@@ -625,9 +697,12 @@ class CoinbaseSpotStream:
             backoff = min(backoff * 2.0, 30.0)
 
 
-async def usd_spot_rest(session: aiohttp.ClientSession) -> float | None:
+async def usd_spot_rest(
+    session: aiohttp.ClientSession,
+    sources: tuple[tuple[str, str], ...] = USD_SPOT_REST,
+) -> float | None:
     """One-shot USD spot, for sanity-checking a stream against REST."""
-    for name, url in USD_SPOT_REST:
+    for name, url in sources:
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:

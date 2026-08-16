@@ -382,7 +382,60 @@ printed at exit — that file is the run's record; send it for review.
 ```bash
 python kalshi_main.py --mode live --warmup-min 20      # skip the prompts
 python kalshi_main.py --mode dry --min-edge 0.03       # extra flags pass through
+python kalshi_main.py --assets BTC,ETH --aggressive    # both instruments, hot
 ```
+
+### Two instruments, one account
+
+`--assets BTC,ETH` runs `KXBTC15M` and `KXETH15M` concurrently. Each gets its
+**own** spot tape, own basis correction, and own volatility estimate; the
+summary and the settlement scorecard report them separately, so a losing
+instrument can't hide behind a winning one.
+
+The series and its spot feed are bound together in a single `Asset` object
+rather than being two independent flags. That is deliberate: pricing an ETH
+contract off the BTC tape compares a ~$63,000 spot against a ~$1,880 strike,
+concludes YES is certain, and reports a vast edge on *every* observation. An
+underlying with no configured feed is refused outright rather than guessed.
+
+Risk stays on one shared trader. Two instruments each believing they owned the
+whole balance would silently double the intended risk, so stake caps, exposure
+and the loss breakers span both — and **every** instrument must pass the
+promotion gates before either trades. There is no going live on half the book.
+
+ETH's book is thinner (~107k contracts per window against BTC's ~2.3M), so
+expect wider spreads and less certain fills there.
+
+### Aggressive mode
+
+```bash
+python kalshi_main.py --aggressive
+```
+
+Loosens **opportunity** thresholds only — how sure, how cheap, and how
+long-lived a setup must be:
+
+| | standard | aggressive |
+|---|---:|---:|
+| `--confirm-seconds` | 3.0 | **1.0** |
+| `--book-interval` | 1.0 | **0.4** |
+| `--eval-interval` | 0.2 | **0.1** |
+| `--endgame-z` | 3.0 | **2.5** |
+| `--min-edge` | 0.02 | **0.01** |
+| `--stale-min-move` | 8 bps | **6 bps** |
+| `--max-stake-pct` | 8% | **12%** |
+
+The confirmation and book-poll changes are the load-bearing pair. Session
+`L_081626_181730` found a real, priced, edge-positive ENDGAME setup that lasted
+about **two seconds** against a three-second confirmation window, so it was
+never taken. Confirming in 1s only helps if the book underneath is fresher than
+1s — which is why both move together.
+
+It deliberately does **not** touch `--vol-ratio-max`, the strike guard, the
+side-mapping probe, or the loss breakers. Each of those was added after a
+graded session lost money; loosening them wouldn't be aggression, it would be
+amnesia. A value you type always outranks the preset, including when it equals
+the default.
 
 The individual scripts still work standalone (`kalshi_monitor.py`,
 `kalshi_setup.py`, `kalshi_score.py`, `check_kalshi_account.py`) — the

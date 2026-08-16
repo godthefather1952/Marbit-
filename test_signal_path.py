@@ -1943,7 +1943,8 @@ async def test_setup_and_confirmation() -> None:
             min_seconds_left=20.0, book_interval=1.0, discovery_interval=10.0,
             cooldown=5.0, heartbeat=15.0, binance=False, live=False,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
-            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0,
+            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
+            assets=None, eval_interval=0.2,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
             allow_unvalidated_vol=False, no_cross=False, no_stale=False,
             no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
@@ -2218,19 +2219,21 @@ async def test_autopilot() -> None:
             min_seconds_left=20.0, spike_bps=12.0, book_interval=1.0,
             discovery_interval=10.0, cooldown=5.0, heartbeat=15.0,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
-            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0,
+            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
+            assets=None, eval_interval=0.2,
             endgame_window=120.0, endgame_z=3.0, no_cross=False,
             no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
             env_file=".env", verbose=False,
         ))
-        mon._stream = SimpleNamespace(connected=True)
-        mon._basis = None
-        mon._market = SimpleNamespace(ticker="KXBTC15M-T", strike_known=True)
+        inst = mon.instruments[0]
+        inst.stream = SimpleNamespace(connected=True)
+        inst.basis = None
+        inst.market = SimpleNamespace(ticker="KXBTC15M-T", strike_known=True)
         now = _time.monotonic()
         for i in range(35):  # past the 31-bar vol_is_measured threshold
-            mon._buffer._bars.append((now - 35 + i, 63_000.0))
-        mon._observations = 500
-        mon._vol_ratios = [1.1] * 60
+            inst.buffer._bars.append((now - 35 + i, 63_000.0))
+        inst.observations = 500
+        inst.vol_ratios = [1.1] * 60
         return mon
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2239,23 +2242,23 @@ async def test_autopilot() -> None:
         check("a healthy warm-up passes every gate", passed, lines[-1].strip())
 
         mon = ready_monitor(tmp)
-        mon._vol_ratios = [2.4] * 60
+        mon.instruments[0].vol_ratios = [2.4] * 60
         passed, lines = evaluate_gates(mon, 1.5)
         check("a sigma disagreement fails promotion",
               not passed and any("sigma agrees" in l and "FAIL" in l for l in lines))
 
         mon = ready_monitor(tmp)
-        mon._vol_ratios = [1.1] * 5  # too few to validate
+        mon.instruments[0].vol_ratios = [1.1] * 5  # too few to validate
         passed, _ = evaluate_gates(mon, 1.5)
         check("an unvalidatable sigma fails closed, not open", not passed)
 
         mon = ready_monitor(tmp)
-        mon._market = SimpleNamespace(ticker="X", strike_known=False)
+        mon.instruments[0].market = SimpleNamespace(ticker="X", strike_known=False)
         passed, _ = evaluate_gates(mon, 1.5)
         check("a market without a published strike fails promotion", not passed)
 
         mon = ready_monitor(tmp)
-        mon._stream = SimpleNamespace(connected=False)
+        mon.instruments[0].stream = SimpleNamespace(connected=False)
         passed, _ = evaluate_gates(mon, 1.5)
         check("a dead spot feed fails promotion", not passed)
 
@@ -2277,6 +2280,130 @@ async def test_autopilot() -> None:
               not mon._pending_orders and not mon._candidates)
         check("a market that signalled on paper can trade live",
               mon.ledger.record(sig))
+
+
+# --------------------------------------------------------------------------- #
+# Multi-asset and the aggressive preset
+# --------------------------------------------------------------------------- #
+
+
+async def test_multi_asset_and_preset() -> None:
+    print("\n--- multi-asset instruments and the aggressive preset ---")
+
+    from kalshi import ASSETS, asset_for
+    from kalshi_monitor import (
+        AGGRESSIVE_PRESET,
+        Instrument,
+        Monitor,
+        _requested_assets,
+        parse_args,
+    )
+
+    # -- the series/feed pairing ------------------------------------------- #
+    # Pricing an ETH contract off the BTC tape compares ~$63,000 against a
+    # ~$1,880 strike and reports certainty on every observation. The pairing is
+    # one object so a caller cannot express the mismatch.
+    btc, eth = asset_for("BTC"), asset_for("ETH")
+    check("each asset carries its own series and spot product",
+          btc.series != eth.series and btc.coinbase_product != eth.coinbase_product,
+          f"{btc.series}/{btc.coinbase_product} vs {eth.series}/{eth.coinbase_product}")
+    check("a series ticker resolves to its own asset",
+          asset_for("KXETH15M").name == "ETH" and asset_for("KXBTC15M").name == "BTC")
+    try:
+        asset_for("KXSOL15M")
+        refused = False
+    except ValueError:
+        refused = True
+    check("an underlying with no configured feed is refused, not guessed", refused)
+    check("no two assets share a composite source table",
+          len({a.composite for a in ASSETS.values()}) == len(ASSETS))
+
+    # -- instruments are independent --------------------------------------- #
+    a, b = Instrument(btc), Instrument(eth)
+    a.buffer.add(63_000.0, 0, 1)
+    b.buffer.add(1_880.0, 0, 1)
+    check("each instrument keeps its own tape",
+          abs(a.buffer.last().price - 63_000.0) < 1e-9
+          and abs(b.buffer.last().price - 1_880.0) < 1e-9)
+    a.observations = 10
+    check("counters do not leak between instruments", b.observations == 0)
+
+    # -- asset selection ---------------------------------------------------- #
+    import argparse as _ap
+    check("--assets selects several",
+          _requested_assets(_ap.Namespace(assets="BTC,ETH", series="KXBTC15M"))
+          == ["BTC", "ETH"])
+    check("duplicates collapse",
+          _requested_assets(_ap.Namespace(assets="BTC,btc,BTC", series=None)) == ["BTC"])
+    check("a bare --series still works, single-asset",
+          _requested_assets(_ap.Namespace(assets=None, series="KXETH15M")) == ["ETH"])
+
+    args = parse_args(["--assets", "BTC,ETH", "--no-log"])
+    mon = Monitor(args)
+    check("a monitor builds one instrument per asset",
+          [i.name for i in mon.instruments] == ["BTC", "ETH"])
+    check("instruments are wired to their own feed",
+          mon.instruments[0].asset.coinbase_product == "BTC-USD"
+          and mon.instruments[1].asset.coinbase_product == "ETH-USD")
+
+    # -- the preset touches opportunity, never correctness ------------------ #
+    plain = parse_args(["--no-log"])
+    hot = parse_args(["--aggressive", "--no-log"])
+    check("the preset speeds up confirmation and book polling",
+          hot.confirm_seconds < plain.confirm_seconds
+          and hot.book_interval < plain.book_interval,
+          f"{hot.confirm_seconds}s / book {hot.book_interval}s")
+    check("the preset loosens the opportunity thresholds",
+          hot.endgame_z < plain.endgame_z and hot.min_edge < plain.min_edge
+          and hot.max_stake_pct > plain.max_stake_pct)
+
+    # The whole point of the preset is what it does NOT do. Every gate here
+    # was added after a graded session lost money.
+    for guard in ("vol_ratio_max", "allow_unvalidated_vol", "max_exposure_pct",
+                  "daily_loss_pct", "max_trades", "min_seconds_left"):
+        check(f"the preset leaves {guard} alone",
+              getattr(hot, guard) == getattr(plain, guard),
+              f"{getattr(hot, guard)}")
+    check("no correctness gate is even named in the preset",
+          not ({"vol_ratio_max", "allow_unvalidated_vol", "daily_loss_pct",
+                "max_exposure_pct", "max_trades"} & set(AGGRESSIVE_PRESET)))
+
+    explicit = parse_args(["--aggressive", "--endgame-z", "3.0",
+                           "--max-stake-pct", "5", "--no-log"])
+    check("a value typed on the command line outranks the preset",
+          explicit.endgame_z == 3.0 and explicit.max_stake_pct == 5.0,
+          "even when it equals the default")
+    check("unspecified flags still take the preset",
+          explicit.confirm_seconds == AGGRESSIVE_PRESET["confirm_seconds"])
+
+    # -- gates require EVERY instrument ------------------------------------- #
+    from types import SimpleNamespace
+
+    from kalshi_main import evaluate_gates
+
+    def ready(inst):
+        inst.stream = SimpleNamespace(connected=True)
+        inst.basis = None
+        inst.market = SimpleNamespace(ticker=f"{inst.series}-T", strike_known=True)
+        now = time.monotonic()
+        for i in range(35):
+            inst.buffer._bars.append((now - 35 + i, 1000.0))
+        inst.observations = 500
+        inst.vol_ratios = [1.1] * 60
+        return inst
+
+    both = Monitor(parse_args(["--assets", "BTC,ETH", "--no-log"]))
+    for inst in both.instruments:
+        ready(inst)
+    passed, lines = evaluate_gates(both, 1.5)
+    check("both instruments healthy promotes", passed)
+    check("the report names each instrument",
+          any("BTC" in line for line in lines) and any("ETH" in line for line in lines))
+
+    both.instruments[1].vol_ratios = [3.0] * 60  # ETH sigma disagrees
+    passed, lines = evaluate_gates(both, 1.5)
+    check("one bad instrument blocks promotion for the whole account",
+          not passed, "shared balance, so there is no half-live")
 
 
 # --------------------------------------------------------------------------- #
@@ -2401,6 +2528,7 @@ async def main() -> None:
     await test_strategies()
     await test_setup_and_confirmation()
     await test_autopilot()
+    await test_multi_asset_and_preset()
     await test_kalshi_execution()
     await test_polymarket_us()
     await test_run_log()

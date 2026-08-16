@@ -120,13 +120,35 @@ def evaluate_gates(monitor: Monitor, vol_ratio_max: float) -> tuple[bool, list[s
     session's signals are distinguishable from the failure modes this project
     has actually hit: a dead feed, an unmeasured volatility prior, and a sigma
     estimate the market itself contradicts.
+
+    With several instruments running, EVERY instrument must pass. They share
+    one account and one set of risk limits, so a broken ETH feed can spend the
+    balance that BTC was supposed to trade - there is no such thing as going
+    live on half the book.
     """
+    lines: list[str] = []
+    passed = True
+    for inst in monitor.instruments:
+        ok, block = _instrument_gates(inst, vol_ratio_max)
+        passed = passed and ok
+        if len(monitor.instruments) > 1:
+            lines.append(f"   {inst.name} ({inst.series}):")
+            lines.extend("   " + line for line in block)
+        else:
+            lines.extend(block)
+    lines.append(
+        "   => ALL GATES PASSED" if passed else "   => NOT READY - staying on paper"
+    )
+    return passed, lines
+
+
+def _instrument_gates(inst, vol_ratio_max: float) -> tuple[bool, list[str]]:
     checks: list[tuple[str, bool, str]] = []
 
-    stream_ok = monitor._stream is not None and monitor._stream.connected
-    checks.append(("spot feed connected", stream_ok, ""))
+    stream_ok = inst.stream is not None and inst.stream.connected
+    checks.append(("spot feed connected", stream_ok, inst.asset.coinbase_product))
 
-    basis = monitor._basis
+    basis = inst.basis
     basis_ok = basis is None or basis.samples >= 3
     checks.append((
         "USD basis correction settled",
@@ -134,24 +156,22 @@ def evaluate_gates(monitor: Monitor, vol_ratio_max: float) -> tuple[bool, list[s
         f"{basis.samples} polls, {basis.offset:+.2f} USD" if basis else "disabled",
     ))
 
-    market_ok = monitor._market is not None and monitor._market.strike_known
+    market_ok = inst.market is not None and inst.market.strike_known
     checks.append((
         "live market with a published strike",
         market_ok,
-        monitor._market.ticker if monitor._market else "none",
+        inst.market.ticker if inst.market else "none",
     ))
 
-    vol_measured = monitor._buffer.vol_is_measured
     checks.append((
-        "volatility measured from tape (not the assumed prior)", vol_measured, "",
+        "volatility measured from tape (not the assumed prior)",
+        inst.buffer.vol_is_measured, "",
     ))
 
-    obs_ok = monitor._observations >= 100
-    checks.append((
-        "enough evaluated observations", obs_ok, f"{monitor._observations}",
-    ))
+    obs_ok = inst.observations >= 100
+    checks.append(("enough evaluated observations", obs_ok, f"{inst.observations}"))
 
-    ratios = monitor._vol_ratios[-200:]
+    ratios = inst.vol_ratios[-200:]
     invertible_ok = len(ratios) >= 30
     checks.append((
         "market quote invertible often enough to validate sigma",
@@ -171,9 +191,6 @@ def evaluate_gates(monitor: Monitor, vol_ratio_max: float) -> tuple[bool, list[s
     passed = all(ok for _, ok, _ in checks)
     lines = [f"   [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({d})" if d else "")
              for name, ok, d in checks]
-    lines.append(
-        "   => ALL GATES PASSED" if passed else "   => NOT READY - staying on paper"
-    )
     return passed, lines
 
 
@@ -359,8 +376,20 @@ def parse_main_args() -> tuple[argparse.Namespace, list[str]]:
                    help="stop after this many minutes; 0 = run until Ctrl+C")
     p.add_argument("--settle-wait-min", type=float, default=25.0,
                    help="how long the scorecard waits for markets to settle")
+    p.add_argument("--assets", default=None,
+                   help="comma-separated underlyings to trade concurrently, e.g. "
+                        "'BTC,ETH'. Each gets its own spot feed; they share one "
+                        "account, so risk limits apply across all of them.")
+    p.add_argument("--aggressive", action="store_true",
+                   help="loosen the opportunity thresholds (see kalshi_monitor.py "
+                        "--aggressive). The correctness gates are unchanged.")
     p.add_argument("--env-file", default=".env")
     known, extra = p.parse_known_args()
+    # Forward the shared flags to the monitor's parser too.
+    if known.assets:
+        extra += ["--assets", known.assets]
+    if known.aggressive:
+        extra += ["--aggressive"]
     # Anything after `--` (or any unrecognised monitor flag) passes through to
     # the monitor's own parser, so one script exposes every knob.
     return known, [a for a in extra if a != "--"]
@@ -392,12 +421,15 @@ def main() -> int:
         log,
         directory=margs.log_dir,
         title=f"KALSHI AUTOPILOT ({args.mode.upper()}"
+              f"{', AGGRESSIVE' if margs.aggressive else ''}"
               f"{', gates before live' if args.mode == 'live' else ', paper only'})",
         context=[
-            f"series   : {margs.series}",
+            f"assets   : {', '.join(i.name + ' (' + i.series + ' <- ' + i.asset.coinbase_product + ')' for i in monitor.instruments)}",
+            f"preset   : {'AGGRESSIVE' if margs.aggressive else 'standard'}",
             f"warm-up  : {args.warmup_min:.0f} min, then quality gates",
             f"min edge : {margs.min_edge:+.4f}/contract net of fees",
-            f"confirm  : {margs.confirm_seconds:.1f}s / {margs.confirm_passes} passes",
+            f"confirm  : {margs.confirm_seconds:.1f}s / {margs.confirm_passes} passes, "
+            f"book every {margs.book_interval:.2f}s",
         ],
     )
     monitor.run_log = run_log
