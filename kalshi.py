@@ -743,3 +743,13 @@ class KalshiClient:
 
     async def positions(self, **filters: Any):
         return await self._get("/portfolio/positions", filters, signed=True)
+
+    async def fills(self, **filters: Any):
+        """Executed trades. The direct record of what actually filled.
+
+        A position snapshot is a derived, eventually-consistent view and can
+        read empty for seconds after a fill; a fill is the event itself, and
+        carries the `side` the venue booked - which is exactly what the side
+        mapping check needs to confirm.
+        """
+        return await self._get("/portfolio/fills", filters, signed=True)

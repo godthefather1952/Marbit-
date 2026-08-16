@@ -56,6 +56,11 @@ class RiskLimits:
     max_consecutive_losses: int = 3
     max_trades: int = 40  # hard cap on a session
     min_contracts: int = MIN_CONTRACTS
+    #: How many ~$1 side-mapping probes a session will buy before giving up on
+    #: proving the mapping and refusing to trade. Each costs about a dollar,
+    #: so an unbounded retry quietly bleeds the account: a live session bought
+    #: three and would have kept going.
+    max_verification_attempts: int = 3
 
 
 @dataclass(slots=True)
@@ -71,6 +76,10 @@ class OrderResult:
     order_id: str | None = None
     status: str = ""
     error: str | None = None
+    #: True for the 1-contract side-mapping probe. Its cost is a known,
+    #: bounded cost of doing business - not a strategy's opinion being wrong -
+    #: so it must not feed the consecutive-loss breaker.
+    verification: bool = False
 
     @property
     def stake(self) -> float:
@@ -112,6 +121,7 @@ class KalshiTrader:
         self.halted = False
         self.halt_reason = ""
         self.side_mapping_verified = False
+        self.verification_attempts = 0
         self._lock = asyncio.Lock()
         self._orders: list[OrderResult] = []
 
@@ -269,7 +279,20 @@ class KalshiTrader:
             self.side_mapping_verified = True
             return True
 
-        log.warning("Verifying side mapping with a single 1-contract NO order on %s", ticker)
+        if self.verification_attempts >= self.limits.max_verification_attempts:
+            log.error(
+                "Side mapping still unproven after %d probes (~$%d spent); refusing "
+                "to trade rather than keep buying probes",
+                self.verification_attempts, self.verification_attempts,
+            )
+            return False
+
+        self.verification_attempts += 1
+        log.warning(
+            "Verifying side mapping with a single 1-contract NO order on %s "
+            "(attempt %d/%d)",
+            ticker, self.verification_attempts, self.limits.max_verification_attempts,
+        )
         result = await self.place(
             ticker, "NO", 0.999, 1, tif="immediate_or_cancel", verification=True
         )
@@ -280,25 +303,12 @@ class KalshiTrader:
             )
             return None
 
-        await asyncio.sleep(2.0)
-        try:
-            positions = await self._client.positions()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not read positions to verify (%s); inconclusive", exc)
-            return None
-
-        rows = (positions or {}).get("market_positions") or []
-        row = next((r for r in rows if r.get("ticker") == ticker), None)
-        qty = (row or {}).get("position") or (row or {}).get("market_exposure") or 0
-        try:
-            qty = float(qty)
-        except (TypeError, ValueError):
-            qty = 0.0
-
-        if qty == 0.0:
-            # The order claimed a fill but the book shows nothing: either the
-            # fill has not propagated or the claim was wrong. Unknown != wrong.
-            log.warning("No position visible after the probe; inconclusive - will retry")
+        qty = await self._probe_position(ticker)
+        if qty is None:
+            log.warning(
+                "Could not confirm the probe's position or fill; inconclusive - "
+                "will retry on a later signal"
+            )
             return None
         if qty > 0:
             log.error(
@@ -313,6 +323,63 @@ class KalshiTrader:
         )
         self.side_mapping_verified = True
         return True
+
+    async def _probe_position(self, ticker: str) -> float | None:
+        """Signed position on `ticker` after the probe, or None if unreadable.
+
+        Two sources, because the first one failed live. A position snapshot is
+        eventually consistent: a live session read it 2s after a fill and saw
+        nothing three separate times, then watched the same contract settle
+        from that very position 15 minutes later. So the read is retried with
+        backoff and scoped to the one ticker, and if it still comes back empty
+        the fills endpoint - the record of the trade itself, which carries the
+        side the venue booked - is asked directly.
+        """
+        for delay in (1.5, 2.5, 4.0):
+            await asyncio.sleep(delay)
+            try:
+                payload = await self._client.positions(ticker=ticker)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Position read failed (%s); retrying", exc)
+                continue
+            for row in (payload or {}).get("market_positions") or []:
+                if row.get("ticker") != ticker:
+                    continue
+                raw = row.get("position")
+                if raw in (None, ""):
+                    raw = row.get("market_exposure")
+                try:
+                    qty = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if qty != 0.0:
+                    return qty
+
+        # The position view never showed it. Ask what actually filled.
+        try:
+            payload = await self._client.fills(ticker=ticker, limit=10)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Fill read failed (%s)", exc)
+            return None
+
+        net = 0.0
+        for fill in (payload or {}).get("fills") or []:
+            if fill.get("ticker") != ticker:
+                continue
+            try:
+                count = float(fill.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            # A fill's `side` is the YES-book side the venue booked. Our NO buy
+            # was sent as an ask (sell YES), so it must come back short.
+            side = str(fill.get("side") or "").lower()
+            action = str(fill.get("action") or "buy").lower()
+            signed = count if side in ("yes", "bid") else -count
+            net += signed if action == "buy" else -signed
+        if net != 0.0:
+            log.warning("Confirmed from fills instead of positions: net %s", net)
+            return net
+        return None
 
     # -- order placement ---------------------------------------------------- #
 
@@ -344,6 +411,7 @@ class KalshiTrader:
             price=price,
             api_price=api_price,
             count=count,
+            verification=verification,
         )
 
         if self.halted:
@@ -457,6 +525,20 @@ class KalshiTrader:
             total += pnl
             self.realized += pnl
             self.open_stake = max(0.0, self.open_stake - order.stake - fees)
+            # The consecutive-loss breaker exists to stop a STRATEGY that has
+            # started being wrong. The verification probe is not a strategy: it
+            # is a fixed ~$1 safety cost paid to prove the venue's side
+            # semantics, and a market moving against a 1-contract probe says
+            # nothing about the model. Letting it count halted a live session
+            # after three probes - see L_081626_085656.
+            if order.verification:
+                log.warning(
+                    "SETTLED [probe] %s %s x%d @ %.4f -> %s : %+.2f  "
+                    "(safety cost, not counted against the loss breaker)",
+                    ticker, order.outcome, order.count, order.price,
+                    result.upper(), pnl,
+                )
+                continue
             self.consecutive_losses = 0 if pnl > 0 else self.consecutive_losses + 1
             log.warning(
                 "SETTLED %s %s x%d @ %.4f -> %s : %+.2f  (session %+.2f)",

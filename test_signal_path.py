@@ -2139,8 +2139,73 @@ async def test_autopilot() -> None:
                                 {"market_positions": [{"ticker": "T", "position": 1}]})
         check("a LONG-YES position after a NO buy is the definitive halt",
               await reversed_.verify_side_mapping("T") is False)
+
+        # -- the fills fallback ---------------------------------------------- #
+        # Session L_081626_085656 read an empty position 2s after a fill three
+        # separate times, then watched that same contract settle from the very
+        # position it could not see. Fills are the trade itself, not a derived
+        # snapshot, so they are asked when positions come back empty.
+        class FillsTrader(VenueTrader):
+            def __init__(self, fills_response):
+                super().__init__({"order": {"order_id": "a", "status": "executed"}},
+                                 {"market_positions": []})
+                self._fills_response = fills_response
+                trader_self = self
+
+                class _Client:
+                    async def positions(self, **kw):
+                        return {"market_positions": []}
+
+                    async def fills(self, **kw):
+                        return trader_self._fills_response
+
+                self._client = _Client()
+
+        from_fills = FillsTrader({"fills": [
+            {"ticker": "T", "count": 1, "side": "no", "action": "buy"}]})
+        check("an invisible position falls back to the fills record",
+              await from_fills.verify_side_mapping("T") is True)
+
+        empty_fills = FillsTrader({"fills": []})
+        check("no position and no fill stays inconclusive",
+              await empty_fills.verify_side_mapping("T") is None)
+
+        # -- the probe attempt cap ------------------------------------------- #
+        capped = VenueTrader({"order": {"order_id": "a", "status": "canceled"}})
+        capped.limits.max_verification_attempts = 2
+        r1 = await capped.verify_side_mapping("T")
+        r2 = await capped.verify_side_mapping("T")
+        r3 = await capped.verify_side_mapping("T")
+        check("probes stop after the attempt cap instead of bleeding dollars",
+              r1 is None and r2 is None and r3 is False
+              and capped.verification_attempts == 2)
     finally:
         _aio.sleep = real_sleep
+
+    # -- the probe is a safety cost, not a strategy loss ---------------------- #
+    # This is what actually ended session L_081626_085656: three 1-contract
+    # probes settled at -0.01, -0.01 and -1.01, the consecutive-loss breaker
+    # counted all three, and trading halted at 13:00 - so the two good signals
+    # later that afternoon never executed.
+    probes = VenueTrader({"order": {"order_id": "a", "status": "executed"}})
+    for i in range(3):
+        res = await probes.place(f"M{i}", "NO", 0.999, 1, verification=True)
+        assert res.ok
+    for i in range(3):
+        probes.settle(f"M{i}", "yes")  # every probe loses
+    check("settled probes never touch the consecutive-loss breaker",
+          probes.consecutive_losses == 0 and not probes.halted,
+          f"{probes.consecutive_losses} losses counted, halted={probes.halted}")
+    check("probe losses still show up in realized PnL",
+          probes.realized < -2.9, f"${probes.realized:.2f}")
+
+    real_losses = VenueTrader({"order": {"order_id": "a", "status": "executed"}})
+    for i in range(3):
+        await real_losses.place(f"M{i}", "NO", 0.50, 1)
+    for i in range(3):
+        real_losses.settle(f"M{i}", "yes")
+    check("three real losing trades still halt, as designed",
+          real_losses.halted and real_losses.consecutive_losses == 3)
 
     # -- evaluate_gates ------------------------------------------------------ #
     def ready_monitor(tmp: str) -> Monitor:
