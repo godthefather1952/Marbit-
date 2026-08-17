@@ -2193,6 +2193,21 @@ async def test_autopilot() -> None:
     res = await filled.place("T", "NO", 0.999, 1)
     check("an executed order books normally", res.ok and filled.trades == 1)
 
+    # -- entries are IOC, not FOK --------------------------------------------- #
+    # L_081726_161637: 4 of 11 live entry attempts died with
+    # `fill_or_kill_insufficient_resting_volume` - a 36% miss on otherwise good
+    # signals, because FOK needs the WHOLE size resting at the price. IOC takes
+    # the 2 contracts that exist rather than refusing 3.
+    tif_check = VenueTrader({"order": {"order_id": "a", "fill_count": "2",
+                                       "remaining_count": "1"}})
+    res = await tif_check.place("T", "YES", 0.40, 3)  # $1.20, inside the cap
+    check("entries default to immediate-or-cancel",
+          tif_check._last_body["time_in_force"] == "immediate_or_cancel",
+          tif_check._last_body["time_in_force"])
+    check("a partial fill is taken rather than refused",
+          res.ok and res.count == 2, f"asked 3, got {res.count}")
+
+
     # -- the real CreateOrder V2 shape -------------------------------------- #
     # V2 returns NO status field at all - only fill_count / remaining_count.
     # Session L_081626_233108 fell through to "has an order_id, so it filled",

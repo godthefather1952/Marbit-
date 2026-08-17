@@ -17,9 +17,17 @@ one-contract order before any real size is risked. Getting it backwards would
 take the exact opposite of every intended position, so it is checked rather
 than trusted.
 
-Orders are fill-or-kill by default: the edge is a resting quote that is about
-to move, so an order must take it now or not at all. A resting remainder turns
-a short-dated arb into an unhedged directional bet.
+Orders are immediate-or-cancel: the edge is a resting quote about to move, so
+an order must take what is there NOW and cancel the rest. A resting remainder
+would turn a short-dated arb into an unhedged directional bet.
+
+Not fill-or-kill, which was the original choice and cost real trades. FOK
+requires the ENTIRE size to be resting at the price; on these books that failed
+4 of 11 live attempts in one session with
+`fill_or_kill_insufficient_resting_volume` - a 36% miss rate on signals that
+were otherwise good. IOC takes the 2 contracts that exist instead of refusing
+3, which is strictly better now that partial fills are booked correctly (see
+`place()` reading fill_count rather than assuming the requested size).
 """
 
 from __future__ import annotations
@@ -524,7 +532,7 @@ class KalshiTrader:
         outcome: str,
         price: float,
         count: int,
-        tif: str = "fill_or_kill",
+        tif: str = "immediate_or_cancel",
         verification: bool = False,
         strategy: str = "",
         entry_fair: float = 0.0,
