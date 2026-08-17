@@ -603,6 +603,10 @@ class Monitor:
                     args.min_edge, sigma,
                     require_implied=not args.allow_unvalidated_vol,
                     min_move_bps=args.stale_min_move,
+                    max_vol_ratio=(
+                        0.0 if args.allow_unvalidated_vol else args.vol_ratio_max
+                    ),
+                    max_edge=args.max_edge,
                 )
                 if sig:
                     found.append(sig)
@@ -1104,6 +1108,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CROSS: minimum locked dollar profit per pair")
     p.add_argument("--anchor-age", type=float, default=20.0,
                    help="STALE: how far back the market anchor is taken, seconds")
+    p.add_argument("--max-edge", type=float, default=0.35,
+                   help="refuse any signal claiming more than this net edge per "
+                        "contract. An edge this large on a liquid book is a model "
+                        "error, not an opportunity - every one this project has "
+                        "produced has been. 0 disables the cap.")
     p.add_argument("--stale-min-move", type=float, default=8.0,
                    help="STALE: minimum spot move vs the anchor, bps. Below this "
                         "the 'edge' is the book repricing on its own information "

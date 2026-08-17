@@ -116,7 +116,17 @@ def implied_sigma(market: KalshiMarket, book: KalshiBook, spot: float) -> float 
     if abs(z) < 0.25 or abs(lm) < 1e-7:
         return None  # too close to the money to invert reliably
     sigma = lm / (z * math.sqrt(tau))
-    return sigma if 1e-6 < sigma < 1e-2 else None
+    # Absolute plausibility. 1e-5 per sqrt-second is ~5.6% annualized; crypto
+    # does not trade there, so anything below it is an artefact rather than a
+    # measurement. A live session inverted a 0.9935 mid sitting almost exactly
+    # AT the strike into 0.03 bps/s, and STALE turned that into a claimed
+    # $19.83 edge on a $0.15 risk.
+    #
+    # The divergence is not noise, it is structural: near expiry the market
+    # knows how much of the settlement TWAP is already realized and we only
+    # know spot, so the quote can be confident while ln(S/K) is ~0. Inverting
+    # it there asks the quote a question it is not answering.
+    return sigma if 1e-5 < sigma < 1e-2 else None
 
 
 def vol_agreement(measured: float, implied: float | None) -> float | None:
@@ -198,6 +208,8 @@ def scan_stale(
     fallback_sigma: float,
     require_implied: bool = True,
     min_move_bps: float = 8.0,
+    max_vol_ratio: float = 0.0,
+    max_edge: float = 0.35,
 ) -> Signal | None:
     """Trade the repricing a spot move implies, not the level.
 
@@ -243,6 +255,16 @@ def scan_stale(
         if require_implied:
             return None
         sigma = fallback_sigma
+    elif max_vol_ratio > 0.0:
+        # Taking sigma from the quote was supposed to make this strategy immune
+        # to our own estimator being wrong. It does - but only while the quote's
+        # sigma is itself sane. When the two disagree wildly, one of them is
+        # broken and nothing here can tell which, so the honest move is to sit
+        # out. A live session traded a 9.53x disagreement (ours 0.32, market
+        # 0.03 bps/s) and bought 93 contracts on a fabricated edge.
+        ratio = vol_agreement(fallback_sigma, sigma)
+        if ratio is not None and ratio > max_vol_ratio:
+            return None
     tau = market.effective_tau()
     denom = sigma * math.sqrt(tau)
     if denom <= 0:
@@ -260,6 +282,12 @@ def scan_stale(
 
     edge = fair_side - ask - fee_per_contract(ask)
     if edge < min_edge:
+        return None
+    # An edge this large on a liquid book is a model error, not an opportunity.
+    # Every one this project has produced turned out to be. The trade that
+    # motivated the cap claimed $19.83 of expected profit against $0.15 of
+    # risk - a 132:1 return that no real market offers.
+    if max_edge > 0.0 and edge > max_edge:
         return None
 
     return Signal(

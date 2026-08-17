@@ -1905,6 +1905,50 @@ async def test_strategies() -> None:
         implied_sigma(live_now, near_money, 63_778.9) is None,
     )
 
+    # -- the 93-contract trade from L_081726_202145 -------------------------- #
+    # Spot sat almost exactly AT the strike (ln(S/K) = 2.6e-5) while the market
+    # quoted 0.9935. Inverting that gave sigma = 0.03 bps/s against our measured
+    # 0.32 - a 9.53x disagreement - and STALE turned it into a claimed $19.83
+    # edge on $0.15 of risk, bought 93 contracts, and lost.
+    #
+    # The divergence is structural, not noise: near expiry the market knows how
+    # much of the settlement TWAP is already realized and we only know spot, so
+    # the quote can be confident while ln(S/K) is ~0.
+    near_expiry = market("64285.01", close=closing_in(37.0))
+    tight = book(0.993, 0.994)
+    at_strike = 64_286.67
+    check(
+        "an implausibly low implied sigma is rejected outright",
+        implied_sigma(near_expiry, tight, at_strike) is None,
+        "0.03 bps/s is ~1.7% annualized; crypto does not trade there",
+    )
+    check(
+        "so STALE cannot trade on it",
+        scan_stale(near_expiry, tight, 64_329.0, 0.998, at_strike, 20.0,
+                   0.01, 0.32e-4, max_vol_ratio=1.5) is None,
+    )
+
+    # Even a plausible implied sigma is refused when it disagrees with ours.
+    # Taking sigma from the quote only protects us while the quote is sane.
+    plausible = market("63777.35", close=closing_in(600.0))
+    q = book(0.10, 0.11)
+    imp = implied_sigma(plausible, q, 63_400.0)
+    check("this quote does invert to a usable sigma", imp is not None,
+          f"{imp * 1e4:.2f} bps/s" if imp else "n/a")
+    if imp:
+        far = imp * 12.0  # our measurement wildly different
+        check(
+            "STALE sits out a large sigma disagreement rather than trusting the quote",
+            scan_stale(plausible, q, 63_800.0, 0.30, 63_400.0, 20.0,
+                       0.01, far, max_vol_ratio=1.5) is None,
+            f"{far / imp:.1f}x apart - one of them is broken and we cannot tell which",
+        )
+        check(
+            "max_vol_ratio 0 restores the old behaviour",
+            scan_stale(plausible, q, 63_800.0, 0.30, 63_400.0, 20.0,
+                       0.01, far, max_vol_ratio=0.0) is not None,
+        )
+
     # -- STALE without an invertible quote ----------------------------------- #
     atm = book(0.495, 0.505)  # z ~ 0, cannot be inverted
     check(
@@ -1915,8 +1959,25 @@ async def test_strategies() -> None:
     check(
         "the fallback is reachable only by opting in explicitly",
         scan_stale(live_now, atm, 63_000.0, 0.50, 63_600.0, 20.0, 0.01, 0.8e-4,
-                   require_implied=False) is not None,
+                   require_implied=False, max_edge=0.0) is not None,
+        "max_edge=0 here so the test isolates require_implied",
     )
+
+    # -- the edge sanity ceiling --------------------------------------------- #
+    # A 95 bps move against a 0.8 bps/s sigma drives fair value to the rail and
+    # claims ~50c of edge per contract. Real books do not offer that.
+    huge = scan_stale(live_now, atm, 63_000.0, 0.50, 63_600.0, 20.0, 0.01,
+                      0.8e-4, require_implied=False, max_edge=0.0)
+    check("without the cap, a runaway model claims an enormous edge",
+          huge is not None and huge.expected_net / 20.0 > 0.35,
+          f"{huge.expected_net / 20.0:+.3f}/contract" if huge else "no signal")
+    check(
+        "with the cap, that signal is refused as a model error",
+        scan_stale(live_now, atm, 63_000.0, 0.50, 63_600.0, 20.0, 0.01,
+                   0.8e-4, require_implied=False, max_edge=0.35) is None,
+        "every edge this large the project has produced was a bug",
+    )
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1980,6 +2041,7 @@ async def test_setup_and_confirmation() -> None:
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
             assets=None, eval_interval=0.2, take_profit=1.5,
             stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
+            max_edge=0.35,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
             allow_unvalidated_vol=False, no_cross=False, no_stale=False,
             no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
@@ -2431,6 +2493,7 @@ async def test_autopilot() -> None:
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
             assets=None, eval_interval=0.2, take_profit=1.5,
             stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
+            max_edge=0.35,
             endgame_window=120.0, endgame_z=3.0, no_cross=False,
             no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
             env_file=".env", verbose=False,
