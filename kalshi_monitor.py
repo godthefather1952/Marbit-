@@ -129,6 +129,9 @@ class Monitor:
         # `--confirm-seconds` before it is recorded or traded. Key is
         # (strategy, ticker, leg sides); value tracks first/last sighting.
         self._candidates: dict[tuple, dict] = {}
+        #: Sides already committed per market, so two strategies cannot take
+        #: opposite ends of the same contract. See _conflicts().
+        self._committed: dict[str, set[str]] = {}
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -595,12 +598,40 @@ class Monitor:
                 market, book, spot, args.size, sigma,
                 max_seconds_left=args.endgame_window,
                 min_z=args.endgame_z,
+                require_implied=not args.allow_unvalidated_vol,
             )
             if sig:
                 found.append(sig)
 
         for sig in found:
             self._emit(sig, inst)
+
+    def _conflicts(self, sig) -> str | None:
+        """Reject a signal that opposes a position we have already taken here.
+
+        A live session bought ENDGAME NO at 0.975 and, 32 seconds later, STALE
+        YES at 0.820 on the SAME contract. That is not a hedge: settlement pays
+        exactly one of them, so the pair is a guaranteed loss of both fees plus
+        the gap between the two prices, and it means two of our own strategies
+        flatly disagreed about the outcome while we funded both opinions.
+
+        When they disagree the honest move is to hold the first view or none,
+        not to buy both. CROSS is exempt because taking both sides IS its
+        thesis - it only fires when the pair costs less than the dollar it pays.
+        """
+        if sig.strategy == "CROSS":
+            return None
+        held = self._committed.get(sig.ticker)
+        if not held:
+            return None
+        for leg in sig.legs:
+            opposite = "NO" if leg.side == "YES" else "YES"
+            if opposite in held:
+                return (
+                    f"already committed {opposite} on {sig.ticker}; refusing the "
+                    f"opposing {leg.side}"
+                )
+        return None
 
     def _record_execution(self, sig, outcome: str, **kw) -> None:
         """Write the companion execution row, so nothing downstream can read a
@@ -618,6 +649,7 @@ class Monitor:
         """
         self._pending_orders.clear()
         self._candidates.clear()
+        self._committed.clear()
         if self.ledger is not None:
             self.ledger.reset_dedupe()
 
@@ -668,7 +700,15 @@ class Monitor:
             held = now - cand["first"]
             sig.note = f"{sig.note} | confirmed over {held:.1f}s / {cand['passes']} passes"
 
+        conflict = self._conflicts(sig)
+        if conflict is not None:
+            log.warning(" conflict: [%s] %s", sig.strategy, conflict)
+            self._record_execution(sig, "skipped", detail=conflict)
+            return
+
         if self.ledger is not None and self.ledger.record(sig):
+            for leg in sig.legs:
+                self._committed.setdefault(sig.ticker, set()).add(leg.side)
             self._pending_orders.append(sig)
             log.warning(
                 "\n---- PAPER TRADE ----\n %s\n %s\n"

@@ -295,6 +295,7 @@ def scan_endgame(
     min_z: float = 3.0,
     min_edge: float = 0.005,
     max_price: float = 0.99,
+    require_implied: bool = True,
 ) -> Signal | None:
     """Late in the window, buy the side that is nearly decided.
 
@@ -309,21 +310,41 @@ def scan_endgame(
     strictest sizing of the three, and a `min_z` well above what feels
     necessary.
 
-    `sigma` here must be MEASURED, not implied. Feeding it the market's own
-    implied volatility makes the strategy degenerate: implied sigma is defined
-    as the value that reproduces the quote, so z comes back as the market's own
-    z, fair value equals the mid exactly, and the edge collapses to half the
-    spread minus the fee - negative by construction, always. The consequence is
-    unavoidable and worth stating: ENDGAME is a bet that our volatility is
-    better than the market's. Only take it when the two are known to agree, and
-    size it as the tail risk deserves.
+    `sigma` must be MEASURED, not implied. Feeding it the market's own implied
+    volatility makes the strategy degenerate: implied sigma is by definition
+    the value that reproduces the quote, so z comes back as the market's own z,
+    fair value equals the mid exactly, and the edge collapses to half the
+    spread minus the fee - negative by construction, always.
+
+    So ENDGAME is irreducibly a bet that our volatility beats the market's, and
+    the graded record says it does not. A live session bought NO at 0.975 on a
+    "2.8 sigma" reading while our sigma sat 1.45x BELOW the market's - just
+    inside the 1.50x gate. On the market's sigma the same setup was 1.97 sigma,
+    under any sane threshold. BTC then moved $38 in 37 seconds, the market
+    settled YES, and the trade lost $8.79 - more than every ENDGAME win in the
+    project's history combined.
+
+    Hence `require_implied` and the conservative sigma below: when the market
+    thinks the world is more volatile than we do, we use ITS number. That
+    removes the overconfidence which is the only thing that ever made this
+    strategy look profitable. It will fire far less often, and the honest
+    reading of that is not that the filter is too strict - it is that the edge
+    was the error.
     """
     left = market.seconds_remaining()
     if left > max_seconds_left or left <= 0 or spot <= 0 or not market.strike_known:
         return None
 
+    implied = implied_sigma(market, book, spot)
+    if implied is None and require_implied:
+        return None
+    # Never let an under-estimate of volatility manufacture certainty. Taking
+    # the larger sigma can only ever move fair value toward 0.5, so it cannot
+    # invent an edge - it can only refuse one.
+    sigma_used = max(sigma, implied) if implied is not None else sigma
+
     tau = market.effective_tau()
-    denom = sigma * math.sqrt(tau)
+    denom = sigma_used * math.sqrt(tau)
     if denom <= 0:
         return None
     z = math.log(spot / market.strike) / denom
@@ -352,8 +373,14 @@ def scan_endgame(
         spot=spot,
         strike=market.strike,
         seconds_left=left,
-        sigma_used=sigma,
-        note=f"{abs(z):.1f} sigma from the strike with {left:.0f}s left",
+        sigma_used=sigma_used,
+        note=(
+            f"{abs(z):.1f} sigma from the strike with {left:.0f}s left "
+            f"(sigma {sigma_used * 1e4:.2f} bps/s"
+            + (f", ours {sigma * 1e4:.2f}, market {implied * 1e4:.2f}"
+               if implied is not None else "")
+            + ")"
+        ),
     )
 
 

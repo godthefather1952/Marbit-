@@ -1832,11 +1832,44 @@ async def test_strategies() -> None:
         eimplied is not None
         and scan_endgame(em, ebook, espot, 20.0, eimplied, min_z=0.5, min_edge=0.0) is None,
     )
-    with_measured = scan_endgame(em, ebook, espot, 20.0, esigma * 0.5, min_z=0.5, min_edge=0.0)
+    # The whole of ENDGAME's apparent edge was an UNDER-estimate of volatility
+    # making it overconfident. Taking the larger of the two sigmas removes it.
+    under = scan_endgame(em, ebook, espot, 20.0, esigma * 0.5, min_z=0.5, min_edge=0.0)
     check(
-        "ENDGAME only finds an edge when our sigma differs from the market's",
-        with_measured is not None,
+        "a too-low sigma can no longer manufacture certainty",
+        under is None,
         f"implied {eimplied * 1e4:.2f} vs measured {esigma * 0.5 * 1e4:.2f} bps/s",
+    )
+    check(
+        "ENDGAME sits out when the quote cannot supply a volatility to check against",
+        scan_endgame(em, book(0.50, 0.51), espot, 20.0, esigma,
+                     min_z=0.5, min_edge=0.0) is None,
+    )
+
+    # --- the trade that actually lost $8.79 -------------------------------- #
+    # L_081726_031221: NO at 0.975 on a "2.8 sigma" reading, with our sigma
+    # 1.45x BELOW the market's - inside the 1.50x gate. On the market's sigma
+    # it was 1.95 sigma. BTC moved $38 in 37s and it settled the other way.
+    loser = market("63337.39", close=closing_in(106.0))
+    loser_book = book(0.0250, 0.0260)  # NO ask 0.975
+    loser_spot = 63_300.83
+    ours, mkt = 0.25e-4, implied_sigma(loser, loser_book, loser_spot)
+    check(
+        "the market's own sigma was well above ours on the losing setup",
+        mkt is not None and 1.3 < mkt / ours < 1.6,
+        f"ours {ours * 1e4:.2f} vs market {mkt * 1e4:.2f} bps/s = {mkt / ours:.2f}x",
+    )
+    check(
+        "that trade is now refused outright",
+        scan_endgame(loser, loser_book, loser_spot, 20.0, ours,
+                     max_seconds_left=120.0, min_z=2.5) is None,
+    )
+    check(
+        "and it only fired before because our sigma was the smaller one",
+        scan_endgame(loser, loser_book, loser_spot, 20.0, ours,
+                     max_seconds_left=120.0, min_z=2.5,
+                     require_implied=False) is None,
+        "conservative sigma applies even without require_implied",
     )
 
     # -- the graded failure mode: no real spot move, no trade ---------------- #
@@ -2001,6 +2034,54 @@ async def test_setup_and_confirmation() -> None:
         mon = fresh_monitor(0.0, 1, tmp)
         mon._emit(sig())
         check("confirm-seconds 0 restores immediate recording",
+              len(mon._pending_orders) == 1)
+
+    # -- two strategies must not take opposite sides of one market ---------- #
+    # L_081726_031221 bought ENDGAME NO @ 0.975 and, 32s later, STALE YES @
+    # 0.820 on the SAME contract. Settlement pays exactly one, so the pair is a
+    # guaranteed loss of both fees plus the gap - and it meant two of our own
+    # strategies flatly disagreed while we funded both opinions.
+    def named(strategy: str, side: str, price: float) -> Signal:
+        return Signal(
+            strategy=strategy, ticker="KXBTC15M-SAME", legs=[Leg(side, price, 20.0)],
+            fair_yes=0.5, expected_net=0.4, max_loss=8.0, spot=63_300.0,
+            strike=63_337.0, seconds_left=100.0, sigma_used=2.5e-5,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        mon._emit(named("ENDGAME", "NO", 0.975))
+        check("the first side is taken", len(mon._pending_orders) == 1)
+        mon._emit(named("STALE", "YES", 0.820))
+        check("a second strategy cannot buy the opposing side of the same market",
+              len(mon._pending_orders) == 1,
+              "settlement pays one of them; holding both is a guaranteed loss")
+        mon._emit(named("STALE", "NO", 0.970))
+        check("the SAME side from another strategy is still allowed",
+              len(mon._pending_orders) == 2)
+
+        rows = [json.loads(l) for l in
+                (mon.ledger.path).read_text().splitlines() if l.strip()]
+        blocked = [r for r in rows if r.get("kind") == "execution"
+                   and r.get("outcome") == "skipped"]
+        check("the block is recorded in the ledger, not silent",
+              len(blocked) == 1 and "opposing" in blocked[0]["detail"],
+              blocked[0]["detail"] if blocked else "nothing recorded")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # CROSS is exempt: taking both sides IS its thesis, and it only fires
+        # when the pair costs less than the dollar it pays.
+        mon = fresh_monitor(0.0, 1, tmp)
+        both = Signal(
+            strategy="CROSS", ticker="KXBTC15M-SAME",
+            legs=[Leg("YES", 0.48, 20.0), Leg("NO", 0.49, 20.0)],
+            fair_yes=0.5, expected_net=0.4, max_loss=0.0, spot=0.0,
+            strike=63_337.0, seconds_left=100.0, sigma_used=0.0,
+        )
+        mon._emit(both)
+        check("CROSS may still hold both sides at once", len(mon._pending_orders) == 1)
+        mon._emit(both)
+        check("and a repeat CROSS is deduped, not conflict-blocked",
               len(mon._pending_orders) == 1)
 
 
