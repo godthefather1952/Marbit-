@@ -2537,12 +2537,15 @@ async def test_take_profit() -> None:
 
     check("a position below target is held",
           t.exit_reason(pos, book(0.40, 0.42), 300.0) is None)
-    check("the side-mapping probe is never managed as a position",
-          t.exit_reason(
-              OrderResult(ok=True, dry_run=True, ticker="T", outcome="NO",
-                          api_side="ask", price=0.99, api_price=0.01, count=1,
-                          verification=True),
-              book(0.99, 0.995), 300.0) is None)
+    # The probe IS managed. Its PnL stays out of the loss breaker, but it is a
+    # real contract bought with real money - and excluding it threw away the
+    # best trade in the record (see the 0.12 -> 0.57 replay below).
+    probe = OrderResult(ok=True, dry_run=True, ticker="T", outcome="NO",
+                        api_side="ask", price=0.12, api_price=0.88, count=1,
+                        verification=True)
+    check("the side-mapping probe is managed like any other position",
+          t.exit_reason(probe, book(0.42, 0.43), 300.0) is not None,
+          "it is real money, even if its PnL is excluded from the breaker")
     check("no exit is attempted in the final seconds, where the book empties",
           t.exit_reason(pos, book(0.90, 0.92), 20.0) is None,
           "min_seconds_to_exit")
@@ -2605,6 +2608,43 @@ async def test_take_profit() -> None:
         check("locking that gain beats the settlement it actually got",
               t.realized > 0 and winner.closed,
               f"${t.realized:+.2f} realized vs -$7.96 at settlement")
+
+    # -- replay: the two positions in the user's Kalshi screenshots ---------- #
+    # Both were 1-contract side-mapping probes that settled worthless:
+    #   BTC NO @ 0.19 (target $63,441.03) - peaked at a 0.26 bid = 1.23x net
+    #   ETH NO @ 0.12 (target $1,901.25)  - peaked at a 0.57 bid = 4.34x net
+    # The ETH one is the trade worth having: a 2x rule exits it for a profit
+    # instead of losing the whole stake.
+    t = trader(take_profit_multiple=2.0)
+    eth_probe = OrderResult(ok=True, dry_run=True, ticker="KXETH15M-26AUG170100-00",
+                            outcome="NO", api_side="ask", price=0.12,
+                            api_price=0.88, count=1, verification=True)
+    t._orders.append(eth_probe)
+    path = [0.14, 0.22, 0.31, 0.44, 0.57]  # the NO bid as it actually moved
+    exit_at = None
+    for nb in path:
+        d = t.exit_reason(eth_probe, book(1.0 - nb - 0.01, 1.0 - nb), 300.0)
+        if d and exit_at is None:
+            exit_at = d[1]
+    check("the ETH screenshot position would now be sold on the way up",
+          exit_at is not None and exit_at <= 0.57,
+          f"exits at {exit_at:.2f} instead of riding 0.12 -> 0.57 -> $0.00"
+          if exit_at else "never exits")
+    check("its peak is remembered for the settlement report",
+          abs(eth_probe.peak_mark - 0.57) < 1e-9, f"{eth_probe.peak_mark:.3f}")
+
+    # The BTC one only reached 1.23x net, so a 2x rule correctly leaves it -
+    # the rule is not a promise to catch every mover.
+    t2 = trader(take_profit_multiple=2.0)
+    btc_probe = OrderResult(ok=True, dry_run=True, ticker="KXBTC15M-26AUG170100-00",
+                            outcome="NO", api_side="ask", price=0.19,
+                            api_price=0.81, count=1, verification=True)
+    fired = [t2.exit_reason(btc_probe, book(1.0 - nb - 0.01, 1.0 - nb), 300.0)
+             for nb in (0.20, 0.25, 0.26)]
+    check("the BTC screenshot position never reached 2x, so it is not exited",
+          not any(fired), "peaked at 1.23x net - a lower threshold would be needed")
+    check("but its peak is still recorded, so the threshold can be tuned",
+          abs(btc_probe.peak_mark - 0.26) < 1e-9, f"{btc_probe.peak_mark:.3f}")
 
     # -- the stop, off by default -------------------------------------------- #
     check("no stop-loss unless asked for",

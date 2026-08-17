@@ -125,6 +125,11 @@ class OrderResult:
     closing: bool = False
     #: Which strategy opened it, for the exit rules and the scorecard.
     strategy: str = ""
+    #: Best mark seen while the position was open. Reported at settlement so
+    #: the take-profit threshold can be set from evidence rather than taste:
+    #: "peaked at 4.3x then settled worthless" is the number that tells you
+    #: whether the exit rule is set too high.
+    peak_mark: float = 0.0
 
     @property
     def stake(self) -> float:
@@ -623,13 +628,18 @@ class KalshiTrader:
         +0.32 but nets about +0.29 after both fees. Testing the raw price ratio
         would exit a "double" that is really 1.9x.
         """
-        if order.verification:
-            return None  # the probe is a cost, not a position to manage
+        # The side-mapping probe IS managed, deliberately. Its PnL is kept out
+        # of the consecutive-loss breaker because a 1-contract safety cost says
+        # nothing about the model - but it is still a real contract bought with
+        # real money, and excluding it from exits threw away the best trade in
+        # the record: a probe bought at 0.12 reached a 0.57 bid (4.3x net) and
+        # was then held to a worthless settlement.
         if seconds_left < self.limits.min_seconds_to_exit:
             return None
         value = self.mark(order, book)
         if value is None:
             return None
+        order.peak_mark = max(order.peak_mark, value)
 
         cost = order.price + fee_per_contract(order.price)
         proceeds = value - fee_per_contract(value)
@@ -751,18 +761,32 @@ class KalshiTrader:
             # nothing about the model. Letting it count halted a live session
             # after three probes - see L_081626_085656.
             if order.verification:
+                peak = (
+                    f"  [peaked at {order.peak_mark:.3f}]"
+                    if order.peak_mark > order.price else ""
+                )
                 log.warning(
                     "SETTLED [probe] %s %s x%d @ %.4f -> %s : %+.2f  "
-                    "(safety cost, not counted against the loss breaker)",
+                    "(safety cost, not counted against the loss breaker)%s",
                     ticker, order.outcome, order.count, order.price,
-                    result.upper(), pnl,
+                    result.upper(), pnl, peak,
                 )
                 continue
             self.consecutive_losses = 0 if pnl > 0 else self.consecutive_losses + 1
+            missed = ""
+            if pnl < 0 and order.peak_mark > order.price:
+                ratio = (
+                    (order.peak_mark - fee_per_contract(order.peak_mark))
+                    / (order.price + fee_per_contract(order.price))
+                )
+                missed = (
+                    f"  [peaked at {order.peak_mark:.3f} = {ratio:.2f}x net - "
+                    f"a --take-profit of {ratio:.2f} would have exited here]"
+                )
             log.warning(
-                "SETTLED %s %s x%d @ %.4f -> %s : %+.2f  (session %+.2f)",
+                "SETTLED %s %s x%d @ %.4f -> %s : %+.2f  (session %+.2f)%s",
                 ticker, order.outcome, order.count, order.price,
-                result.upper(), pnl, self.realized,
+                result.upper(), pnl, self.realized, missed,
             )
         if total:
             self.check_halt()
