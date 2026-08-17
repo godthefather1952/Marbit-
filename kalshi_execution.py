@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from kalshi import KalshiAuthError, KalshiClient, trading_fee
+from kalshi import KalshiAuthError, KalshiClient, fee_per_contract, trading_fee
 from btc_polymarket_arb import RETRYABLE_STATUS, RetryableError, json_loads, log
 
 ORDERS_PATH = "/portfolio/events/orders"
@@ -61,6 +61,24 @@ class RiskLimits:
     #: so an unbounded retry quietly bleeds the account: a live session bought
     #: three and would have kept going.
     max_verification_attempts: int = 3
+    #: Sell once the position is worth this multiple of what it cost, net of
+    #: the fees on both sides. 0 disables early exits.
+    #:
+    #: This is not a bolt-on: STALE's thesis is that the book has not yet
+    #: repriced a spot move. When it does reprice, the edge is CAPTURED, and
+    #: holding to settlement is a different bet that was never intended - a
+    #: contract bought at 0.32 because the model said 0.45 has no thesis left
+    #: at 0.64. Taking the gain there converts a binary lottery into a realized
+    #: profit and removes the reversal risk that has produced every loss.
+    take_profit_multiple: float = 2.0
+    #: Sell if the position falls to this fraction of its cost. 0 disables.
+    #: Deliberately off by default: on a cheap contract the mark is noisy and a
+    #: stop mostly pays the spread to exit trades that would have recovered.
+    stop_loss_fraction: float = 0.0
+    #: Never try to exit inside the final seconds - the book thins to nothing
+    #: there (the winning side stops being offered at all), so an exit would
+    #: cross a huge spread to escape a position about to settle anyway.
+    min_seconds_to_exit: float = 45.0
 
 
 def _fixed_point(value) -> float | None:
@@ -100,6 +118,13 @@ class OrderResult:
     #: bounded cost of doing business - not a strategy's opinion being wrong -
     #: so it must not feed the consecutive-loss breaker.
     verification: bool = False
+    #: Set once the position has been exited early, so settlement does not
+    #: also pay out a position we already sold.
+    closed: bool = False
+    #: True when this order was itself a closing trade.
+    closing: bool = False
+    #: Which strategy opened it, for the exit rules and the scorecard.
+    strategy: str = ""
 
     @property
     def stake(self) -> float:
@@ -411,6 +436,7 @@ class KalshiTrader:
         count: int,
         tif: str = "fill_or_kill",
         verification: bool = False,
+        strategy: str = "",
     ) -> OrderResult:
         """Buy `count` contracts of `outcome`. Never raises.
 
@@ -432,6 +458,7 @@ class KalshiTrader:
             api_price=api_price,
             count=count,
             verification=verification,
+            strategy=strategy,
         )
 
         if self.halted:
@@ -564,10 +591,145 @@ class KalshiTrader:
 
     # -- settlement accounting ---------------------------------------------- #
 
+    # -- exits -------------------------------------------------------------- #
+
+    def open_positions(self, ticker: str | None = None) -> list[OrderResult]:
+        """Filled orders still exposed to settlement."""
+        return [
+            o for o in self._orders
+            if o.ok and not o.closed and not o.closing
+            and (ticker is None or o.ticker == ticker)
+        ]
+
+    @staticmethod
+    def mark(order: OrderResult, book) -> float | None:
+        """What the position could be sold for right now, per contract.
+
+        A long YES is worth the YES bid; a long NO is worth the NO bid. Both
+        are BIDS on purpose - the mark has to be what someone will actually pay
+        us, not the mid or the ask, or every exit rule fires on a price we
+        could never get.
+        """
+        value = book.yes_bid if order.outcome == "YES" else book.no_bid
+        return value if value is not None and 0.0 < value < 1.0 else None
+
+    def exit_reason(
+        self, order: OrderResult, book, seconds_left: float
+    ) -> tuple[str, float] | None:
+        """Whether to close now, and at what mark. None means hold.
+
+        Both the entry and the exit pay Kalshi's taker fee, so the test is on
+        the NET multiple: a contract bought at 0.32 and sold at 0.64 grosses
+        +0.32 but nets about +0.29 after both fees. Testing the raw price ratio
+        would exit a "double" that is really 1.9x.
+        """
+        if order.verification:
+            return None  # the probe is a cost, not a position to manage
+        if seconds_left < self.limits.min_seconds_to_exit:
+            return None
+        value = self.mark(order, book)
+        if value is None:
+            return None
+
+        cost = order.price + fee_per_contract(order.price)
+        proceeds = value - fee_per_contract(value)
+        if cost <= 0:
+            return None
+        ratio = proceeds / cost
+
+        tp = self.limits.take_profit_multiple
+        if tp > 0 and ratio >= tp:
+            return ("take-profit", value)
+        sl = self.limits.stop_loss_fraction
+        if sl > 0 and ratio <= sl:
+            return ("stop-loss", value)
+        return None
+
+    async def close_position(
+        self, order: OrderResult, price: float, reason: str = "exit"
+    ) -> OrderResult:
+        """Sell a position back to the book.
+
+        Closing inverts the side: a long YES is closed by SELLING yes
+        (side="ask"), and a long NO - which on this venue is a short YES - is
+        closed by BUYING yes back (side="bid"). Getting this backwards would
+        double the position instead of flattening it, so it is derived from the
+        same to_api_side() the entry used rather than written out again.
+        """
+        # Selling outcome X is buying the opposite outcome, in side terms.
+        opposite = "NO" if order.outcome == "YES" else "YES"
+        api_side, api_price = self.to_api_side(opposite, round(1.0 - price, 4))
+        result = OrderResult(
+            ok=False, dry_run=self.dry_run, ticker=order.ticker,
+            outcome=order.outcome, api_side=api_side, price=price,
+            api_price=api_price, count=order.count, closing=True,
+            strategy=order.strategy,
+        )
+
+        gross = order.count * (price - order.price)
+        fees = trading_fee(price, order.count)
+        async with self._lock:
+            if self.dry_run:
+                result.ok = True
+                result.status = "simulated"
+            else:
+                body = {
+                    "ticker": order.ticker,
+                    "side": api_side,
+                    "count": f"{order.count}",
+                    "price": f"{api_price:.4f}",
+                    "time_in_force": "immediate_or_cancel",
+                    "self_trade_prevention_type": "taker_at_cross",
+                    "client_order_id": str(uuid.uuid4()),
+                }
+                try:
+                    response = await self._post(ORDERS_PATH, body)
+                except Exception as exc:  # noqa: BLE001
+                    result.error = f"{type(exc).__name__}: {exc}"
+                    log.error("Exit order failed on %s: %s", order.ticker, exc)
+                    return result
+                payload = (response or {}).get("order") or response or {}
+                filled = _fixed_point(payload.get("fill_count"))
+                avg = _fixed_point(payload.get("average_fill_price"))
+                result.order_id = str(payload.get("order_id") or "") or None
+                result.ok = bool(filled and filled > 0)
+                if result.ok:
+                    result.count = int(filled)
+                    if avg and 0.0 < avg < 1.0:
+                        result.price = (
+                            avg if order.outcome == "YES" else round(1.0 - avg, 4)
+                        )
+                    gross = result.count * (result.price - order.price)
+                    fees = trading_fee(result.price, result.count)
+                else:
+                    result.error = f"exit did not fill (filled {filled})"
+                    log.warning("Exit on %s did not fill; holding", order.ticker)
+                    return result
+
+        pnl = gross - fees
+        order.closed = True
+        self.realized += pnl
+        self.open_stake = max(0.0, self.open_stake - order.stake)
+        self.consecutive_losses = 0 if pnl > 0 else self.consecutive_losses + 1
+        self._orders.append(result)
+        log.warning(
+            "%s %s %s x%d: %.4f -> %.4f = %+.2f  (%.2fx net, session %+.2f)",
+            "EXITED" if not self.dry_run else "EXITED [sim]",
+            reason, order.outcome, result.count, order.price, result.price,
+            pnl, (result.price - fee_per_contract(result.price))
+            / max(order.price + fee_per_contract(order.price), 1e-9),
+            self.realized,
+        )
+        self.check_halt()
+        return result
+
     def settle(self, ticker: str, result: str) -> float:
-        """Book the outcome of every order on `ticker`. Returns realized PnL."""
+        """Book the outcome of every order on `ticker` still open at expiry."""
         total = 0.0
-        for order in [o for o in self._orders if o.ticker == ticker and o.ok]:
+        for order in [
+            o for o in self._orders
+            if o.ticker == ticker and o.ok and not o.closed and not o.closing
+        ]:
             won = (order.outcome == "YES" and result == "yes") or (
                 order.outcome == "NO" and result == "no"
             )

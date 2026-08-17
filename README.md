@@ -406,6 +406,38 @@ promotion gates before either trades. There is no going live on half the book.
 ETH's book is thinner (~107k contracts per window against BTC's ~2.3M), so
 expect wider spreads and less certain fills there.
 
+### Taking profit before settlement
+
+```bash
+python kalshi_main.py --take-profit 2.0     # default; 0 holds to settlement
+```
+
+STALE buys because the book has **not yet repriced** a spot move. The moment it
+does reprice, the thesis has played out and the edge is captured — whatever BTC
+does afterwards is a directional bet nobody chose to make. A contract bought at
+0.32 on a model value of 0.45 has no thesis left at 0.64.
+
+So positions are marked against the live book every pass and sold once they are
+worth `--take-profit` times what they cost. Details that matter:
+
+- **The mark is a bid, never a mid or an ask** — what someone will actually pay
+  us. Marking at the mid would fire exits at prices we could never get.
+- **The test is on the NET multiple.** Both entry and exit pay Kalshi's taker
+  fee, so 0.32 → 0.64 is only 1.86x net and does *not* trigger; it takes about
+  0.72 to be a real double.
+- **No exits inside `--min-exit-seconds`** (45s default). The book thins to
+  nothing near expiry — the winning side stops being offered at all — so an
+  exit there would cross a huge spread to escape a position about to settle.
+- **Settlement skips anything already sold**, so a closed position is never
+  paid out twice.
+- `--stop-loss` exists but is **off by default**: on a cheap contract the mark
+  is noisy, and a stop mostly pays the spread to exit trades that recover.
+
+What this cannot do is rescue a loser. Replaying the real ETH position from
+`L_081726_040520` (bought NO at 0.087, fell 0.069 → 0.051 → 0.006, settled
+worthless), the rule never fires — it only stops a *winner* from becoming a
+loser.
+
 ### Aggressive mode
 
 ```bash

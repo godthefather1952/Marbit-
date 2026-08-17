@@ -1978,7 +1978,8 @@ async def test_setup_and_confirmation() -> None:
             cooldown=5.0, heartbeat=15.0, binance=False, live=False,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
-            assets=None, eval_interval=0.2,
+            assets=None, eval_interval=0.2, take_profit=2.0,
+            stop_loss=0.0, min_exit_seconds=45.0,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
             allow_unvalidated_vol=False, no_cross=False, no_stale=False,
             no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
@@ -2413,7 +2414,8 @@ async def test_autopilot() -> None:
             discovery_interval=10.0, cooldown=5.0, heartbeat=15.0,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
-            assets=None, eval_interval=0.2,
+            assets=None, eval_interval=0.2, take_profit=2.0,
+            stop_loss=0.0, min_exit_seconds=45.0,
             endgame_window=120.0, endgame_z=3.0, no_cross=False,
             no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
             env_file=".env", verbose=False,
@@ -2473,6 +2475,143 @@ async def test_autopilot() -> None:
               not mon._pending_orders and not mon._candidates)
         check("a market that signalled on paper can trade live",
               mon.ledger.record(sig))
+
+
+# --------------------------------------------------------------------------- #
+# Taking profit before settlement
+# --------------------------------------------------------------------------- #
+
+
+async def test_take_profit() -> None:
+    print("\n--- exits: taking profit once the thesis has played out ---")
+
+    from kalshi import KalshiBook, KalshiClient, fee_per_contract, trading_fee
+    from kalshi_execution import KalshiTrader, OrderResult, RiskLimits
+
+    def book(yes_bid: float, yes_ask: float) -> KalshiBook:
+        return KalshiBook.from_payload({"orderbook_fp": {
+            "yes_dollars": [[f"{yes_bid:.4f}", "500"]],
+            "no_dollars": [[f"{1.0 - yes_ask:.4f}", "500"]],
+        }})
+
+    class FakeClient(KalshiClient):
+        def __init__(self):  # noqa: super-init-not-called
+            pass
+
+        async def balance(self):
+            return {"balance": 7500}
+
+    def trader(**kw) -> KalshiTrader:
+        t = KalshiTrader(FakeClient(), RiskLimits(**kw), dry_run=True)
+        t.starting_balance = 75.0
+        return t
+
+    def held(outcome: str, price: float, count: int = 20) -> OrderResult:
+        return OrderResult(ok=True, dry_run=True, ticker="T", outcome=outcome,
+                           api_side="bid", price=price, api_price=price,
+                           count=count, strategy="STALE")
+
+    # -- the mark must be a bid, never a mid or an ask ----------------------- #
+    t = trader()
+    b = book(0.60, 0.66)  # yes bid 0.60, yes ask 0.66 -> no bid 0.34
+    check("a YES position marks at the YES bid - what someone will actually pay",
+          abs(t.mark(held("YES", 0.30), b) - 0.60) < 1e-9)
+    check("a NO position marks at the NO bid",
+          abs(t.mark(held("NO", 0.30), b) - 0.34) < 1e-9,
+          "1 - yes_ask, not 1 - yes_bid")
+
+    # -- the doubling test is on the NET multiple ---------------------------- #
+    # Bought at 0.32, quoted at 0.64: gross is exactly 2x, but both sides pay
+    # Kalshi's fee, so the real multiple is under 2. Testing the raw ratio
+    # would exit a "double" that is really 1.9x.
+    t = trader(take_profit_multiple=2.0)
+    pos = held("YES", 0.32)
+    gross_double = t.exit_reason(pos, book(0.64, 0.66), 300.0)
+    net_ratio = (0.64 - fee_per_contract(0.64)) / (0.32 + fee_per_contract(0.32))
+    check("a gross double that is not a NET double does not trigger",
+          gross_double is None and net_ratio < 2.0, f"net {net_ratio:.3f}x")
+    decision = t.exit_reason(pos, book(0.72, 0.74), 300.0)
+    check("a genuine net double does trigger",
+          decision is not None and decision[0] == "take-profit",
+          f"sell at {decision[1]:.2f}" if decision else "no exit")
+
+    check("a position below target is held",
+          t.exit_reason(pos, book(0.40, 0.42), 300.0) is None)
+    check("the side-mapping probe is never managed as a position",
+          t.exit_reason(
+              OrderResult(ok=True, dry_run=True, ticker="T", outcome="NO",
+                          api_side="ask", price=0.99, api_price=0.01, count=1,
+                          verification=True),
+              book(0.99, 0.995), 300.0) is None)
+    check("no exit is attempted in the final seconds, where the book empties",
+          t.exit_reason(pos, book(0.90, 0.92), 20.0) is None,
+          "min_seconds_to_exit")
+    check("an empty book cannot be marked, so nothing is sold into it",
+          t.exit_reason(pos, KalshiBook.from_payload(
+              {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}), 300.0) is None)
+
+    # -- closing actually books the gain and flattens ------------------------ #
+    t = trader(take_profit_multiple=2.0)
+    pos = held("YES", 0.32, count=20)
+    t._orders.append(pos)
+    t.open_stake = pos.stake
+    res = await t.close_position(pos, 0.72, "take-profit")
+    expected = 20 * (0.72 - 0.32) - trading_fee(0.72, 20)
+    check("the exit books the realized gain", res.ok
+          and abs(t.realized - expected) < 1e-6, f"${t.realized:+.2f}")
+    check("the position is flat afterwards", pos.closed
+          and not t.open_positions("T"))
+    # Settlement must not ALSO pay out a position we already sold.
+    t.settle("T", "no")  # would have been a total loss if still held
+    check("settlement skips a position that was already exited",
+          abs(t.realized - expected) < 1e-6, f"${t.realized:+.2f}")
+
+    # -- the side inversion on the way out ----------------------------------- #
+    t = trader()
+    yes_pos = held("YES", 0.30)
+    t._orders.append(yes_pos)
+    res = await t.close_position(yes_pos, 0.70)
+    check("closing a YES long SELLS yes (side=ask)", res.api_side == "ask",
+          f"sent as {res.api_side} {res.api_price:.4f}")
+    t = trader()
+    no_pos = held("NO", 0.30)
+    t._orders.append(no_pos)
+    res = await t.close_position(no_pos, 0.70)
+    check("closing a NO long BUYS yes back (side=bid)", res.api_side == "bid",
+          "a NO long is a short YES on this venue")
+
+    # -- replay: the ETH position from L_081726_040520 ----------------------- #
+    # Bought NO at 0.087; the book then ran the other way (no bid 0.091, 0.069,
+    # 0.051, 0.042, 0.033 ...) and it settled worthless. A take-profit never
+    # fires on a position that only ever falls - the rule cannot rescue a
+    # losing trade, it can only stop a winner from becoming one.
+    t = trader(take_profit_multiple=2.0)
+    losing = held("NO", 0.087, count=86)
+    fired = [t.exit_reason(losing, book(1.0 - nb, 1.0 - nb + 0.001), 250.0)
+             for nb in (0.091, 0.069, 0.051, 0.042, 0.033, 0.014, 0.006)]
+    check("the real losing ETH position never triggers an exit",
+          not any(fired), "it fell from 0.087 to 0.006 without ever doubling")
+
+    # And the trade it WOULD have saved: same entry, book doubling instead.
+    t = trader(take_profit_multiple=2.0)
+    winner = held("NO", 0.087, count=86)
+    t._orders.append(winner)
+    # no_bid = 1 - yes_ask, so a 0.25 NO bid is book(0.74, 0.75).
+    decision = t.exit_reason(winner, book(0.74, 0.75), 250.0)
+    check("the same entry exits when the book DOES double",
+          decision is not None, f"sell at {decision[1]:.3f}" if decision else "no")
+    if decision:
+        await t.close_position(winner, decision[1], decision[0])
+        check("locking that gain beats the settlement it actually got",
+              t.realized > 0 and winner.closed,
+              f"${t.realized:+.2f} realized vs -$7.96 at settlement")
+
+    # -- the stop, off by default -------------------------------------------- #
+    check("no stop-loss unless asked for",
+          trader().limits.stop_loss_fraction == 0.0)
+    t = trader(stop_loss_fraction=0.5)
+    d = t.exit_reason(held("YES", 0.40), book(0.15, 0.17), 300.0)
+    check("a stop fires when enabled", d is not None and d[0] == "stop-loss")
 
 
 # --------------------------------------------------------------------------- #
@@ -2721,6 +2860,7 @@ async def main() -> None:
     await test_strategies()
     await test_setup_and_confirmation()
     await test_autopilot()
+    await test_take_profit()
     await test_multi_asset_and_preset()
     await test_kalshi_execution()
     await test_polymarket_us()

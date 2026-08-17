@@ -62,6 +62,16 @@ from kalshi import (
 )
 
 
+class _ExitStub:
+    """Minimal shape `PaperLedger.record_execution` needs for an exit row."""
+
+    __slots__ = ("strategy", "ticker")
+
+    def __init__(self, strategy: str, ticker: str) -> None:
+        self.strategy = strategy
+        self.ticker = ticker
+
+
 class Instrument:
     """One underlying, its own tape, and the contract currently open on it.
 
@@ -147,6 +157,9 @@ class Monitor:
                     max_exposure_pct=self._args.max_exposure_pct / 100.0,
                     daily_loss_pct=self._args.daily_loss_pct / 100.0,
                     max_trades=self._args.max_trades,
+                    take_profit_multiple=self._args.take_profit,
+                    stop_loss_fraction=self._args.stop_loss,
+                    min_seconds_to_exit=self._args.min_exit_seconds,
                 ),
                 dry_run=not self._args.live,
             )
@@ -768,7 +781,10 @@ class Monitor:
                                 detail=f"no legal size at {leg.price:.4f}",
                             )
                             continue
-                        result = await trader.place(sig.ticker, leg.side, leg.price, count)
+                        result = await trader.place(
+                            sig.ticker, leg.side, leg.price, count,
+                            strategy=sig.strategy,
+                        )
                         log.warning(" execution: [%s] %s", sig.strategy, result.summary())
                         self._record_execution(
                             sig,
@@ -778,12 +794,51 @@ class Monitor:
                             price=result.price,
                             detail=result.error or "",
                         )
+                await self._manage_exits()
                 await self._settle_finished()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("Execution loop error: %s", exc)
             await asyncio.sleep(1.0)
+
+    async def _manage_exits(self) -> None:
+        """Mark open positions against the live book and take profits.
+
+        The reason this belongs in the loop rather than at settlement: STALE
+        buys because the book has NOT yet repriced a spot move. The moment it
+        reprices, the thesis has played out and the edge is realized - whatever
+        happens to BTC afterwards is a directional bet nobody chose to make. A
+        position bought at 0.32 on a model value of 0.45 has no thesis left at
+        0.64, and every loss this project has taken came from holding one of
+        those into settlement.
+        """
+        trader = self.trader
+        if trader is None or trader.limits.take_profit_multiple <= 0:
+            return
+        # Books are per-instrument, so a position can only be marked against
+        # the instrument that owns its ticker.
+        for inst in self.instruments:
+            market, book = inst.market, inst.book
+            if market is None or book is None:
+                continue
+            left = market.seconds_remaining()
+            for order in trader.open_positions(market.ticker):
+                decision = trader.exit_reason(order, book, left)
+                if decision is None:
+                    continue
+                reason, price = decision
+                await trader.close_position(order, price, reason)
+                self._committed.get(order.ticker, set()).discard(order.outcome)
+                if self.ledger is not None:
+                    with contextlib.suppress(Exception):
+                        self.ledger.record_execution(
+                            _ExitStub(order.strategy, order.ticker),
+                            "closed",
+                            count=order.count,
+                            price=price,
+                            detail=f"{reason} at {price:.4f} from {order.price:.4f}",
+                        )
 
     async def _settle_finished(self) -> None:
         """Book the real outcome of any market we traded that has now settled."""
@@ -997,6 +1052,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="session loss that halts trading, percent of balance")
     p.add_argument("--max-trades", type=int, default=40,
                    help="hard cap on orders in one session")
+    p.add_argument("--take-profit", type=float, default=2.0,
+                   help="sell once a position is worth this multiple of what it "
+                        "cost, net of the fees on both sides. 0 holds every "
+                        "position to settlement. STALE buys because the book has "
+                        "not repriced yet; when it does, the thesis has played out "
+                        "and holding on is a directional bet nobody chose.")
+    p.add_argument("--stop-loss", type=float, default=0.0,
+                   help="sell if a position falls to this fraction of its cost "
+                        "(e.g. 0.4). 0 disables - on a cheap contract the mark is "
+                        "noisy and a stop mostly pays the spread to exit trades "
+                        "that would have recovered.")
+    p.add_argument("--min-exit-seconds", type=float, default=45.0,
+                   help="never try to exit inside this many seconds of expiry; the "
+                        "book thins to nothing there")
     p.add_argument("--min-profit", type=float, default=0.01,
                    help="CROSS: minimum locked dollar profit per pair")
     p.add_argument("--anchor-age", type=float, default=20.0,
