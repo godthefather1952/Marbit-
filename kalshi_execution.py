@@ -70,11 +70,23 @@ class RiskLimits:
     #: contract bought at 0.32 because the model said 0.45 has no thesis left
     #: at 0.64. Taking the gain there converts a binary lottery into a realized
     #: profit and removes the reversal risk that has produced every loss.
-    take_profit_multiple: float = 2.0
+    #:
+    #: 1.5x, not 2.0x, on evidence. Across every position observable in the
+    #: logs so far the peak marks were 4.34x, 1.75x, 1.25x, 1.23x, 1.23x,
+    #: 0.93x, 0.91x and 0.63x - so a 2.0x rule caught exactly one of eight and
+    #: sat out a 1.75x mover that then settled worthless. 1.5x catches both
+    #: without cutting the one winner short (it peaked at 1.25x and settled
+    #: full). Small sample; revisit as the peak reports accumulate.
+    take_profit_multiple: float = 1.5
     #: Sell if the position falls to this fraction of its cost. 0 disables.
     #: Deliberately off by default: on a cheap contract the mark is noisy and a
     #: stop mostly pays the spread to exit trades that would have recovered.
     stop_loss_fraction: float = 0.0
+    #: Also exit when the book reprices to the fair value the signal was based
+    #: on, even if that is short of the multiple. This is the most faithful
+    #: exit of all: STALE bought because the book had not caught up to our fair
+    #: value, so the moment it does, the thesis is complete by definition.
+    exit_at_fair_value: bool = True
     #: Never try to exit inside the final seconds - the book thins to nothing
     #: there (the winning side stops being offered at all), so an exit would
     #: cross a huge spread to escape a position about to settle anyway.
@@ -125,6 +137,9 @@ class OrderResult:
     closing: bool = False
     #: Which strategy opened it, for the exit rules and the scorecard.
     strategy: str = ""
+    #: Our fair value for THIS outcome at entry. The book reaching it means the
+    #: mispricing we bought has closed.
+    entry_fair: float = 0.0
     #: Best mark seen while the position was open. Reported at settlement so
     #: the take-profit threshold can be set from evidence rather than taste:
     #: "peaked at 4.3x then settled worthless" is the number that tells you
@@ -330,11 +345,15 @@ class KalshiTrader:
             return True
 
         if self.verification_attempts >= self.limits.max_verification_attempts:
-            log.error(
-                "Side mapping still unproven after %d probes (~$%d spent); refusing "
-                "to trade rather than keep buying probes",
-                self.verification_attempts, self.verification_attempts,
-            )
+            # Out of attempts is NOT the same as reversed. Saying "REVERSED"
+            # here mislabelled a whole session's halt reason.
+            if not self.halted:
+                self.halted = True
+                self.halt_reason = (
+                    f"side mapping unproven after {self.verification_attempts} "
+                    f"probes - refusing to trade rather than keep buying probes"
+                )
+                log.error("TRADING HALTED: %s", self.halt_reason)
             return False
 
         self.verification_attempts += 1
@@ -343,6 +362,7 @@ class KalshiTrader:
             "(attempt %d/%d)",
             ticker, self.verification_attempts, self.limits.max_verification_attempts,
         )
+        before = await self._balance_or_none()
         result = await self.place(
             ticker, "NO", 0.999, 1, tif="immediate_or_cancel", verification=True
         )
@@ -352,6 +372,61 @@ class KalshiTrader:
                 "on a later signal", result.error,
             )
             return None
+
+        # The FILL PRICE settles this on its own, with no second API call.
+        #
+        # We sent side="ask" at 0.001 - an order to sell YES at 0.1c or better.
+        # A limit order can only ever fill on the favourable side of its own
+        # limit, so:
+        #
+        #   sell semantics: fills at >= 0.001, i.e. wherever the YES BID is.
+        #                   Filling at 0.945 means it crossed a 0.945 bid, and
+        #                   we are now short YES = long NO at 0.055. Correct.
+        #   buy semantics:  could only fill at <= 0.001, so a 0.945 fill is
+        #                   arithmetically impossible.
+        #
+        # This matters because the position endpoint has now failed to confirm a
+        # fill nine times across four sessions - reading empty 8s after an order
+        # that demonstrably filled and later settled. Asking it at all was the
+        # mistake: the venue already told us the price, and the price is proof.
+        limit = 1.0 - 0.999  # the YES-book price we sent
+        fill = result.api_price
+        if fill > limit + 0.005:
+            log.warning(
+                "Side mapping VERIFIED from the fill: sold YES at %.4f against a "
+                "%.4f limit, so we are short YES = long NO at %.4f. A buy could "
+                "not have filled above its limit.",
+                fill, limit, result.price,
+            )
+            self.side_mapping_verified = True
+            return True
+        # Filled at (not above) the limit, so the price says nothing: the YES
+        # bid really was ~0.001. Ask the BALANCE instead, which distinguishes
+        # both directions decisively and, unlike the position endpoint, has
+        # answered correctly in every session. Buying NO at 0.055 debits 5.5c;
+        # buying YES at 0.945 debits 94.5c. Those cannot be confused.
+        log.info("Probe filled at its limit; checking the balance delta instead")
+        after = await self._balance_or_none()
+        if before is not None and after is not None:
+            spent = before - after
+            no_cost = result.price * result.count
+            yes_cost = (1.0 - result.price) * result.count
+            if abs(spent - no_cost) < abs(spent - yes_cost):
+                log.warning(
+                    "Side mapping VERIFIED from the balance: spent $%.4f, which "
+                    "matches NO at %.4f (a YES fill would have cost $%.4f)",
+                    spent, result.price, yes_cost,
+                )
+                self.side_mapping_verified = True
+                return True
+            log.error(
+                "Side mapping REVERSED - ABORTING: spent $%.4f, which matches "
+                "YES at %.4f rather than the NO at %.4f we intended. Every "
+                "position would be the opposite of the one asked for.",
+                spent, 1.0 - result.price, result.price,
+            )
+            self.side_mapping_verified = False
+            return False
 
         qty = await self._probe_position(ticker)
         if qty is None:
@@ -373,6 +448,16 @@ class KalshiTrader:
         )
         self.side_mapping_verified = True
         return True
+
+    async def _balance_or_none(self) -> float | None:
+        """Account balance in dollars, or None if it cannot be read."""
+        try:
+            payload = await self._client.balance()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Balance read failed (%s)", exc)
+            return None
+        cents = (payload or {}).get("balance")
+        return float(cents) / 100.0 if isinstance(cents, (int, float)) else None
 
     async def _probe_position(self, ticker: str) -> float | None:
         """Signed position on `ticker` after the probe, or None if unreadable.
@@ -442,6 +527,7 @@ class KalshiTrader:
         tif: str = "fill_or_kill",
         verification: bool = False,
         strategy: str = "",
+        entry_fair: float = 0.0,
     ) -> OrderResult:
         """Buy `count` contracts of `outcome`. Never raises.
 
@@ -464,6 +550,7 @@ class KalshiTrader:
             count=count,
             verification=verification,
             strategy=strategy,
+            entry_fair=entry_fair,
         )
 
         if self.halted:
@@ -650,6 +737,16 @@ class KalshiTrader:
         tp = self.limits.take_profit_multiple
         if tp > 0 and ratio >= tp:
             return ("take-profit", value)
+        # The thesis target: the book has caught up to what we thought the
+        # contract was worth when we bought it. Nothing is left to be right
+        # about, so holding on is a fresh directional bet.
+        if (
+            self.limits.exit_at_fair_value
+            and order.entry_fair > 0.0
+            and proceeds >= order.entry_fair
+            and ratio > 1.0
+        ):
+            return ("thesis-complete", value)
         sl = self.limits.stop_loss_fraction
         if sl > 0 and ratio <= sl:
             return ("stop-loss", value)

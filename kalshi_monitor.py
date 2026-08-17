@@ -142,6 +142,8 @@ class Monitor:
         #: Sides already committed per market, so two strategies cannot take
         #: opposite ends of the same contract. See _conflicts().
         self._committed: dict[str, set[str]] = {}
+        #: Conflicts already reported, so a persisting signal is logged once.
+        self._conflicts_seen: set[tuple] = set()
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -158,6 +160,7 @@ class Monitor:
                     daily_loss_pct=self._args.daily_loss_pct / 100.0,
                     max_trades=self._args.max_trades,
                     take_profit_multiple=self._args.take_profit,
+                    exit_at_fair_value=not self._args.no_fair_exit,
                     stop_loss_fraction=self._args.stop_loss,
                     min_seconds_to_exit=self._args.min_exit_seconds,
                 ),
@@ -663,6 +666,7 @@ class Monitor:
         self._pending_orders.clear()
         self._candidates.clear()
         self._committed.clear()
+        self._conflicts_seen.clear()
         if self.ledger is not None:
             self.ledger.reset_dedupe()
 
@@ -713,10 +717,17 @@ class Monitor:
             held = now - cand["first"]
             sig.note = f"{sig.note} | confirmed over {held:.1f}s / {cand['passes']} passes"
 
+        ckey_conflict = (sig.strategy, sig.ticker,
+                         tuple(leg.side for leg in sig.legs))
         conflict = self._conflicts(sig)
         if conflict is not None:
-            log.warning(" conflict: [%s] %s", sig.strategy, conflict)
-            self._record_execution(sig, "skipped", detail=conflict)
+            # Once per (strategy, market, side): a persisting signal is
+            # re-evaluated several times a second, and logging each one wrote
+            # 548 identical lines in a single session.
+            if ckey_conflict not in self._conflicts_seen:
+                self._conflicts_seen.add(ckey_conflict)
+                log.warning(" conflict: [%s] %s", sig.strategy, conflict)
+                self._record_execution(sig, "skipped", detail=conflict)
             return
 
         if self.ledger is not None and self.ledger.record(sig):
@@ -738,20 +749,32 @@ class Monitor:
                 while self._pending_orders and trader is not None:
                     sig = self._pending_orders.pop(0)
                     if trader.check_halt():
+                        # Halted is terminal for the session. Draining the queue
+                        # one signal at a time logged 548 identical skip lines
+                        # in one run, which buried everything else in the log.
+                        if self._pending_orders:
+                            log.warning(
+                                " execution: halted (%s) - discarding %d queued "
+                                "signal(s); no further orders this session",
+                                trader.halt_reason, len(self._pending_orders) + 1,
+                            )
                         self._record_execution(
                             sig, "skipped", detail=f"halted: {trader.halt_reason}"
                         )
-                        continue
+                        self._pending_orders.clear()
+                        break
                     if not trader.side_mapping_verified:
                         # One 1-contract NO order, read back as a position,
                         # before any real size: getting the YES-book inversion
                         # backwards would take the opposite of every trade.
                         verdict = await trader.verify_side_mapping(sig.ticker)
                         if verdict is False:
-                            # Definitively reversed - the one unrecoverable case.
-                            trader.halted = True
-                            trader.halt_reason = "side mapping REVERSED on the venue"
-                            log.error("TRADING HALTED: %s", trader.halt_reason)
+                            # Either genuinely reversed or out of attempts;
+                            # verify_side_mapping has already set the reason.
+                            if not trader.halted:
+                                trader.halted = True
+                                trader.halt_reason = "side mapping REVERSED on the venue"
+                                log.error("TRADING HALTED: %s", trader.halt_reason)
                             self._record_execution(
                                 sig, "skipped", detail=trader.halt_reason
                             )
@@ -781,9 +804,15 @@ class Monitor:
                                 detail=f"no legal size at {leg.price:.4f}",
                             )
                             continue
+                        # fair_yes is the model's YES probability; the exit
+                        # target for a NO leg is its complement.
+                        fair_leg = (
+                            sig.fair_yes if leg.side == "YES"
+                            else 1.0 - sig.fair_yes
+                        )
                         result = await trader.place(
                             sig.ticker, leg.side, leg.price, count,
-                            strategy=sig.strategy,
+                            strategy=sig.strategy, entry_fair=fair_leg,
                         )
                         log.warning(" execution: [%s] %s", sig.strategy, result.summary())
                         self._record_execution(
@@ -1052,12 +1081,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="session loss that halts trading, percent of balance")
     p.add_argument("--max-trades", type=int, default=40,
                    help="hard cap on orders in one session")
-    p.add_argument("--take-profit", type=float, default=2.0,
+    p.add_argument("--take-profit", type=float, default=1.5,
                    help="sell once a position is worth this multiple of what it "
                         "cost, net of the fees on both sides. 0 holds every "
                         "position to settlement. STALE buys because the book has "
                         "not repriced yet; when it does, the thesis has played out "
                         "and holding on is a directional bet nobody chose.")
+    p.add_argument("--no-fair-exit", action="store_true",
+                   help="do not exit when the book reprices to the fair value the "
+                        "signal was based on. That target is the most faithful exit "
+                        "there is - STALE bought because the book had not caught up, "
+                        "so when it does the thesis is complete by definition.")
     p.add_argument("--stop-loss", type=float, default=0.0,
                    help="sell if a position falls to this fraction of its cost "
                         "(e.g. 0.4). 0 disables - on a cheap contract the mark is "

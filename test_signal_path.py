@@ -1978,8 +1978,8 @@ async def test_setup_and_confirmation() -> None:
             cooldown=5.0, heartbeat=15.0, binance=False, live=False,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
-            assets=None, eval_interval=0.2, take_profit=2.0,
-            stop_loss=0.0, min_exit_seconds=45.0,
+            assets=None, eval_interval=0.2, take_profit=1.5,
+            stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
             allow_unvalidated_vol=False, no_cross=False, no_stale=False,
             no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
@@ -2414,8 +2414,8 @@ async def test_autopilot() -> None:
             discovery_interval=10.0, cooldown=5.0, heartbeat=15.0,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
-            assets=None, eval_interval=0.2, take_profit=2.0,
-            stop_loss=0.0, min_exit_seconds=45.0,
+            assets=None, eval_interval=0.2, take_profit=1.5,
+            stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
             endgame_window=120.0, endgame_z=3.0, no_cross=False,
             no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
             env_file=".env", verbose=False,
@@ -2645,6 +2645,97 @@ async def test_take_profit() -> None:
           not any(fired), "peaked at 1.23x net - a lower threshold would be needed")
     check("but its peak is still recorded, so the threshold can be tuned",
           abs(btc_probe.peak_mark - 0.26) < 1e-9, f"{btc_probe.peak_mark:.3f}")
+
+    # -- verification from the fill price, not a position read --------------- #
+    # The position endpoint failed to confirm a fill NINE times across four
+    # sessions - reading empty 8s after orders that demonstrably filled and
+    # later settled. That blocked every strategy trade in a whole overnight run
+    # (L_081726_053906: 3 probes, 0 strategy orders, -$0.30). The fill price
+    # answers it with no second call: an order sent as ask 0.001 can only fill
+    # ABOVE its limit if it sold into a bid.
+    class ProbeTrader(KalshiTrader):
+        def __init__(self, avg_fill, fill_count="1", balances=None):
+            seq = list(balances or [])
+
+            class _C:
+                async def positions(self, **kw):
+                    return {"market_positions": []}   # the endpoint that fails
+
+                async def fills(self, **kw):
+                    return {"fills": []}
+
+                async def balance(self):
+                    return {"balance": seq.pop(0)} if seq else {"balance": 2000}
+
+            super().__init__(_C(), RiskLimits(), dry_run=False)
+            self.starting_balance = 20.0
+            self._resp = {"order": {"order_id": "x", "fill_count": fill_count,
+                                    "average_fill_price": avg_fill}}
+
+        def authenticate(self):
+            pass
+
+        async def _post(self, path, body):
+            return self._resp
+
+    real = ProbeTrader("0.9450")   # sold YES at 0.945 against a 0.001 limit
+    check("the mapping is proven from the fill price alone",
+          await real.verify_side_mapping("T") is True and real.side_mapping_verified,
+          "a sell can only fill above its limit; a buy cannot")
+    check("the position endpoint is not consulted when the fill is decisive",
+          real.verification_attempts == 1)
+
+    # A fill AT the limit says nothing about direction (the YES bid really was
+    # ~0.001), so the balance decides. Intending NO at 0.999: a correct fill
+    # debits ~99.9c, a reversed one would debit ~0.1c.
+    right = ProbeTrader("0.0010", balances=[2000, 1900])  # spent $1.00
+    check("a limit fill is resolved by the balance delta",
+          await right.verify_side_mapping("T") is True,
+          "$1.00 spent matches NO at 0.999")
+    wrong = ProbeTrader("0.0010", balances=[2000, 1999])  # spent $0.01
+    check("a balance matching the OTHER side is the reversed mapping, and halts",
+          await wrong.verify_side_mapping("T") is False,
+          "$0.01 spent matches YES at 0.001, not the NO we asked for")
+
+    nofill = ProbeTrader("0", fill_count="0")
+    check("a probe that does not fill stays inconclusive",
+          await nofill.verify_side_mapping("T") is None)
+
+    capped = ProbeTrader("0", fill_count="0")
+    capped.limits.max_verification_attempts = 1
+    await capped.verify_side_mapping("T")
+    check("running out of attempts halts with 'unproven', not 'REVERSED'",
+          await capped.verify_side_mapping("T") is False
+          and "unproven" in capped.halt_reason and "REVERSED" not in capped.halt_reason,
+          capped.halt_reason)
+
+    # -- the thesis-complete exit -------------------------------------------- #
+    # Bought NO at 0.14 because the model said NO was worth 0.24. When the book
+    # reprices to 0.24 the mispricing is closed - that is the whole trade.
+    t = trader(take_profit_multiple=99.0)  # multiple far out of reach
+    pos = held("NO", 0.14)
+    pos.entry_fair = 0.2411
+    check("no exit before the book reaches our fair value",
+          t.exit_reason(pos, book(1.0 - 0.19 - 0.01, 1.0 - 0.19), 300.0) is None)
+    d = t.exit_reason(pos, book(1.0 - 0.28 - 0.01, 1.0 - 0.28), 300.0)
+    check("exits once the book reprices to what we thought it was worth",
+          d is not None and d[0] == "thesis-complete",
+          f"fair 0.241, sold at {d[1]:.2f}" if d else "no exit")
+    t2 = trader(take_profit_multiple=99.0, exit_at_fair_value=False)
+    check("--no-fair-exit turns that off",
+          t2.exit_reason(pos, book(1.0 - 0.28 - 0.01, 1.0 - 0.28), 300.0) is None)
+
+    # -- the 1.75x mover that a 2.0x rule sat out ---------------------------- #
+    # L_081726_053906: probe NO @ 0.15 peaked at a 0.31 bid = 1.75x net, then
+    # settled worthless. The default is 1.5x precisely so this one is taken.
+    t = trader(take_profit_multiple=1.5)
+    p2 = held("NO", 0.15, count=1)
+    d = t.exit_reason(p2, book(1.0 - 0.31 - 0.01, 1.0 - 0.31), 300.0)
+    check("the 1.75x mover from the overnight run is now exited",
+          d is not None, "2.0x sat this out and it settled worthless")
+    old = trader(take_profit_multiple=2.0)
+    check("and a 2.0x threshold demonstrably would not have",
+          old.exit_reason(p2, book(1.0 - 0.31 - 0.01, 1.0 - 0.31), 300.0) is None)
 
     # -- the stop, off by default -------------------------------------------- #
     check("no stop-loss unless asked for",
