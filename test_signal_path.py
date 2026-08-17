@@ -2110,6 +2110,44 @@ async def test_autopilot() -> None:
     res = await filled.place("T", "NO", 0.999, 1)
     check("an executed order books normally", res.ok and filled.trades == 1)
 
+    # -- the real CreateOrder V2 shape -------------------------------------- #
+    # V2 returns NO status field at all - only fill_count / remaining_count.
+    # Session L_081626_233108 fell through to "has an order_id, so it filled",
+    # which booked six phantom probe positions across two sessions and left the
+    # side-mapping check hunting a position that never existed.
+    v2_nofill = VenueTrader({"order": {
+        "order_id": "abc", "fill_count": "0", "remaining_count": "1"}})
+    res = await v2_nofill.place("T", "NO", 0.999, 1)
+    check("a V2 zero-fill is not a trade, despite carrying an order_id",
+          not res.ok and v2_nofill.trades == 0 and "no fill" in (res.error or ""),
+          res.error or "")
+
+    v2_fill = VenueTrader({"order": {
+        "order_id": "abc", "fill_count": "1", "remaining_count": "0",
+        "average_fill_price": "0.0100", "average_fee_paid": "0.0007"}})
+    res = await v2_fill.place("T", "NO", 0.999, 1)
+    check("a V2 fill books, priced at what the venue actually charged",
+          res.ok and abs(res.price - 0.99) < 1e-9,
+          f"limit 0.999 -> filled {res.price:.4f}")
+    check("the venue's own fee is captured, not just modelled",
+          abs((res.avg_fee_paid or 0) - 0.0007) < 1e-12)
+
+    # A partial fill must book what filled, not what was asked for: settlement
+    # cannot credit contracts we never owned.
+    from kalshi import trading_fee as _fee
+
+    v2_part = VenueTrader({"order": {
+        "order_id": "abc", "fill_count": "3", "remaining_count": "7",
+        "average_fill_price": "0.1000"}})
+    res = await v2_part.place("T", "YES", 0.10, 10)  # $1.00, inside the cap
+    check("a partial fill books only the filled contracts",
+          res.ok and res.count == 3 and res.remaining == 7.0,
+          f"asked 10, filled {res.count}")
+    v2_part.settle("T", "yes")
+    check("settlement pays the filled size, not the requested size",
+          abs(v2_part.realized - (3 * 1.0 - 3 * 0.10 - _fee(0.10, 3))) < 1e-6,
+          f"${v2_part.realized:+.4f}")
+
     # -- the probe's three outcomes ------------------------------------------- #
     async def _noop(_s):  # verification sleeps 2s between order and read
         return None

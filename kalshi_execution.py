@@ -63,6 +63,21 @@ class RiskLimits:
     max_verification_attempts: int = 3
 
 
+def _fixed_point(value) -> float | None:
+    """Kalshi returns counts and prices as fixed-point STRINGS ("1", "0.9900").
+
+    Returns None for absent/unparseable rather than 0.0, because "the venue did
+    not tell us" and "the venue told us zero" must not be confused: the first
+    means fall back to another signal, the second means the order did not fill.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(slots=True)
 class OrderResult:
     ok: bool
@@ -76,6 +91,11 @@ class OrderResult:
     order_id: str | None = None
     status: str = ""
     error: str | None = None
+    #: Contracts the venue did NOT fill, when it reports them.
+    remaining: float | None = None
+    #: Fee the venue actually charged per contract, when reported. Preferred
+    #: over our own fee model at settlement, since it is the real number.
+    avg_fee_paid: float | None = None
     #: True for the 1-contract side-mapping probe. Its cost is a known,
     #: bounded cost of doing business - not a strategy's opinion being wrong -
     #: so it must not feed the consecutive-loss breaker.
@@ -457,28 +477,60 @@ class KalshiTrader:
             order = (response or {}).get("order") or response or {}
             result.order_id = str(order.get("order_id") or "") or None
             result.status = str(order.get("status") or "")
-            # An accepted order is not a filled order. A killed FOK and a
-            # zero-fill IOC both come back "canceled" WITH an order_id - a live
-            # session booked exactly that as a phantom 1-lot position, which
-            # then "settled" for money that was never at risk. Fills decide:
-            # executed or resting counts, canceled counts only if the venue
-            # reports taker fills on it (an IOC can partially fill, then
-            # cancel the rest).
-            fills = order.get("taker_fill_count")
-            try:
-                fills = int(fills) if fills is not None else None
-            except (TypeError, ValueError):
-                fills = None
-            status_l = result.status.lower()
-            if status_l:
-                result.ok = status_l in ("resting", "executed") or bool(fills)
+
+            # An accepted order is not a filled order, and CreateOrder V2 does
+            # not return a status at all - it returns fill_count and
+            # remaining_count. Treating "came back with an order_id" as a fill
+            # booked phantom positions across two live sessions: orders that
+            # never filled were counted as trades, "settled" for money that was
+            # never at risk, and left the side-mapping probe hunting a position
+            # that had never existed. The venue's own fill count is the only
+            # honest answer.
+            filled = _fixed_point(order.get("fill_count"))
+            if filled is None:  # older payloads used the taker_* naming
+                filled = _fixed_point(order.get("taker_fill_count"))
+            result.remaining = _fixed_point(order.get("remaining_count"))
+            avg_price = _fixed_point(order.get("average_fill_price"))
+            avg_fee = _fixed_point(order.get("average_fee_paid"))
+
+            if filled is not None:
+                result.ok = filled > 0
+                # Book what actually filled, at what it actually cost. An IOC
+                # can fill part of the size, and settlement must not credit us
+                # contracts we never owned.
+                if result.ok:
+                    result.count = int(filled)
+                    if avg_price and 0.0 < avg_price < 1.0:
+                        # average_fill_price is on the YES book; convert back to
+                        # the outcome we asked for.
+                        result.api_price = avg_price
+                        result.price = (
+                            avg_price if result.outcome == "YES"
+                            else round(1.0 - avg_price, 4)
+                        )
+                    if avg_fee is not None:
+                        result.avg_fee_paid = avg_fee
             else:
-                result.ok = bool(result.order_id)
+                # No fill information at all: fall back to the status wording
+                # rather than assuming success.
+                status_l = result.status.lower()
+                result.ok = status_l in ("executed", "filled")
+
             if not result.ok:
                 result.error = result.error or (
-                    f"no fill (status {result.status or 'unknown'})"
+                    f"no fill (filled {filled if filled is not None else '?'} of "
+                    f"{result.count}, status {result.status or 'none reported'})"
+                )
+                log.warning(
+                    "Order not filled (%s %s x%d @ %.4f sent as %s %.4f): %s",
+                    result.outcome, ticker, count, price,
+                    result.api_side, result.api_price, result.error,
                 )
             else:
+                log.info(
+                    "Filled %d/%d %s on %s at %.4f",
+                    result.count, count, result.outcome, ticker, result.price,
+                )
                 self._book_trade(result)
             return result
 
@@ -520,7 +572,12 @@ class KalshiTrader:
                 order.outcome == "NO" and result == "no"
             )
             payout = order.count * (1.0 if won else 0.0)
-            fees = trading_fee(order.price, order.count)
+            # Prefer the fee the venue actually charged over our model of it.
+            fees = (
+                order.avg_fee_paid * order.count
+                if order.avg_fee_paid is not None
+                else trading_fee(order.price, order.count)
+            )
             pnl = payout - order.stake - fees
             total += pnl
             self.realized += pnl
