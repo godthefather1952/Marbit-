@@ -394,6 +394,38 @@ class PaperLedger:
         self.count += 1
         return True
 
+    def record_execution(
+        self,
+        signal: Signal,
+        outcome: str,
+        count: float = 0.0,
+        price: float = 0.0,
+        detail: str = "",
+    ) -> None:
+        """Record what actually happened to a signal when it reached the venue.
+
+        A recorded signal is a hypothesis; only a filled order is money. A live
+        session graded five signals as wins worth +$3.85 while the account moved
+        ten cents, because two were simulated during warm-up and three were
+        skipped - and nothing downstream could tell the difference. Every signal
+        now gets a companion row saying which it was.
+
+        `outcome` is one of: "filled" (real money), "simulated" (dry run),
+        "skipped" (never sent), "rejected" (sent, no fill).
+        """
+        row = {
+            "kind": "execution",
+            "ts": time.time(),
+            "strategy": signal.strategy,
+            "ticker": signal.ticker,
+            "outcome": outcome,
+            "count": count,
+            "price": price,
+            "detail": detail,
+        }
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+
     def reset_dedupe(self) -> None:
         """Forget which (strategy, market) pairs have been recorded.
 

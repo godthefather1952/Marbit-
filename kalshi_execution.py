@@ -607,9 +607,20 @@ class KalshiTrader:
         return total
 
     def stats(self) -> str:
+        """One line, leading with whether any of this was real.
+
+        The distinction is not cosmetic: a session reported five winning trades
+        worth +$3.85 while the account moved ten cents, because every one was
+        simulated or skipped.
+        """
+        real = [o for o in self._orders if o.ok and not o.dry_run]
+        probes = sum(1 for o in real if o.verification)
+        tag = "SIMULATED" if self.dry_run else "LIVE"
         return (
-            f"bal ${self.equity():.2f} (start ${self.starting_balance:.2f}) "
+            f"[{tag}] bal ${self.equity():.2f} (start ${self.starting_balance:.2f}) "
             f"realized {self.realized:+.2f} open ${self.open_stake:.2f} "
-            f"trades {self.trades}/{self.limits.max_trades}"
+            f"trades {self.trades}/{self.limits.max_trades} | "
+            f"REAL fills {len(real)}"
+            + (f" ({probes} side-mapping probe)" if probes else "")
             + (f" HALTED: {self.halt_reason}" if self.halted else "")
         )

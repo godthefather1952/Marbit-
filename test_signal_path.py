@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import json as _stdlib_json
 import logging
 import math
@@ -2147,6 +2148,79 @@ async def test_autopilot() -> None:
     check("settlement pays the filled size, not the requested size",
           abs(v2_part.realized - (3 * 1.0 - 3 * 0.10 - _fee(0.10, 3))) < 1e-6,
           f"${v2_part.realized:+.4f}")
+
+    # -- paper must never be reported as money ------------------------------- #
+    # Session L_081626_233108 graded five winning signals worth +$3.85 while the
+    # account moved ten cents: two were simulated during warm-up, three were
+    # skipped when the side-mapping probe came back inconclusive, and nothing
+    # downstream could tell any of that apart from a real fill.
+    import io as _io
+    from contextlib import redirect_stdout
+
+    from kalshi_score import _execution_index, score as score_trades
+
+    def _sig(strategy, ticker, asset, price, size):
+        return {"strategy": strategy, "ticker": ticker, "note": f"[{asset}] x",
+                "fair_yes": 0.99, "expected_net": 0.3,
+                "legs": [{"side": "YES", "price": price, "size": size}]}
+
+    def _exe(strategy, ticker, outcome):
+        return {"kind": "execution", "strategy": strategy, "ticker": ticker,
+                "outcome": outcome}
+
+    signals = [_sig("STALE", "M1", "BTC", 0.89, 9),
+               _sig("ENDGAME", "M2", "ETH", 0.99, 8),
+               _sig("ENDGAME", "M3", "BTC", 0.97, 20)]
+    settled_all = {t: {"result": "yes"} for t in ("M1", "M2", "M3")}
+
+    none_real = [_exe("STALE", "M1", "simulated"), _exe("ENDGAME", "M2", "simulated"),
+                 _exe("ENDGAME", "M3", "skipped")]
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        score_trades(signals, settled_all, none_real)
+    out = buf.getvalue()
+    check("a session with no fills says so, in the headline",
+          "REAL MONEY : nothing filled" in out and "balance did not move" in out)
+    check("hypothetical winnings are labelled hypothetical",
+          "HYPOTHETICAL" in out and "PAPER ONLY - no money moved" in out)
+    check("no strategy block claims real money when none filled",
+          "[REAL MONEY]" not in out)
+
+    one_real = [_exe("STALE", "M1", "filled"), _exe("ENDGAME", "M2", "simulated"),
+                _exe("ENDGAME", "M3", "skipped")]
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        score_trades(signals, settled_all, one_real)
+    out = buf.getvalue()
+    check("a real fill is reported separately from the paper ones",
+          "REAL MONEY : 1 filled order(s)" in out and "HYPOTHETICAL: 2 signal(s)" in out)
+    check("only the filled strategy is tagged REAL MONEY", out.count("[REAL MONEY]") == 1)
+
+    # "filled" must win over an earlier "skipped" on the same market.
+    idx = _execution_index([_exe("STALE", "M1", "skipped"), _exe("STALE", "M1", "filled")])
+    check("a later fill outranks an earlier skip", idx[("STALE", "M1")] == "filled")
+    idx = _execution_index([_exe("STALE", "M1", "filled"), _exe("STALE", "M1", "skipped")])
+    check("and order does not matter", idx[("STALE", "M1")] == "filled")
+
+    # The ledger must actually write these rows.
+    with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path as _Path
+
+        from strategies import Leg as _Leg, PaperLedger as _PL, Signal as _Sig
+
+        led = _PL(_Path(tmp) / "p.jsonl")
+        s = _Sig(strategy="STALE", ticker="T", legs=[_Leg("YES", 0.4, 5.0)],
+                 fair_yes=0.5, expected_net=1.0, max_loss=2.0, spot=1.0,
+                 strike=1.0, seconds_left=100.0, sigma_used=1e-4)
+        led.record(s)
+        led.record_execution(s, "filled", count=5, price=0.39)
+        lines = [json.loads(l) for l in
+                 _Path(led.path).read_text().splitlines() if l.strip()]
+        check("the ledger carries a signal row and an execution row",
+              len(lines) == 2 and lines[1]["kind"] == "execution"
+              and lines[1]["outcome"] == "filled")
+        check("the execution row records what actually filled",
+              lines[1]["count"] == 5 and abs(lines[1]["price"] - 0.39) < 1e-9)
 
     # -- the probe's three outcomes ------------------------------------------- #
     async def _noop(_s):  # verification sleeps 2s between order and read

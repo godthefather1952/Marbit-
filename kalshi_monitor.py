@@ -602,6 +602,13 @@ class Monitor:
         for sig in found:
             self._emit(sig, inst)
 
+    def _record_execution(self, sig, outcome: str, **kw) -> None:
+        """Write the companion execution row, so nothing downstream can read a
+        recorded signal as money that moved."""
+        if self.ledger is not None:
+            with contextlib.suppress(Exception):
+                self.ledger.record_execution(sig, outcome, **kw)
+
     def reset_for_live(self) -> None:
         """Drop paper-phase signal state at the moment of promotion.
 
@@ -678,6 +685,9 @@ class Monitor:
                 while self._pending_orders and trader is not None:
                     sig = self._pending_orders.pop(0)
                     if trader.check_halt():
+                        self._record_execution(
+                            sig, "skipped", detail=f"halted: {trader.halt_reason}"
+                        )
                         continue
                     if not trader.side_mapping_verified:
                         # One 1-contract NO order, read back as a position,
@@ -689,6 +699,9 @@ class Monitor:
                             trader.halted = True
                             trader.halt_reason = "side mapping REVERSED on the venue"
                             log.error("TRADING HALTED: %s", trader.halt_reason)
+                            self._record_execution(
+                                sig, "skipped", detail=trader.halt_reason
+                            )
                             continue
                         if verdict is not True:
                             # Inconclusive (no fill / unreadable position) is
@@ -696,6 +709,10 @@ class Monitor:
                             log.warning(
                                 " execution: skipping %s - side mapping probe "
                                 "inconclusive, will retry", sig.ticker,
+                            )
+                            self._record_execution(
+                                sig, "skipped",
+                                detail="side mapping probe inconclusive",
                             )
                             continue
                     for leg in sig.legs:
@@ -706,9 +723,21 @@ class Monitor:
                                 "(max stake $%.2f)",
                                 sig.strategy, leg.side, leg.price, trader.max_stake(),
                             )
+                            self._record_execution(
+                                sig, "skipped",
+                                detail=f"no legal size at {leg.price:.4f}",
+                            )
                             continue
                         result = await trader.place(sig.ticker, leg.side, leg.price, count)
                         log.warning(" execution: [%s] %s", sig.strategy, result.summary())
+                        self._record_execution(
+                            sig,
+                            "simulated" if result.dry_run else
+                            ("filled" if result.ok else "rejected"),
+                            count=result.count if result.ok else 0.0,
+                            price=result.price,
+                            detail=result.error or "",
+                        )
                 await self._settle_finished()
             except asyncio.CancelledError:
                 raise

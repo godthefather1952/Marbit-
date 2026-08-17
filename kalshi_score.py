@@ -45,11 +45,33 @@ async def settlement(client: KalshiClient, tickers: list[str]) -> dict[str, dict
     return out
 
 
-def score(rows: list[dict], settled: dict[str, dict]) -> None:
+def _execution_index(executions: list[dict]) -> dict[tuple[str, str], str]:
+    """Best-known outcome per (strategy, ticker).
+
+    "filled" is the only outcome that moved money and wins over everything
+    else, because a signal can be skipped once and filled on a later pass.
+    """
+    rank = {"filled": 3, "rejected": 2, "simulated": 1, "skipped": 0}
+    best: dict[tuple[str, str], str] = {}
+    for row in executions:
+        key = (row.get("strategy", ""), row.get("ticker", ""))
+        outcome = str(row.get("outcome") or "")
+        if rank.get(outcome, -1) > rank.get(best.get(key, ""), -1):
+            best[key] = outcome
+    return best
+
+
+def score(
+    rows: list[dict],
+    settled: dict[str, dict],
+    executions: list[dict] | None = None,
+) -> None:
     # Keyed by "ASSET/STRATEGY" when the ledger carries an asset tag, so a
     # BTC+ETH session is graded as two experiments rather than one blended
     # number that can hide a losing instrument behind a winning one.
     by_strategy: dict[str, list] = collections.defaultdict(list)
+    executed = _execution_index(executions or [])
+    real_keys: set[str] = set()
     pending = 0
 
     for row in rows:
@@ -71,6 +93,9 @@ def score(rows: list[dict], settled: dict[str, dict]) -> None:
         note = str(row.get("note") or "")
         asset = note[1:note.index("]")] if note.startswith("[") and "]" in note else ""
         key = f"{asset}/{row['strategy']}" if asset else row["strategy"]
+        outcome = executed.get((row["strategy"], row["ticker"]), "unknown")
+        if outcome == "filled":
+            real_keys.add(key)
         by_strategy[key].append(
             {
                 "ticker": row["ticker"],
@@ -82,11 +107,12 @@ def score(rows: list[dict], settled: dict[str, dict]) -> None:
                 "fair_yes": row.get("fair_yes"),
                 "expected": row.get("expected_net", 0.0),
                 "legs": row["legs"],
+                "outcome": outcome,
             }
         )
 
     print("=" * 72)
-    print(" SETTLED RESULTS - actual outcomes, not model estimates")
+    print(" SETTLED RESULTS - real outcomes, split by what actually executed")
     print("=" * 72)
     if pending:
         print(f"\n {pending} trade(s) not yet settled; re-run later to include them.")
@@ -110,8 +136,16 @@ def score(rows: list[dict], settled: dict[str, dict]) -> None:
         total_n += len(trades)
         total_wins += wins
 
-        print(f"\n {strategy}")
-        print(f"   trades          {len(trades)}")
+        outcomes = collections.Counter(t["outcome"] for t in trades)
+        real = outcomes.get("filled", 0)
+        tag = "REAL MONEY" if real else "PAPER ONLY - no money moved"
+        print(f"\n {strategy}   [{tag}]")
+        if real and real < len(trades):
+            print(f"   {real} of {len(trades)} actually filled; the rest were "
+                  f"{', '.join(f'{v} {k}' for k, v in outcomes.items() if k != 'filled')}")
+        elif not real:
+            print(f"   ({', '.join(f'{v} {k}' for k, v in outcomes.items())})")
+        print(f"   signals         {len(trades)}")
         print(f"   hit rate        {wins}/{len(trades)} ({wins / len(trades) * 100:.1f}%)")
         print(f"   avg price paid  {avg_price:.3f}   (needs a {avg_price * 100:.0f}%+ hit "
               f"rate just to break even before fees)")
@@ -129,13 +163,29 @@ def score(rows: list[dict], settled: dict[str, dict]) -> None:
             print(f"   -> {verdict}")
 
     if total_n:
-        print("\n" + "-" * 72)
-        print(f" TOTAL  {total_n} trades, {total_wins} won ({total_wins / total_n * 100:.1f}%), "
-              f"staked ${grand_cost:,.2f}")
-        print(f"        ACTUAL ${grand_net:+,.2f}   vs model's ${grand_exp:+,.2f}")
+        real_trades = [t for ts in by_strategy.values() for t in ts if t["outcome"] == "filled"]
+        real_net = sum(t["net"] for t in real_trades)
+        real_cost = sum(t["cost"] for t in real_trades)
+        print("\n" + "=" * 72)
+        # The headline is what the account actually did. A previous session
+        # reported +$3.85 across five "wins" while the balance moved ten cents,
+        # because two were simulated during warm-up and three were never sent.
+        if real_trades:
+            print(f" REAL MONEY : {len(real_trades)} filled order(s), "
+                  f"${real_cost:,.2f} staked, ${real_net:+,.2f}")
+        else:
+            print(" REAL MONEY : nothing filled. Your balance did not move on any")
+            print("              of these - they were simulated or never sent.")
+        hypo = total_n - len(real_trades)
+        if hypo:
+            print(f" HYPOTHETICAL: {hypo} signal(s) graded as if taken, "
+                  f"${grand_cost - real_cost:,.2f} would have been staked for "
+                  f"${grand_net - real_net:+,.2f}")
+        print("=" * 72)
+        print(f" all {total_n} graded, {total_wins} won ({total_wins / total_n * 100:.1f}%), "
+              f"model predicted ${grand_exp:+,.2f}")
         if grand_cost:
-            print(f"        return on stake: {grand_net / grand_cost * 100:+.1f}%")
-        print("-" * 72)
+            print(f" combined return on stake: {grand_net / grand_cost * 100:+.1f}%")
         if total_n < 30:
             print("\n With fewer than ~30 settled trades this is noise, not a result.")
             print(" A coin flip clears 60% often enough at this sample size.")
@@ -156,23 +206,25 @@ async def main() -> int:
             return 1
         path = candidates[-1]
 
-    rows = []
+    rows, executions = [], []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if line:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        (executions if obj.get("kind") == "execution" else rows).append(obj)
     if not rows:
         print(f"{path} holds no trades.", file=sys.stderr)
         return 1
 
-    print(f"Scoring {len(rows)} paper trades from {path}\n")
+    print(f"Scoring {len(rows)} recorded signals from {path}\n")
     async with aiohttp.ClientSession() as session:
         client = KalshiClient(session)
         settled = await settlement(client, sorted({r["ticker"] for r in rows}))
-    score(rows, settled)
+    score(rows, settled, executions)
     return 0
 
 
