@@ -796,6 +796,15 @@ class KalshiTrader:
                     "time_in_force": "immediate_or_cancel",
                     "self_trade_prevention_type": "taker_at_cross",
                     "client_order_id": str(uuid.uuid4()),
+                    # The one flag that makes an exit safe against a position
+                    # we no longer hold. A close is a SELL, and on this venue
+                    # selling what you do not own opens the opposite position -
+                    # so if the position was closed by hand in the Kalshi app,
+                    # or settled early, an ordinary exit order would silently
+                    # open a NEW trade in the other direction. reduce_only lets
+                    # the venue refuse that: it can shrink a position, never
+                    # create or flip one.
+                    "reduce_only": True,
                 }
                 try:
                     response = await self._post(ORDERS_PATH, body)
@@ -817,8 +826,20 @@ class KalshiTrader:
                     gross = result.count * (result.price - order.price)
                     fees = trading_fee(result.price, result.count)
                 else:
+                    # With reduce_only set, "no fill" most often means there is
+                    # nothing left to reduce - the position is already gone.
+                    # Retrying forever against a position that no longer exists
+                    # would spam the venue, so stop tracking it and say so.
                     result.error = f"exit did not fill (filled {filled})"
-                    log.warning("Exit on %s did not fill; holding", order.ticker)
+                    order.closed = True
+                    self.open_stake = max(0.0, self.open_stake - order.stake)
+                    log.warning(
+                        "Exit on %s did not fill. With reduce_only that usually "
+                        "means the position is already gone - closed by hand, or "
+                        "settled. Dropping it from tracking; its PnL is whatever "
+                        "the account actually did, not what this session reports.",
+                        order.ticker,
+                    )
                     return result
 
         pnl = gross - fees

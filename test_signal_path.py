@@ -2624,6 +2624,50 @@ async def test_take_profit() -> None:
               t.realized > 0 and winner.closed,
               f"${t.realized:+.2f} realized vs -$7.96 at settlement")
 
+    # -- a position closed by hand must not be re-opened backwards ----------- #
+    # The user closed one position manually in the Kalshi app. A close is a
+    # SELL, and selling what you do not own OPENS the opposite position here -
+    # so an exit firing against a position that is already gone would silently
+    # start a new trade in the other direction. reduce_only lets the venue
+    # refuse that outright.
+    class ExitTrader(KalshiTrader):
+        def __init__(self, fill_count="3"):
+            class _C:
+                pass
+
+            super().__init__(_C(), RiskLimits(), dry_run=False)
+            self.starting_balance = 20.0
+            self._fill_count = fill_count
+            self.sent = None
+
+        async def _post(self, path, body):
+            self.sent = body
+            return {"order": {"order_id": "x", "fill_count": self._fill_count,
+                              "average_fill_price": "0.7000"}}
+
+    t = ExitTrader()
+    pos = held("YES", 0.30, count=3)
+    t._orders.append(pos)
+    await t.close_position(pos, 0.70, "take-profit")
+    check("every closing order is sent reduce_only",
+          t.sent.get("reduce_only") is True,
+          "so it can shrink a position but never create or flip one")
+    check("closes are immediate-or-cancel too",
+          t.sent["time_in_force"] == "immediate_or_cancel")
+
+    gone = ExitTrader(fill_count="0")   # nothing left to reduce
+    pos2 = held("NO", 0.40, count=3)
+    gone._orders.append(pos2)
+    gone.open_stake = pos2.stake
+    res = await gone.close_position(pos2, 0.80, "take-profit")
+    check("an exit that cannot fill stops tracking the position",
+          not res.ok and pos2.closed,
+          "reduce_only + no fill means it is already gone")
+    check("and its stake is released rather than pinned open",
+          abs(gone.open_stake) < 1e-9, f"${gone.open_stake:.2f}")
+    check("a vanished position books no phantom PnL",
+          abs(gone.realized) < 1e-9, f"${gone.realized:+.2f}")
+
     # -- replay: the two positions in the user's Kalshi screenshots ---------- #
     # Both were 1-contract side-mapping probes that settled worthless:
     #   BTC NO @ 0.19 (target $63,441.03) - peaked at a 0.26 bid = 1.23x net
