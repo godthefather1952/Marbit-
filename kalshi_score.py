@@ -45,20 +45,37 @@ async def settlement(client: KalshiClient, tickers: list[str]) -> dict[str, dict
     return out
 
 
-def _execution_index(executions: list[dict]) -> dict[tuple[str, str], str]:
-    """Best-known outcome per (strategy, ticker).
+def _execution_index(executions: list[dict]) -> dict[tuple[str, str], dict]:
+    """What actually happened per (strategy, ticker): outcome, size, prices.
 
-    "filled" is the only outcome that moved money and wins over everything
-    else, because a signal can be skipped once and filled on a later pass.
+    Two things this has to carry beyond the outcome, because grading from the
+    SIGNAL alone was wrong in both directions:
+
+    `count`/`price` - the signal names a nominal size (--size, 20 by default)
+    and the ask it saw. What we actually got was 3 contracts at a crossed
+    limit. Scoring the nominal size overstated a real +$1.75 session as
+    +$52.72, roughly thirtyfold, on an account that only holds $23.
+
+    `exit_price` - a position closed early does not settle. Grading it as
+    held-to-expiry can invert the result: a contract bought at 0.963 and sold
+    at 0.974 made 1.1c whatever the market did afterwards.
     """
     rank = {"filled": 3, "rejected": 2, "simulated": 1, "skipped": 0}
-    best: dict[tuple[str, str], str] = {}
+    out: dict[tuple[str, str], dict] = {}
     for row in executions:
         key = (row.get("strategy", ""), row.get("ticker", ""))
+        rec = out.setdefault(key, {"outcome": "", "count": 0.0, "price": 0.0,
+                                   "exit_price": None})
         outcome = str(row.get("outcome") or "")
-        if rank.get(outcome, -1) > rank.get(best.get(key, ""), -1):
-            best[key] = outcome
-    return best
+        if outcome == "closed":
+            rec["exit_price"] = row.get("price")
+            continue
+        if rank.get(outcome, -1) > rank.get(rec["outcome"], -1):
+            rec["outcome"] = outcome
+            if outcome in ("filled", "simulated"):
+                rec["count"] = float(row.get("count") or 0.0)
+                rec["price"] = float(row.get("price") or 0.0)
+    return out
 
 
 def score(
@@ -80,20 +97,33 @@ def score(
             pending += 1
             continue
         result = str(market.get("result", "")).lower()  # "yes" | "no"
+        rec = executed.get((row["strategy"], row["ticker"]))
 
         gross = 0.0
         cost = 0.0
         fees = 0.0
+        exit_price = rec.get("exit_price") if rec else None
         for leg in row["legs"]:
-            size, price, side = leg["size"], leg["price"], leg["side"]
+            # Prefer what actually filled over what the signal proposed.
+            size = rec["count"] if rec and rec.get("count") else leg["size"]
+            price = rec["price"] if rec and rec.get("price") else leg["price"]
+            side = leg["side"]
             cost += size * price
             fees += trading_fee(price, size)
-            won = (side == "YES" and result == "yes") or (side == "NO" and result == "no")
-            gross += size * (1.0 if won else 0.0)
+            if exit_price is not None:
+                # Sold before expiry: the exit price IS the outcome, and the
+                # sale pays its own fee.
+                gross += size * float(exit_price)
+                fees += trading_fee(float(exit_price), size)
+            else:
+                won = (side == "YES" and result == "yes") or (
+                    side == "NO" and result == "no"
+                )
+                gross += size * (1.0 if won else 0.0)
         note = str(row.get("note") or "")
         asset = note[1:note.index("]")] if note.startswith("[") and "]" in note else ""
         key = f"{asset}/{row['strategy']}" if asset else row["strategy"]
-        outcome = executed.get((row["strategy"], row["ticker"]), "unknown")
+        outcome = rec["outcome"] if rec else "unknown"
         if outcome == "filled":
             real_keys.add(key)
         by_strategy[key].append(
@@ -103,6 +133,7 @@ def score(
                 "cost": cost,
                 "fees": fees,
                 "won": gross > cost,
+                "exited": exit_price is not None,
                 "result": result,
                 "fair_yes": row.get("fair_yes"),
                 "expected": row.get("expected_net", 0.0),

@@ -2394,11 +2394,47 @@ async def test_autopilot() -> None:
           "REAL MONEY : 1 filled order(s)" in out and "HYPOTHETICAL: 2 signal(s)" in out)
     check("only the filled strategy is tagged REAL MONEY", out.count("[REAL MONEY]") == 1)
 
+    # -- the scorecard must grade what FILLED, not what was proposed --------- #
+    # Pooled scoring reported +$52.72 of "REAL MONEY" on $184.42 staked, for a
+    # session whose log said `realized +1.75` on a $23 account. Two causes:
+    # the signal names a nominal --size of 20 while 3 contracts actually
+    # filled, and a position closed early does not settle at all.
+    sized = [_sig("STALE", "M1", "BTC", 0.80, 20.0)]
+    got_3 = [_exe("STALE", "M1", "filled")]
+    got_3[0].update(count=3, price=0.80)
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        score_trades(sized, {"M1": {"result": "no"}}, got_3)
+    out = buf.getvalue()
+    check("stake is the 3 contracts filled, not the 20 proposed",
+          "$2.40 staked" in out, "20 x 0.80 would have read $16.00")
+
+    # An early exit inverts this one: held to expiry it is a total loss, but it
+    # was sold at 0.919 and made money.
+    exited = [_sig("STALE", "M2", "ETH", 0.89, 20.0)]
+    exit_rows = [_exe("STALE", "M2", "filled"), _exe("STALE", "M2", "closed")]
+    exit_rows[0].update(count=2, price=0.89)
+    exit_rows[1].update(count=2, price=0.919)
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        score_trades(exited, {"M2": {"result": "yes"}}, exit_rows)
+    out = buf.getvalue()
+    net_line = next((l for l in out.splitlines() if "ACTUAL net" in l), "")
+    check("a position sold before expiry is graded on its exit, not settlement",
+          "$+" in net_line and "$-" not in net_line,
+          f"bought NO at 0.89, sold at 0.919, market then settled YES ->{net_line}")
+
+    idx = _execution_index(exit_rows)
+    check("the exit price is carried alongside the entry",
+          abs(idx[("STALE", "M2")]["exit_price"] - 0.919) < 1e-9
+          and idx[("STALE", "M2")]["count"] == 2)
+
     # "filled" must win over an earlier "skipped" on the same market.
     idx = _execution_index([_exe("STALE", "M1", "skipped"), _exe("STALE", "M1", "filled")])
-    check("a later fill outranks an earlier skip", idx[("STALE", "M1")] == "filled")
+    check("a later fill outranks an earlier skip",
+          idx[("STALE", "M1")]["outcome"] == "filled")
     idx = _execution_index([_exe("STALE", "M1", "filled"), _exe("STALE", "M1", "skipped")])
-    check("and order does not matter", idx[("STALE", "M1")] == "filled")
+    check("and order does not matter", idx[("STALE", "M1")]["outcome"] == "filled")
 
     # The ledger must actually write these rows.
     with tempfile.TemporaryDirectory() as tmp:
