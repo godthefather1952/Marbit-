@@ -2041,7 +2041,7 @@ async def test_setup_and_confirmation() -> None:
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
             assets=None, eval_interval=0.2, take_profit=1.5,
             stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
-            max_edge=0.35,
+            max_edge=0.35, max_slippage=0.03, min_fill_edge=0.005,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
             allow_unvalidated_vol=False, no_cross=False, no_stale=False,
             no_endgame=False, no_basis=True, log_dir=tmp, no_log=True,
@@ -2146,6 +2146,45 @@ async def test_setup_and_confirmation() -> None:
         mon._emit(both)
         check("and a repeat CROSS is deduped, not conflict-blocked",
               len(mon._pending_orders) == 1)
+
+    # -- marketable limits: cross far enough to actually fill ---------------- #
+    # L_081726_224233 filled ZERO strategy orders. It bid exactly the ask it had
+    # seen (`sent as bid 0.8400`, `filled 0.0 of 3`) while the probe, which
+    # crosses hard at 0.999, filled every single time. We are takers by
+    # construction, so the limit should be the highest price that still leaves
+    # the edge worth having.
+    from types import SimpleNamespace as _NS
+
+    from kalshi import fee_per_contract
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        mon._args.min_edge = 0.01
+        mon._args.min_fill_edge = 0.005
+        mon._args.max_slippage = 0.03
+        mon.instruments[0].market = _NS(ticker="T", price_ranges=())
+        leg = Leg("YES", 0.84, 20.0)
+        s = named("STALE", "YES", 0.84)
+        s.ticker = "T"
+        limit = mon._marketable_limit(s, leg, 0.8683)   # the real BTC signal
+        check("the limit crosses above the quoted ask",
+              limit is not None and limit > 0.84, f"0.840 -> {limit}")
+        check("but never past the price that still leaves min-fill-edge",
+              limit <= 0.8683 - fee_per_contract(0.84) - 0.005 + 1e-9,
+              f"ceiling {0.8683 - fee_per_contract(0.84) - 0.005:.4f}")
+        check("the fill still carries real edge after crossing",
+              0.8683 - limit - fee_per_contract(limit) >= 0.005 - 1e-9,
+              f"{0.8683 - limit - fee_per_contract(limit):+.4f}/contract left")
+
+        mon._args.max_slippage = 0.50   # absurd allowance
+        wide = mon._marketable_limit(s, leg, 0.8683)
+        check("the edge, not the slippage allowance, is what binds",
+              abs(wide - limit) < 1e-9, f"{wide} vs {limit}")
+
+        thin = mon._marketable_limit(s, Leg("YES", 0.865, 20.0), 0.8683)
+        check("a signal whose ask already eats the edge is refused",
+              thin is None, "no price leaves min-fill-edge")
+
 
 
 # --------------------------------------------------------------------------- #
@@ -2493,7 +2532,7 @@ async def test_autopilot() -> None:
             max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
             assets=None, eval_interval=0.2, take_profit=1.5,
             stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
-            max_edge=0.35,
+            max_edge=0.35, max_slippage=0.03, min_fill_edge=0.005,
             endgame_window=120.0, endgame_z=3.0, no_cross=False,
             no_stale=False, no_endgame=False, log_dir=tmp, no_log=True,
             env_file=".env", verbose=False,

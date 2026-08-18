@@ -928,11 +928,22 @@ class KalshiTrader:
         real = [o for o in self._orders if o.ok and not o.dry_run]
         probes = sum(1 for o in real if o.verification)
         tag = "SIMULATED" if self.dry_run else "LIVE"
+        # Fill rate is the number that says whether our limits are marketable.
+        # A session filled 0 of 1 strategy orders while the probe - which
+        # crosses hard - filled every time, and nothing in the summary said so.
+        entries = [o for o in self._orders
+                   if not o.dry_run and not o.verification and not o.closing]
+        got = sum(1 for o in entries if o.ok)
+        fill_rate = (
+            f" | entry fills {got}/{len(entries)} "
+            f"({got / len(entries) * 100:.0f}%)" if entries else ""
+        )
         return (
             f"[{tag}] bal ${self.equity():.2f} (start ${self.starting_balance:.2f}) "
             f"realized {self.realized:+.2f} open ${self.open_stake:.2f} "
             f"trades {self.trades}/{self.limits.max_trades} | "
             f"REAL fills {len(real)}"
             + (f" ({probes} side-mapping probe)" if probes else "")
+            + fill_rate
             + (f" HALTED: {self.halt_reason}" if self.halted else "")
         )

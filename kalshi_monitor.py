@@ -57,6 +57,7 @@ from kalshi import (
     KalshiMarket,
     breakeven_fair_value,
     fee_per_contract,
+    quantize_kalshi_price,
     net_edge,
     trading_fee,
 )
@@ -144,6 +145,11 @@ class Monitor:
         self._committed: dict[str, set[str]] = {}
         #: Conflicts already reported, so a persisting signal is logged once.
         self._conflicts_seen: set[tuple] = set()
+        #: Set when a signal is queued, so execution runs immediately instead of
+        #: waiting out its poll. A confirmed signal used to sit up to a full
+        #: second before its order was sent - on a book that had just moved 6
+        #: bps, which is what created the signal in the first place.
+        self._work = asyncio.Event()
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -653,6 +659,44 @@ class Monitor:
                 )
         return None
 
+    def _marketable_limit(self, sig, leg, fair_leg: float) -> float | None:
+        """The most we may pay and still clear `--min-edge`, snapped to a tick.
+
+        Bidding exactly the ask we saw is why almost nothing filled: by the time
+        an order lands the ask has moved, and an IOC at a stale price takes
+        nothing. The probe fills every single time precisely because it crosses
+        hard (it bids 0.999), and the strategy orders never did because they
+        crossed by zero.
+
+        We are a taker by construction - the whole thesis is that a quote is
+        about to move - so the limit should be the highest price that still
+        leaves the edge worth having, not the price that happened to be on the
+        screen. Capped by `--max-slippage` so a thin book cannot walk us up, and
+        it returns None rather than paying more than the edge is worth.
+        """
+        # Two different questions, and conflating them is why nothing filled.
+        # `--min-edge` decides whether a signal is worth taking AT ALL, and it
+        # was already applied against the quoted ask when the signal was made.
+        # How far we may then cross is a separate question: a fill that keeps
+        # only part of the edge still beats no fill. With 1c ticks these compete
+        # directly - fair 0.8683 against a 0.84 ask leaves a 0.8483 ceiling
+        # under the old rule, which floors straight back to 0.84 and crosses
+        # nothing.
+        ceiling = fair_leg - fee_per_contract(leg.price) - self._args.min_fill_edge
+        limit = min(leg.price + self._args.max_slippage, ceiling)
+        if limit < leg.price:
+            # Even the quoted ask no longer clears the bar.
+            return None
+        market = next(
+            (i.market for i in self.instruments
+             if i.market is not None and i.market.ticker == sig.ticker),
+            None,
+        )
+        ranges = market.price_ranges if market is not None else ()
+        # Round DOWN: rounding a buy up could push us past the ceiling.
+        snapped = quantize_kalshi_price(limit, ranges, buy=False)
+        return snapped if snapped >= leg.price else leg.price
+
     def _record_execution(self, sig, outcome: str, **kw) -> None:
         """Write the companion execution row, so nothing downstream can read a
         recorded signal as money that moved."""
@@ -738,6 +782,7 @@ class Monitor:
             for leg in sig.legs:
                 self._committed.setdefault(sig.ticker, set()).add(leg.side)
             self._pending_orders.append(sig)
+            self._work.set()
             log.warning(
                 "\n---- PAPER TRADE ----\n %s\n %s\n"
                 " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
@@ -814,8 +859,27 @@ class Monitor:
                             sig.fair_yes if leg.side == "YES"
                             else 1.0 - sig.fair_yes
                         )
+                        limit = self._marketable_limit(sig, leg, fair_leg)
+                        if limit is None:
+                            log.info(
+                                " execution: [%s] %s no longer worth taking once "
+                                "crossing costs are allowed for", sig.strategy,
+                                sig.ticker,
+                            )
+                            self._record_execution(
+                                sig, "skipped",
+                                detail="no price leaves the required edge",
+                            )
+                            continue
+                        count = trader.size_for(limit)
+                        if count < 1:
+                            self._record_execution(
+                                sig, "skipped",
+                                detail=f"no legal size at {limit:.4f}",
+                            )
+                            continue
                         result = await trader.place(
-                            sig.ticker, leg.side, leg.price, count,
+                            sig.ticker, leg.side, limit, count,
                             strategy=sig.strategy, entry_fair=fair_leg,
                         )
                         log.warning(" execution: [%s] %s", sig.strategy, result.summary())
@@ -833,7 +897,10 @@ class Monitor:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("Execution loop error: %s", exc)
-            await asyncio.sleep(1.0)
+            # Wake instantly on a new signal; otherwise tick for exits/settles.
+            self._work.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._work.wait(), timeout=1.0)
 
     async def _manage_exits(self) -> None:
         """Mark open positions against the live book and take profits.
@@ -1108,6 +1175,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CROSS: minimum locked dollar profit per pair")
     p.add_argument("--anchor-age", type=float, default=20.0,
                    help="STALE: how far back the market anchor is taken, seconds")
+    p.add_argument("--min-fill-edge", type=float, default=0.005,
+                   help="edge per contract that must SURVIVE crossing the spread. "
+                        "Distinct from --min-edge, which decides whether a signal "
+                        "is worth taking at the quoted ask; this decides how much "
+                        "of that edge we may spend to actually get filled. On a 1c "
+                        "tick ladder the two compete, and setting them equal "
+                        "crosses zero ticks - which filled zero orders.")
+    p.add_argument("--max-slippage", type=float, default=0.03,
+                   help="how far above the quoted ask an entry may reach, in "
+                        "dollars. We are a taker by construction - the thesis is "
+                        "that the quote is about to move - so bidding exactly the "
+                        "ask we saw fills only if the book stood still. A whole "
+                        "session filled zero strategy orders that way. The limit "
+                        "never exceeds the price that still clears --min-edge.")
     p.add_argument("--max-edge", type=float, default=0.35,
                    help="refuse any signal claiming more than this net edge per "
                         "contract. An edge this large on a liquid book is a model "
