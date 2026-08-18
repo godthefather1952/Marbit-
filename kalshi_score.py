@@ -195,32 +195,43 @@ def score(
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("ledger", nargs="?", help="paper ledger .jsonl (default: newest in logs/)")
+    parser.add_argument("ledger", nargs="*",
+                        help="paper ledger .jsonl file(s). Default: EVERY ledger "
+                             "in logs/, so evidence accumulates across sessions.")
+    parser.add_argument("--latest", action="store_true",
+                        help="score only the most recent session")
     args = parser.parse_args()
 
-    path = args.ledger
-    if not path:
-        candidates = sorted(glob.glob("logs/paper_*.jsonl"))
-        if not candidates:
-            print("No paper ledger found. Run kalshi_monitor.py first.", file=sys.stderr)
-            return 1
-        path = candidates[-1]
+    paths = args.ledger or sorted(glob.glob("logs/paper_*.jsonl"))
+    if not paths:
+        print("No paper ledger found. Run kalshi_main.py first.", file=sys.stderr)
+        return 1
+    if args.latest:
+        paths = paths[-1:]
 
+    # Reading every session by default is the point. A single run yields a
+    # handful of graded trades, which is noise; the question "does this
+    # strategy make money" only gets answered by pooling them, and scoring one
+    # file at a time silently threw away every previous session's evidence.
     rows, executions = [], []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        (executions if obj.get("kind") == "execution" else rows).append(obj)
+    for path in paths:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            (executions if obj.get("kind") == "execution" else rows).append(obj)
     if not rows:
-        print(f"{path} holds no trades.", file=sys.stderr)
+        print("No signals recorded in those ledgers.", file=sys.stderr)
         return 1
 
-    print(f"Scoring {len(rows)} recorded signals from {path}\n")
+    print(f"Scoring {len(rows)} recorded signals from {len(paths)} session(s)")
+    if len(paths) > 1:
+        print(f"  {Path(paths[0]).name} ... {Path(paths[-1]).name}")
+    print()
     async with aiohttp.ClientSession() as session:
         client = KalshiClient(session)
         settled = await settlement(client, sorted({r["ticker"] for r in rows}))

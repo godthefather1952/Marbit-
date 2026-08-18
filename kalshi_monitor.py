@@ -150,6 +150,13 @@ class Monitor:
         #: second before its order was sent - on a book that had just moved 6
         #: bps, which is what created the signal in the first place.
         self._work = asyncio.Event()
+        #: Where signals die. Optimising anything requires knowing which stage
+        #: is losing them: a session with 47 sightings and 0 fills was one
+        #: execution bug, but nothing in the summary said which stage failed.
+        self._funnel: dict[str, int] = {
+            "sighted": 0, "confirmed": 0, "conflicted": 0,
+            "attempted": 0, "filled": 0, "unpriceable": 0,
+        }
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -446,6 +453,12 @@ class Monitor:
             f"paper trades  : {self.ledger.count if self.ledger else 0} "
             f"(score with: python kalshi_score.py)",
             f"strategy hits : {self._strategy_hits or 'none'}",
+            "signal funnel : "
+            + " -> ".join(
+                f"{k} {v}" for k, v in self._funnel.items() if k != "unpriceable"
+            )
+            + (f"  (+{self._funnel['unpriceable']} unpriceable)"
+               if self._funnel["unpriceable"] else ""),
             f"execution     : {self.trader.stats() if self.trader else 'none'}",
         ]
         for inst in self.instruments:
@@ -742,6 +755,7 @@ class Monitor:
             sig.note = f"[{inst.name}] {sig.note}"
         key = f"{inst.name}:{sig.strategy}" if inst is not None else sig.strategy
         self._strategy_hits[key] = self._strategy_hits.get(key, 0) + 1
+        self._funnel["sighted"] += 1
         now = time.monotonic()
         need_s = self._args.confirm_seconds
         need_n = max(self._args.confirm_passes, 1)
@@ -774,6 +788,7 @@ class Monitor:
             # 548 identical lines in a single session.
             if ckey_conflict not in self._conflicts_seen:
                 self._conflicts_seen.add(ckey_conflict)
+                self._funnel["conflicted"] += 1
                 log.warning(" conflict: [%s] %s", sig.strategy, conflict)
                 self._record_execution(sig, "skipped", detail=conflict)
             return
@@ -782,6 +797,7 @@ class Monitor:
             for leg in sig.legs:
                 self._committed.setdefault(sig.ticker, set()).add(leg.side)
             self._pending_orders.append(sig)
+            self._funnel["confirmed"] += 1
             self._work.set()
             log.warning(
                 "\n---- PAPER TRADE ----\n %s\n %s\n"
@@ -870,6 +886,7 @@ class Monitor:
                                 sig, "skipped",
                                 detail="no price leaves the required edge",
                             )
+                            self._funnel["unpriceable"] += 1
                             continue
                         count = trader.size_for(limit)
                         if count < 1:
@@ -878,10 +895,13 @@ class Monitor:
                                 detail=f"no legal size at {limit:.4f}",
                             )
                             continue
+                        self._funnel["attempted"] += 1
                         result = await trader.place(
                             sig.ticker, leg.side, limit, count,
                             strategy=sig.strategy, entry_fair=fair_leg,
                         )
+                        if result.ok:
+                            self._funnel["filled"] += 1
                         log.warning(" execution: [%s] %s", sig.strategy, result.summary())
                         self._record_execution(
                             sig,
