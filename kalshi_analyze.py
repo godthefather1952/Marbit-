@@ -93,6 +93,7 @@ class Sample:
     left: float
     peak: float  # best mark seen afterwards, for the exit policy
     fair: float  # model fair value for this side at entry
+    path: tuple[float, ...] = ()  # marks after entry, in order
 
 
 def _f(text: str) -> float:
@@ -175,15 +176,17 @@ def build_samples(
             # is the only forward-looking value, and only the exit policy uses
             # it - the win rate is computed from settlement alone.
             peak = 0.0
+            path = []
             for later in series[i + 1:]:
                 mark = later.yes_bid if side == "YES" else later.no_bid
                 if mark is not None:
                     peak = max(peak, mark)
+                    path.append(mark)
 
             samples.append(Sample(
                 ticker=ticker, asset=now.asset, move_bps=move, side=side,
                 entry=entry, left=now.left, peak=peak,
-                fair=_fair(now, side),
+                fair=_fair(now, side), path=tuple(path),
             ))
     return samples
 
@@ -225,6 +228,126 @@ def _price_for_multiple(entry: float, multiple: float) -> float | None:
     target = multiple * cost
     # fee_per_contract is monotone-ish and small; one correction pass is plenty.
     return min(target + fee_per_contract(min(target, 0.99)), 0.999)
+
+
+def _exit_pnl(sale: float, cost: float) -> float:
+    return sale - fee_per_contract(sale) - cost
+
+
+def simulate(s: Sample, won: bool, policy: str, param: float, take_profit: float) -> float:
+    """PnL per contract for one exit policy, walking the real post-entry path.
+
+    Every policy sees the same prices in the same order and may only use what
+    has happened so far - no policy is allowed to know the peak in advance,
+    which is the mistake that makes backtested exits look free.
+    """
+    cost = s.entry + fee_per_contract(s.entry)
+    settle = (1.0 if won else 0.0) - cost
+
+    if policy == "hold":
+        return settle
+
+    if policy == "fixed":
+        target = _price_for_multiple(s.entry, param)
+        for mark in s.path:
+            if target is not None and mark >= target:
+                return _exit_pnl(mark, cost)
+        return settle
+
+    if policy == "trail":
+        # Let it run, but give back at most `param` of the best gain so far.
+        # This is the direct answer to "a strict TP would have capped the
+        # winner": there is no ceiling, only a floor that ratchets up.
+        peak = s.entry
+        armed = False
+        for mark in s.path:
+            peak = max(peak, mark)
+            if peak >= s.entry * 1.25:      # only arm once genuinely ahead
+                armed = True
+            if armed and mark <= peak - param * (peak - s.entry):
+                return _exit_pnl(mark, cost)
+        return settle
+
+    if policy == "half":
+        # Sell half at the target, ride the rest. Buys certainty on part of the
+        # position without surrendering the tail.
+        target = _price_for_multiple(s.entry, take_profit)
+        for mark in s.path:
+            if target is not None and mark >= target:
+                return 0.5 * _exit_pnl(mark, cost) + 0.5 * settle
+        return settle
+
+    if policy == "stop":
+        # A floor on the loss. Nothing else in this comparison touches the
+        # downside - every policy shares the same worst case - so this is the
+        # only lever that changes it.
+        floor = s.entry * param
+        for mark in s.path:
+            if mark <= floor:
+                return _exit_pnl(mark, cost)
+        return settle
+
+    if policy == "tp_stop":
+        # Both ends: take the gain at `take_profit`, cut the loss at `param`.
+        target = _price_for_multiple(s.entry, take_profit)
+        floor = s.entry * param
+        for mark in s.path:
+            if target is not None and mark >= target:
+                return _exit_pnl(mark, cost)
+            if mark <= floor:
+                return _exit_pnl(mark, cost)
+        return settle
+
+    if policy == "adaptive":
+        # Take profit only on weak signals; let strong ones run. The bucket
+        # table is what suggests this: exits help below ~10 bps and hurt above.
+        if abs(s.move_bps) < param:
+            target = _price_for_multiple(s.entry, take_profit)
+            for mark in s.path:
+                if target is not None and mark >= target:
+                    return _exit_pnl(mark, cost)
+        return settle
+
+    raise ValueError(policy)
+
+
+def compare_policies(graded, min_move: float, take_profit: float) -> None:
+    live = [g for g in graded if abs(g[0].move_bps) >= min_move]
+    if not live:
+        return
+    policies = [
+        ("hold to settlement", "hold", 0.0),
+        (f"fixed TP {take_profit:g}x", "fixed", take_profit),
+        ("fixed TP 2.0x", "fixed", 2.0),
+        ("fixed TP 3.0x", "fixed", 3.0),
+        ("trail: give back 25%", "trail", 0.25),
+        ("trail: give back 40%", "trail", 0.40),
+        ("trail: give back 60%", "trail", 0.60),
+        (f"sell half at {take_profit:g}x", "half", 0.0),
+        ("adaptive: TP under 10 bps", "adaptive", 10.0),
+        ("adaptive: TP under 15 bps", "adaptive", 15.0),
+        ("stop at 50% of cost", "stop", 0.50),
+        ("stop at 65% of cost", "stop", 0.65),
+        (f"TP {take_profit:g}x + stop 50%", "tp_stop", 0.50),
+        (f"TP {take_profit:g}x + stop 65%", "tp_stop", 0.65),
+    ]
+    print(f"\n{'=' * 78}")
+    print(f" EXIT POLICIES, on the {len(live):,} entries at or above "
+          f"{min_move:.0f} bps ({len({g[0].ticker for g in live})} markets)")
+    print("=" * 78)
+    print(f"  {'policy':<28s} {'$/contract':>11s} {'vs hold':>9s} {'worst':>8s}")
+    print("  " + "-" * 60)
+    base = statistics.fmean(simulate(g[0], g[1], "hold", 0.0, take_profit) for g in live)
+    rows = []
+    for label, kind, param in policies:
+        vals = [simulate(g[0], g[1], kind, param, take_profit) for g in live]
+        mean = statistics.fmean(vals)
+        rows.append((mean, label))
+        print(f"  {label:<28s} {mean:>+11.4f} {mean - base:>+9.4f} "
+              f"{min(vals):>+8.3f}")
+    best = max(rows)
+    print("  " + "-" * 60)
+    print(f"  best on this data: {best[1]} at {best[0]:+.4f}/contract")
 
 
 def report(samples, settled, buckets, take_profit: float, min_move: float = 0.0):
@@ -316,6 +439,8 @@ def report(samples, settled, buckets, take_profit: float, min_move: float = 0.0)
         bh = statistics.fmean(g[2] for g in below)
         print(f"\n Below the threshold ({len(below):,} entries the bot correctly "
               f"skips): hold {bh:+.4f}/contract")
+
+    compare_policies(graded, min_move, take_profit)
 
     markets_total = len({s.ticker for s, *_ in graded})
     print("-" * 78)
