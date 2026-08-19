@@ -3067,6 +3067,85 @@ async def test_multi_asset_and_preset() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Telegram control
+# --------------------------------------------------------------------------- #
+
+
+async def test_telegram() -> None:
+    print("\n--- telegram control ---")
+
+    import argparse as _ap
+    import logging as _lg
+
+    from kalshi_telegram import NOTIFY, Notifier, TelegramBot, _split
+
+    def bot(chat_id):
+        b = TelegramBot("token", chat_id, _ap.Namespace(
+            env_file=".env", session_min=0.0, settle_wait_min=25.0,
+            monitor_flags=[]))
+        b.sent = []
+
+        async def _send(text, chat_id=None):
+            b.sent.append((chat_id or b.chat_id, text))
+
+        b.send = _send
+        return b
+
+    # -- the allowlist. This bot spends real money; a leaked token must not be
+    # -- enough for a stranger to send /start.
+    b = bot("111")
+    fired = []
+    b._command = lambda text: fired.append(text) or _noop()
+
+    async def _noop():
+        return None
+
+    await b._on_update({"message": {"text": "/start live", "chat": {"id": 999}}})
+    check("a command from an unknown chat is ignored entirely",
+          not fired and not b.sent, "not even an error reply, which would confirm the bot exists")
+    await b._on_update({"message": {"text": "/start live", "chat": {"id": 111}}})
+    check("a command from the allowlisted chat is handled", fired == ["/start live"])
+
+    # Before registration it helps you onboard, but still refuses to act.
+    fresh = bot(None)
+    acted = []
+    fresh._command = lambda text: acted.append(text) or _noop()
+    await fresh._on_update({"message": {"text": "/start live", "chat": {"id": 42}}})
+    check("an unregistered bot replies with the chat id but runs nothing",
+          not acted and fresh.sent and "42" in fresh.sent[0][1],
+          "TELEGRAM_CHAT_ID onboarding")
+
+    # -- notifications are lifted off the log, not wired into the trade path -- #
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    handler = Notifier(q, loop)
+    logger = _lg.getLogger("tg-test")
+    logger.addHandler(handler)
+    logger.setLevel(_lg.INFO)
+    logger.warning("EXITED take-profit NO x3: 0.20 -> 0.40")
+    logger.info("hb | [BTC] spot=$64,000 ...")          # noise
+    logger.warning("SETTLED KXBTC15M-X NO x3 -> NO : +0.57")
+    await asyncio.sleep(0)
+    got = []
+    while not q.empty():
+        got.append(q.get_nowait())
+    logger.removeHandler(handler)
+    check("fills, exits and settlements are forwarded", len(got) == 2, str(len(got)))
+    check("heartbeats and routine chatter are not", all("hb |" not in g for g in got))
+    check("every notify marker is a real log string the bot emits",
+          all(isinstance(m, str) and m for m in NOTIFY))
+
+    # -- long reports are split on line boundaries, never truncated ---------- #
+    report = "\n".join(f"line {i} of the session summary" for i in range(400))
+    chunks = _split(report, 500)
+    check("a long summary is split rather than cut off",
+          len(chunks) > 1 and "".join(chunks) == report)
+    check("each chunk fits inside Telegram's message limit",
+          all(len(c) <= 500 for c in chunks), f"max {max(len(c) for c in chunks)}")
+    check("a short message is left alone", _split("hi", 500) == ["hi"])
+
+
+# --------------------------------------------------------------------------- #
 # Kalshi execution
 # --------------------------------------------------------------------------- #
 
@@ -3188,6 +3267,7 @@ async def main() -> None:
     await test_strategies()
     await test_setup_and_confirmation()
     await test_autopilot()
+    await test_telegram()
     await test_take_profit()
     await test_multi_asset_and_preset()
     await test_kalshi_execution()

@@ -385,6 +385,44 @@ python kalshi_main.py --mode dry --min-edge 0.03       # extra flags pass throug
 python kalshi_main.py --assets BTC,ETH --aggressive    # both instruments, hot
 ```
 
+### Running it from your phone
+
+```bash
+python kalshi_telegram.py --assets BTC,ETH --aggressive
+```
+
+Leave that running on an always-on machine and operate the bot from Telegram:
+
+| command | |
+|---|---|
+| `/start` | dry run, 20-minute warm-up |
+| `/start live` | real money, after the warm-up gates pass |
+| `/start live 30` | real money, 30-minute warm-up |
+| `/stop` | end the session, post the summary |
+| `/status` | balance, open positions, funnel, fill rate |
+| `/score` | the pooled scorecard across every session |
+
+Fills, exits, settlements, promotions and halts are pushed to your phone as
+they happen, batched so a busy second is one notification rather than twelve.
+
+Between `/start` and `/stop` the session is exactly what `kalshi_main.py` runs
+— same phases, same gates, same risk limits. The wrapper cannot change what or
+how the bot trades: notifications are lifted off the existing log stream by a
+logging handler, not by new hooks in the strategies or the executor.
+
+**Setup, once.** Message @BotFather, send `/newbot`, put the token in `.env` as
+`TELEGRAM_BOT_TOKEN`. Then run the script and message your bot — it replies
+with your chat id, which goes in `.env` as `TELEGRAM_CHAT_ID`.
+
+That second step is not ceremony. This bot spends real money, so a leaked token
+must not be enough for a stranger to send `/start`. Commands from any other
+chat are logged and ignored without a reply — not even an error, which would
+confirm the bot exists.
+
+Credentials still have to be set up on the host once (`python kalshi_setup.py`);
+`/start live` refuses with instructions rather than prompting, since it cannot
+ask for a private key over a chat window.
+
 ### Two instruments, one account
 
 `--assets BTC,ETH` runs `KXBTC15M` and `KXETH15M` concurrently. Each gets its
