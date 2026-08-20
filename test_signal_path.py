@@ -3546,6 +3546,28 @@ async def test_accuracy_upgrades() -> None:
     check("dispersion measures venue disagreement in dollars",
           abs(b.dispersion - 10.0) < 1e-6, f"${b.dispersion:.2f}")
 
+    # The number that feeds PRICING must be stable. Live, the max-min range of
+    # four venues swung $17 -> $45 across six polls seconds apart while no venue
+    # was systematically off by more than a basis point.
+    jumpy = {"//b/": (63_000.0, 0.0), "//g/": (63_010.0, 0.0),
+             "//k/": (63_005.0, 0.0), "//s/": (63_002.0, 0.0)}
+    b, _ = basis_for(jumpy)
+    await b.poll_once()
+    settled_err = b.reference_error
+    check("the reference error is a standard deviation, not the raw range",
+          settled_err < b.dispersion / 2.0,
+          f"${settled_err:.2f} vs range/2 ${b.dispersion / 2.0:.2f} - the range "
+          f"of four samples is a high-variance estimator")
+
+    b._sources = tuple((n, u) for n, u in b._sources)
+    b._session = FakeSession({"//b/": (63_000.0, 0.0), "//g/": (63_060.0, 0.0),
+                              "//k/": (63_005.0, 0.0), "//s/": (63_002.0, 0.0)})
+    await b.poll_once()
+    check("a one-poll widening moves it, but does not jump to the new range",
+          settled_err < b.reference_error < b.dispersion / 2.0,
+          f"${settled_err:.2f} -> ${b.reference_error:.2f}, range/2 "
+          f"${b.dispersion / 2.0:.2f}")
+
     late = {"//b/": (63_000.0, 0.0), "//g/": (63_010.0, 0.0),
             "//k/": (63_005.0, 0.0), "//s/": (63_900.0, 2.5)}
     b, _ = basis_for(late)

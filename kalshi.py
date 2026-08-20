@@ -44,6 +44,7 @@ import base64
 import contextlib
 import math
 import os
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -743,11 +744,34 @@ class CompositeBasis:
         #: late to describe the same instant as the others.
         self.rejected_outlier: int = 0
         self.rejected_late: int = 0
+        #: Smoothed 1-sigma estimate of how far our reference may sit from the
+        #: settlement index, in dollars. See `reference_error`.
+        self._error_ewma: float = 0.0
+        self._error_samples: int = 0
 
     @property
     def age(self) -> float | None:
         """Seconds since the composite last updated, or None if never."""
         return time.monotonic() - self.updated_mono if self.updated_mono else None
+
+    @property
+    def reference_error(self) -> float:
+        """Smoothed 1-sigma dollars our reference may sit from the settlement index.
+
+        Not `dispersion / 2`, though that was the first version and is close on
+        average. The max-min RANGE of three or four samples is a high-variance
+        estimator: measured live it swung between $12 and $59 across six polls a
+        few seconds apart while no venue was systematically off by more than a
+        basis point. Feeding that straight into pricing would make fair value
+        jump for reasons that have nothing to do with the market.
+
+        So: standard deviation across the venues rather than the range, then
+        smoothed across polls, because the level of genuine cross-venue
+        disagreement moves on the timescale of exchange flow and not of our
+        polling. With only two venues there is no usable standard deviation, so
+        half the gap is used instead.
+        """
+        return self._error_ewma
 
     #: A venue replying this much later than the fastest one is describing a
     #: different instant, not a different price.
@@ -820,6 +844,16 @@ class CompositeBasis:
         composite = _median(kept)
 
         self.dispersion = kept[-1] - kept[0]
+        # The number that feeds pricing is smoothed and uses a lower-variance
+        # statistic than the range; see `reference_error`.
+        spread = (
+            statistics.stdev(kept) if len(kept) >= 3
+            else (kept[-1] - kept[0]) / 2.0
+        )
+        self._error_ewma = spread if self._error_samples == 0 else (
+            self._error_ewma + self._alpha * (spread - self._error_ewma)
+        )
+        self._error_samples += 1
         self.venues = len(kept_obs)
         self.venue_skew = latest - earliest
         self.venue_prices = {

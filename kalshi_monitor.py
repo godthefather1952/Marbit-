@@ -136,7 +136,7 @@ def _reference_line(basis) -> str:
     )
     return (
         f"{basis.venues} venues spread ${basis.dispersion:,.2f} "
-        f"(+/-${basis.dispersion / 2.0:,.2f} assumed vs BRTI), "
+        f"(+/-${basis.reference_error:,.2f} assumed vs BRTI), "
         f"replies within {basis.venue_skew:.1f}s | {detail}"
     )
 
@@ -1118,15 +1118,13 @@ class Monitor:
     def _reference_error(self, inst) -> float:
         """1-sigma dollars our USD composite may sit away from the settlement index.
 
-        Half the observed cross-venue range is a crude proxy, but it is a
-        MEASURED one that widens exactly when the venues stop agreeing, which is
-        when our reference deserves less trust. With no composite yet we pass 0
-        rather than inventing a number - the caller is already gated on the
-        reference being fresh.
+        A MEASURED number that widens exactly when the venues stop agreeing,
+        which is when our reference deserves less trust. With no composite yet
+        we pass 0 rather than inventing one - the caller is already gated on the
+        reference being fresh. See CompositeBasis.reference_error.
         """
         basis = getattr(inst, "basis", None)
-        dispersion = getattr(basis, "dispersion", 0.0) or 0.0
-        return max(dispersion, 0.0) / 2.0
+        return max(getattr(basis, "reference_error", 0.0) or 0.0, 0.0)
 
     def _conflicts(self, sig) -> str | None:
         """Reject a signal that opposes a position we have already taken here.
