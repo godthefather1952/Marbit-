@@ -65,17 +65,35 @@ def _execution_index(executions: list[dict]) -> dict[tuple[str, str], dict]:
     for row in executions:
         key = (row.get("strategy", ""), row.get("ticker", ""))
         rec = out.setdefault(key, {"outcome": "", "count": 0.0, "price": 0.0,
-                                   "exit_price": None})
+                                   "exit_price": None, "signal_price": None,
+                                   "fill_ms": None, "entry_ts": None,
+                                   "exit_ts": None, "attempts": 0})
         outcome = str(row.get("outcome") or "")
         if outcome == "closed":
             rec["exit_price"] = row.get("price")
+            rec["exit_ts"] = row.get("ts")
             continue
+        if outcome in ("filled", "simulated", "rejected"):
+            rec["attempts"] += 1
         if rank.get(outcome, -1) > rank.get(rec["outcome"], -1):
             rec["outcome"] = outcome
             if outcome in ("filled", "simulated"):
                 rec["count"] = float(row.get("count") or 0.0)
                 rec["price"] = float(row.get("price") or 0.0)
+                rec["signal_price"] = row.get("signal_price")
+                rec["fill_ms"] = row.get("elapsed_ms")
+                rec["entry_ts"] = row.get("ts")
     return out
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def score(
@@ -139,6 +157,16 @@ def score(
                 "expected": row.get("expected_net", 0.0),
                 "legs": row["legs"],
                 "outcome": outcome,
+                "contracts": sum(
+                    (rec["count"] if rec and rec.get("count") else leg["size"])
+                    for leg in row["legs"]
+                ),
+                "attempts": (rec or {}).get("attempts", 0),
+                "signal_price": (rec or {}).get("signal_price"),
+                "fill_price": (rec or {}).get("price"),
+                "fill_ms": (rec or {}).get("fill_ms"),
+                "entry_ts": (rec or {}).get("entry_ts"),
+                "exit_ts": (rec or {}).get("exit_ts"),
             }
         )
 
@@ -185,6 +213,38 @@ def score(
         print(f"   ACTUAL net      ${net:+,.2f}   ({net / cost * 100:+.1f}% on stake)"
               if cost else f"   ACTUAL net      ${net:+,.2f}")
         print(f"   model predicted ${expected:+,.2f}")
+
+        # Execution quality, separate from whether the thesis was right. A
+        # strategy can call direction correctly on every trade and still lose,
+        # if the price it pays is worse than the quote that justified it.
+        contracts = sum(t["contracts"] for t in trades)
+        attempts = sum(t["attempts"] for t in trades)
+        got = sum(1 for t in trades if t["outcome"] in ("filled", "simulated"))
+        if attempts:
+            print(f"   fill rate       {got}/{attempts} attempts "
+                  f"({got / attempts * 100:.0f}%), {contracts:g} contracts")
+        slips = [
+            (t["fill_price"] - t["signal_price"]) * 100.0
+            for t in trades
+            if t.get("fill_price") and t.get("signal_price")
+        ]
+        if slips:
+            print(f"   slippage        {sum(slips) / len(slips):+.2f}c/contract "
+                  f"vs the quote that produced the signal (n={len(slips)})")
+        fill_ms = _median([t["fill_ms"] for t in trades if t.get("fill_ms")])
+        if fill_ms is not None:
+            print(f"   time to fill    {fill_ms / 1000.0:.1f}s median")
+        holds = _median([
+            t["exit_ts"] - t["entry_ts"] for t in trades
+            if t.get("exit_ts") and t.get("entry_ts")
+        ])
+        if holds is not None:
+            print(f"   time to exit    {holds:.0f}s median "
+                  f"({sum(1 for t in trades if t['exited'])} closed early)")
+        if contracts:
+            print(f"   per contract    predicted {expected / contracts:+.4f} "
+                  f"vs realized {net / contracts:+.4f}")
+
         if expected > 0:
             verdict = (
                 "model was OPTIMISTIC" if net < expected * 0.5

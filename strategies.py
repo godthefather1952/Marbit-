@@ -502,6 +502,8 @@ class PaperLedger:
         count: float = 0.0,
         price: float = 0.0,
         detail: str = "",
+        signal_price: float | None = None,
+        elapsed_ms: float | None = None,
     ) -> None:
         """Record what actually happened to a signal when it reached the venue.
 
@@ -512,7 +514,15 @@ class PaperLedger:
         now gets a companion row saying which it was.
 
         `outcome` is one of: "filled" (real money), "simulated" (dry run),
-        "skipped" (never sent), "rejected" (sent, no fill).
+        "skipped" (never sent), "rejected" (sent, no fill), "closed" (exited
+        before expiry).
+
+        `signal_price` and `elapsed_ms` are written here rather than left to be
+        reconstructed by joining rows later: slippage is the gap between the
+        quote that justified the trade and the price we actually paid, and a
+        strategy can be perfectly right about direction while losing all of its
+        edge in that gap. Neither number is recoverable after the fact if the
+        signal row and the fill row disagree about which leg they describe.
         """
         row = {
             "kind": "execution",
@@ -523,6 +533,8 @@ class PaperLedger:
             "count": count,
             "price": price,
             "detail": detail,
+            "signal_price": signal_price,
+            "elapsed_ms": elapsed_ms,
         }
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")

@@ -2477,6 +2477,44 @@ async def test_autopilot() -> None:
         check("the execution row records what actually filled",
               lines[1]["count"] == 5 and abs(lines[1]["price"] - 0.39) < 1e-9)
 
+        led2 = _PL(_Path(tmp) / "q.jsonl")
+        led2.record(s)
+        led2.record_execution(s, "filled", count=5, price=0.42,
+                              signal_price=0.40, elapsed_ms=850.0)
+        row = [json.loads(l) for l in
+               _Path(led2.path).read_text().splitlines() if l.strip()][1]
+        check("and the quote that justified the trade, alongside the fill",
+              abs(row["signal_price"] - 0.40) < 1e-9 and row["elapsed_ms"] == 850.0,
+              "2c of slippage is not recoverable later by joining rows")
+
+    # -- per-strategy execution quality -------------------------------------- #
+    # "Did the model call it right" and "did we get a price worth having" are
+    # different questions, and a strategy can pass the first while failing the
+    # second on every single trade.
+    slipped = [_sig("STALE", "M9", "BTC", 0.40, 10.0)]
+    slip_rows = [_exe("STALE", "M9", "filled")]
+    slip_rows[0].update(count=10, price=0.46, signal_price=0.40,
+                        elapsed_ms=1500.0, ts=1000.0)
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        score_trades(slipped, {"M9": {"result": "yes"}}, slip_rows)
+    out = buf.getvalue()
+    check("slippage is reported against the quote that produced the signal",
+          "+6.00c/contract" in out, "paid 0.46 on a signal built at 0.40")
+    check("time to fill is reported", "1.5s median" in out)
+    check("fill rate is reported per strategy", "1/1 attempts" in out)
+    check("predicted and realized edge are compared per contract",
+          "per contract" in out and "predicted" in out)
+
+    missed = [_sig("STALE", "M8", "BTC", 0.40, 10.0)]
+    miss_rows = [_exe("STALE", "M8", "rejected"), _exe("STALE", "M8", "rejected"),
+                 _exe("STALE", "M8", "filled")]
+    miss_rows[2].update(count=10, price=0.40, signal_price=0.40, ts=1000.0)
+    idx = _execution_index(miss_rows)
+    check("attempts count every order sent, not just the one that filled",
+          idx[("STALE", "M8")]["attempts"] == 3,
+          "a strategy that fills one order in three is not a 100% fill rate")
+
     # -- the probe's three outcomes ------------------------------------------- #
     async def _noop(_s):  # verification sleeps 2s between order and read
         return None

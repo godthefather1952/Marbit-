@@ -140,6 +140,75 @@ def _reference_line(basis) -> str:
     )
 
 
+class StrategyStats:
+    """Live performance of ONE strategy on ONE underlying.
+
+    The session summary reported strategy hits and a single global funnel, which
+    cannot answer the question that actually decides what to keep: is CROSS on
+    ETH paying for itself while STALE on BTC is not? Three strategies times two
+    instruments blended into one number can show a profit while five of the six
+    combinations lose money.
+
+    Slippage is tracked separately from edge on purpose. A strategy can be right
+    about direction on every trade and still lose, if the price it pays is
+    consistently worse than the quote that justified the trade - and that shows
+    up here as a healthy predicted edge against a negative realized one.
+    """
+
+    __slots__ = (
+        "attempted", "filled", "rejected", "skipped", "contracts",
+        "slippage_cents", "slippage_n", "fill_ms", "exit_ms",
+        "predicted", "realized", "closed", "settled", "wins",
+    )
+
+    def __init__(self) -> None:
+        self.attempted = 0
+        self.filled = 0
+        self.rejected = 0
+        self.skipped = 0
+        self.contracts = 0.0
+        self.slippage_cents = 0.0
+        self.slippage_n = 0
+        self.fill_ms: list[float] = []
+        self.exit_ms: list[float] = []
+        self.predicted = 0.0   # dollars of edge the model claimed
+        self.realized = 0.0    # dollars actually booked (exits + settlements)
+        self.closed = 0
+        self.settled = 0
+        self.wins = 0
+
+    @property
+    def fill_rate(self) -> float:
+        return self.filled / self.attempted if self.attempted else 0.0
+
+    @property
+    def avg_slippage(self) -> float:
+        """Cents per contract paid above the quote that produced the signal."""
+        return self.slippage_cents / self.slippage_n if self.slippage_n else 0.0
+
+    def line(self) -> str:
+        def med(values):
+            if not values:
+                return "n/a"
+            ordered = sorted(values)
+            return f"{ordered[len(ordered) // 2] / 1000.0:.1f}s"
+
+        parts = [
+            f"attempted {self.attempted}",
+            f"filled {self.filled} ({self.fill_rate * 100:.0f}%)",
+            f"{self.contracts:g} contracts",
+            f"slip {self.avg_slippage:+.2f}c/contract",
+            f"fill {med(self.fill_ms)}",
+        ]
+        if self.closed:
+            parts.append(f"exit {med(self.exit_ms)} ({self.closed} closed early)")
+        if self.settled or self.closed:
+            graded = self.settled + self.closed
+            parts.append(f"won {self.wins}/{graded}")
+        parts.append(f"predicted ${self.predicted:+.2f} vs realized ${self.realized:+.2f}")
+        return " | ".join(parts)
+
+
 class _ExitStub:
     """Minimal shape `PaperLedger.record_execution` needs for an exit row."""
 
@@ -256,6 +325,11 @@ class Monitor:
         #: Websocket order book, when the session can sign for one. None means
         #: every book in this run came from REST polling.
         self._book_stream: KalshiBookStream | None = None
+        #: "ASSET:STRATEGY" -> StrategyStats. Which combination is actually
+        #: paying, rather than whether the blend of all of them is.
+        self._strategy_stats: dict[str, StrategyStats] = {}
+        #: ticker -> monotonic time of the fill, so time-to-exit is measurable.
+        self._entry_mono: dict[tuple[str, str], float] = {}
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -698,9 +772,24 @@ class Monitor:
                if self._funnel["unpriceable"] else ""),
             f"execution     : {self.trader.stats() if self.trader else 'none'}",
         ]
+        lines += self._strategy_lines()
         for inst in self.instruments:
             lines += [""] + self._instrument_lines(inst, elapsed)
         return lines
+
+    def _strategy_lines(self) -> list[str]:
+        """Per-strategy, per-instrument record - six experiments, not one.
+
+        A blended number can show a profit while most of the combinations that
+        produced it lose money, and the decision this feeds is which strategy to
+        keep running.
+        """
+        if not self._strategy_stats:
+            return []
+        out = ["", " per-strategy record (asset:strategy):"]
+        for key, stats in sorted(self._strategy_stats.items()):
+            out.append(f"   {key:<16} {stats.line()}")
+        return out
 
     def _book_stream_line(self) -> str:
         """Where the books actually came from - not where they were meant to.
@@ -1052,6 +1141,63 @@ class Monitor:
                 return count
         return 0
 
+    def _stats_key(self, item) -> str:
+        """The "ASSET:STRATEGY" bucket a signal or a filled order belongs to.
+
+        Keyed off the ticker so a signal and the order it produced always land
+        in the same bucket - the two objects share no other field that survives
+        the round trip through the venue.
+        """
+        ticker = getattr(item, "ticker", "") or ""
+        asset = next(
+            (i.name for i in self.instruments if ticker.startswith(i.series)), ""
+        )
+        strategy = getattr(item, "strategy", "") or "?"
+        return f"{asset}:{strategy}" if asset else strategy
+
+    def _stats_for(self, sig) -> StrategyStats:
+        key = self._stats_key(sig)
+        stats = self._strategy_stats.get(key)
+        if stats is None:
+            stats = self._strategy_stats[key] = StrategyStats()
+        return stats
+
+    def _track_strategy(self, sig, outcome: str, leg, result, elapsed_ms: float) -> None:
+        """Fold one execution attempt into its strategy's running record."""
+        stats = self._stats_for(sig)
+        stats.attempted += 1
+        if outcome in ("filled", "simulated"):
+            stats.filled += 1
+            stats.contracts += result.count
+            stats.fill_ms.append(elapsed_ms)
+            if result.price and leg.price:
+                # Positive means we paid MORE than the quote that justified the
+                # trade. Signed, because a limit that improves is real too.
+                stats.slippage_cents += (result.price - leg.price) * 100.0 * result.count
+                stats.slippage_n += result.count
+            # The model's claim, scaled to what actually filled rather than to
+            # the nominal size the signal was written against.
+            nominal = sum(l.size for l in sig.legs) or 1.0
+            stats.predicted += sig.expected_net * (result.count / nominal)
+            self._entry_mono[(sig.ticker, leg.side)] = time.monotonic()
+        elif outcome == "rejected":
+            stats.rejected += 1
+        else:
+            stats.skipped += 1
+
+    def _track_close(self, order, price: float, realized: float) -> None:
+        """Book an early exit against its strategy."""
+        stats = self._strategy_stats.get(self._stats_key(order))
+        if stats is None:
+            return
+        stats.closed += 1
+        stats.realized += realized
+        if realized > 0:
+            stats.wins += 1
+        entered = self._entry_mono.pop((order.ticker, order.outcome), None)
+        if entered is not None:
+            stats.exit_ms.append((time.monotonic() - entered) * 1000.0)
+
     def _record_execution(self, sig, outcome: str, **kw) -> None:
         """Write the companion execution row, so nothing downstream can read a
         recorded signal as money that moved."""
@@ -1272,13 +1418,21 @@ class Monitor:
                         if result.ok:
                             self._funnel["filled"] += 1
                         log.warning(" execution: [%s] %s", sig.strategy, result.summary())
-                        self._record_execution(
-                            sig,
+                        outcome = (
                             "simulated" if result.dry_run else
-                            ("filled" if result.ok else "rejected"),
+                            ("filled" if result.ok else "rejected")
+                        )
+                        elapsed_ms = max(time.time() - sig.ts, 0.0) * 1000.0
+                        self._record_execution(
+                            sig, outcome,
                             count=result.count if result.ok else 0.0,
                             price=result.price,
                             detail=result.error or "",
+                            signal_price=leg.price,
+                            elapsed_ms=elapsed_ms,
+                        )
+                        self._track_strategy(
+                            sig, outcome, leg, result, elapsed_ms
                         )
                 await self._manage_exits()
                 await self._settle_finished()
@@ -1317,7 +1471,12 @@ class Monitor:
                 if decision is None:
                     continue
                 reason, price = decision
+                # close_position is the only thing that moves `realized` in
+                # this call, so the delta across it IS this exit's P&L - more
+                # reliable than recomputing it from a partially filled result.
+                before = trader.realized
                 await trader.close_position(order, price, reason)
+                self._track_close(order, price, trader.realized - before)
                 self._committed.get(order.ticker, set()).discard(order.outcome)
                 if self.ledger is not None:
                     with contextlib.suppress(Exception):
@@ -1327,6 +1486,7 @@ class Monitor:
                             count=order.count,
                             price=price,
                             detail=f"{reason} at {price:.4f} from {order.price:.4f}",
+                            signal_price=order.price,
                         )
 
     async def _settle_finished(self) -> None:
@@ -1342,8 +1502,35 @@ class Monitor:
                 continue
             result = str(((payload or {}).get("market") or {}).get("result", "")).lower()
             if result in ("yes", "no"):
+                # Attribute each settlement to the strategy that opened it,
+                # before settle() marks the orders closed and the link is gone.
+                held = [
+                    o for o in trader.open_positions(ticker)
+                ]
+                before = trader.realized
                 trader.settle(ticker, result)
+                booked = trader.realized - before
+                self._attribute_settlement(held, result, booked)
                 self._settled.add(ticker)
+
+    def _attribute_settlement(self, held: list, result: str, booked: float) -> None:
+        """Split a settled market's P&L across the strategies that opened it.
+
+        Two strategies can hold the same contract, so the total is apportioned
+        by stake rather than credited whole to whichever one is found first.
+        """
+        if not held:
+            return
+        total_stake = sum(o.stake for o in held) or 1.0
+        for order in held:
+            stats = self._strategy_stats.get(self._stats_key(order))
+            if stats is None:
+                continue
+            stats.settled += 1
+            stats.realized += booked * (order.stake / total_stake)
+            if (order.outcome == "YES") == (result == "yes"):
+                stats.wins += 1
+            self._entry_mono.pop((order.ticker, order.outcome), None)
 
     async def _heartbeat_loop(self) -> None:
         while True:
