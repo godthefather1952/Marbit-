@@ -675,6 +675,31 @@ class PriceBuffer:
                 )
         return best
 
+    def mean_since(
+        self, since_mono: float, now_mono: float | None = None
+    ) -> tuple[float, float] | None:
+        """(mean price, seconds covered) over the 1-second bars since `since_mono`.
+
+        The settlement average is built from observations that have ALREADY
+        happened by the time a contract is near expiry. Those are not a forecast
+        and should not be modelled as one - this exposes what the tape actually
+        saw so the model can treat the realized part as known.
+
+        `covered` is a DENSITY, not a span: it counts the 1-second bars actually
+        present, capped by the length of the window asked for. A span would read
+        a dead feed as full coverage (the endpoints are still far apart), which
+        is the reading that would let a stale tape masquerade as a known
+        settlement average. Missing seconds are missing bars, so counting bars
+        makes both gaps and staleness show up as exactly what they are.
+        """
+        picked = [p for mono, p in self._bars if mono >= since_mono and p > 0]
+        if not picked:
+            return None
+        end = self._bars[-1][0] if now_mono is None else now_mono
+        span = max(end - since_mono, 0.0)
+        covered = min(float(len(picked)), span)
+        return sum(picked) / len(picked), covered
+
     def sigma_per_sqrt_second(self) -> float:
         """EWMA realized vol of 1-second log returns, in per-sqrt-second units."""
         fallback = FALLBACK_ANNUAL_VOL / math.sqrt(SECONDS_PER_YEAR)

@@ -80,6 +80,18 @@ FEE_COEFFICIENT = 0.07
 #: Settlement averages the final 60 seconds.
 TWAP_LOOKBACK_SECONDS = 60.0
 
+#: Cap on the realized model's certainty, in sigma. Nothing about a synthetic
+#: reference tape justifies more than "as settled as we can tell", and an
+#: unbounded z here would let a division by a vanishing remaining window print
+#: absurd numbers into logs and gates.
+_SETTLED_Z = 8.0
+
+#: How much of the already-elapsed averaging window our own tape must cover
+#: before we are willing to price against the realized part of it. Below this we
+#: would be extrapolating a partial observation across the whole elapsed slice,
+#: which is a worse error than falling back to the terminal model.
+MIN_TWAP_COVERAGE = 0.8
+
 
 #: Settlement is CF Benchmarks BRTI, which is a **USD** index built from USD
 #: spot venues. Binance's BTCUSDT is quoted in USDT, and USDT/USD routinely
@@ -123,10 +135,36 @@ def trading_fee(price: float, contracts: float) -> float:
 
 
 def fee_per_contract(price: float) -> float:
-    """Marginal fee at this price, in dollars per contract (unrounded)."""
+    """Marginal fee at this price, in dollars per contract (UNROUNDED).
+
+    Correct only in the limit of a large order. Kalshi rounds the fee up to the
+    next cent on the WHOLE order, so on the small sizes a small account
+    actually trades this understates the real cost badly:
+
+        price 0.99, 1 contract  -> 0.00069 modelled vs 0.01000 charged (14.4x)
+        price 0.99, 3 contracts -> 0.00069 modelled vs 0.00333 charged  (4.8x)
+        price 0.50, 7 contracts -> 0.01750 modelled vs 0.01857 charged  (1.1x)
+
+    Prefer `fee_at_size` anywhere the order size is known - which is every
+    decision that leads to an order. This remains for the size-independent
+    breakeven reporting where no size exists yet.
+    """
     if not (0.0 < price < 1.0):
         return 0.0
     return FEE_COEFFICIENT * price * (1.0 - price)
+
+
+def fee_at_size(price: float, contracts: float) -> float:
+    """Fee per contract for an order of exactly `contracts`, rounding included.
+
+    This is what the account is actually charged, divided by the size. On a
+    3-contract order at 0.99 it is 0.33c per contract where the unrounded model
+    says 0.07c - a difference larger than the entire edge such a trade is
+    usually chasing.
+    """
+    if contracts <= 0 or not (0.0 < price < 1.0):
+        return 0.0
+    return trading_fee(price, contracts) / contracts
 
 
 def net_edge(fair_value: float, ask: float) -> float:
@@ -245,7 +283,12 @@ class KalshiMarket:
         return self.strike > 0.0
 
     def fair_value(
-        self, spot: float, sigma_per_sqrt_s: float, now: float | None = None
+        self,
+        spot: float,
+        sigma_per_sqrt_s: float,
+        now: float | None = None,
+        realized: tuple[float, float] | None = None,
+        reference_error: float = 0.0,
     ) -> float | None:
         """P(settlement TWAP >= strike), from the PUBLISHED strike.
 
@@ -265,13 +308,135 @@ class KalshiMarket:
         known, so the true expectation is a blend of that slice and spot. The
         error is small at 15-minute horizons and is bounded by staying out of
         the final seconds.
+
+        Pass `realized` once the averaging window has opened to replace that
+        approximation with what the tape actually printed - see
+        `fair_value_realized`. It degrades to this terminal model by returning
+        None whenever the observation cannot support the better estimate, so
+        callers never have to choose between the two.
         """
         if spot <= 0 or not self.strike_known:
             return None
+        if realized is not None:
+            settled = self.fair_value_realized(
+                spot, sigma_per_sqrt_s, realized, now, reference_error
+            )
+            if settled is not None:
+                return settled
         denom = sigma_per_sqrt_s * math.sqrt(self.effective_tau(now))
         if denom <= 0.0:
             return None
         return clamp_prob(norm_cdf(math.log(spot / self.strike) / denom))
+
+    def fair_value_realized(
+        self,
+        spot: float,
+        sigma_per_sqrt_s: float,
+        realized: tuple[float, float],
+        now: float | None = None,
+        reference_error: float = 0.0,
+    ) -> float | None:
+        """`realized_z` as a probability, or None when it cannot be computed."""
+        z = self.realized_z(
+            spot, sigma_per_sqrt_s, realized, now, reference_error
+        )
+        return None if z is None else clamp_prob(norm_cdf(z))
+
+    def realized_z(
+        self,
+        spot: float,
+        sigma_per_sqrt_s: float,
+        realized: tuple[float, float],
+        now: float | None = None,
+        reference_error: float = 0.0,
+    ) -> float | None:
+        """Standard deviations between spot and the MOVING effective strike.
+
+        Kept separate from the probability because `clamp_prob` floors at 0.01
+        and caps at 0.99, whose z is only 2.33 - inverting the clamped
+        probability to recover a z would make every reading look like at most
+        2.33 sigma and would silently disqualify anything gated on a higher
+        threshold. Callers that need certainty in sigma units take this; callers
+        that need a price take `fair_value_realized`.
+
+        The contract settles on the mean of the final `L` seconds. Once the
+        window has opened, some of that mean is no longer random - the tape has
+        already printed it. Pricing against the ORIGINAL strike throughout
+        treats known observations as unknown, and it is least accurate exactly
+        when ENDGAME trades.
+
+        With `e` seconds elapsed at observed mean `m`, and `r = L - e` still to
+        come, settlement is YES when
+
+            (e*m + r*mean_remaining) / L  >=  strike
+
+        so the remaining stub must itself average at least
+
+            required = (L*strike - e*m) / r
+
+        which is a MOVING effective strike: it drifts away as the realized part
+        runs against us, and collapses toward the current price as `r` shrinks.
+        The mean of a driftless walk over the remaining `r` seconds has variance
+        sigma^2*r/3, giving the usual normal probability.
+
+        `realized` is `(observed_mean, covered_seconds)` as returned by
+        `PriceBuffer.mean_since()`: the mean our tape printed since the window
+        opened, and how many seconds of tape that mean actually spans. Returns
+        None when the window has not opened or when coverage is too thin, so the
+        caller falls back to the terminal model.
+
+        Two honest limitations, neither hidden: our tape is a synthetic USD
+        composite rather than the BRTI index Kalshi actually settles on, and the
+        arithmetic mean here is mixed with a log-normal volatility, which is a
+        good approximation only because 60 seconds of BTC is a small move. This
+        is a better estimate, not the settlement calculation.
+        """
+        observed_mean, covered = realized
+        lookback = self.twap_lookback
+        if lookback <= 0.0 or covered <= 0.0 or observed_mean <= 0.0:
+            return None
+        remaining = self.seconds_remaining(now)
+
+        # `e` is DEFINITIONAL, not "however much tape we happen to hold": the
+        # window opened `lookback - r` seconds ago whether or not we watched it.
+        # Deriving `e` from coverage instead breaks the identity e + r == L and
+        # silently produces a nonsense `required` - which is precisely how this
+        # returned a pinned 0.01 for every input during development. When the
+        # tape does not reach back far enough we refuse to price and the caller
+        # falls back to the terminal model, which is wrong-but-bounded rather
+        # than confidently wrong.
+        r = max(min(remaining, lookback), 0.0)
+        e = lookback - r
+        if e <= 0.0:
+            return None  # the averaging window has not started yet
+        if covered < e * MIN_TWAP_COVERAGE:
+            return None  # we did not watch enough of the realized part
+
+        if remaining <= 0.0:
+            # Everything that decides this has printed.
+            return _SETTLED_Z if observed_mean >= self.strike else -_SETTLED_Z
+
+        required = (lookback * self.strike - e * observed_mean) / r
+        if required <= 0.0:
+            return _SETTLED_Z  # cannot settle below zero; we have already won
+
+        # Price-space volatility of the remaining stub's own mean.
+        sigma_abs = sigma_per_sqrt_s * spot
+        var_stub = (sigma_abs * sigma_abs) * (r / 3.0)
+
+        # Our tape is not BRTI, and the moving strike AMPLIFIES that gap: an
+        # error of d dollars in `observed_mean` moves `required` by d*e/r. With
+        # 10 seconds left that is a 5x multiplier, so a $3 reference error
+        # becomes a $15 error in the level we are pricing against. Carrying it
+        # as variance rather than ignoring it is what stops this model from
+        # getting *more* confident exactly as it becomes least reliable - in the
+        # last seconds the term dominates and fair value collapses toward 0.5,
+        # which is the honest answer there.
+        amplified = abs(reference_error) * (e / r)
+        denom = math.sqrt(var_stub + amplified * amplified)
+        if denom <= 0.0:
+            return None
+        return max(-_SETTLED_Z, min(_SETTLED_Z, (spot - required) / denom))
 
 
 @dataclass(slots=True)
@@ -289,6 +454,57 @@ class KalshiBook:
     no_ask: float | None
     yes_bid_size: float = 0.0
     yes_ask_size: float = 0.0
+    #: Full ladders, ascending by price: [(price, contracts), ...]. Kept so
+    #: execution can ask what a given SIZE actually costs rather than assuming
+    #: the whole order fills at the top level.
+    yes_levels: tuple[tuple[float, float], ...] = ()
+    no_levels: tuple[tuple[float, float], ...] = ()
+    #: Identity and age of this snapshot.
+    #:
+    #: `version` distinguishes one book from the next. Without it a confirmation
+    #: gate counts evaluation passes rather than new information: the evaluator
+    #: runs every 0.1s while REST refreshes every 0.4s, so a single unchanged
+    #: snapshot was being counted as four independent confirmations. Kalshi's
+    #: REST book carries no sequence number, so this falls back to a hash of the
+    #: ladder contents - which is exactly the property wanted, since a book that
+    #: has not changed should not count twice.
+    seq: int | None = None
+    version: int = 0
+    received_mono: float = 0.0
+    received_ts: float = 0.0
+
+    @property
+    def age(self) -> float:
+        """Seconds since this snapshot arrived."""
+        return time.monotonic() - self.received_mono if self.received_mono else 0.0
+
+    def cost_for(self, side: str, contracts: float) -> tuple[float, float] | None:
+        """VWAP and filled quantity for taking `contracts` of `side`.
+
+        Top-of-book is what a 1-lot pays. Asking for 20 when 2 are offered at
+        0.63 and the rest sit at 0.67 costs materially more than 0.63, and the
+        edge is computed against the price we would ACTUALLY pay. Returns None
+        if no depth is visible; returns less than `contracts` when the book
+        cannot fill the whole order.
+        """
+        # Buying YES lifts the NO bid ladder (and vice versa), converted to the
+        # price of the outcome we want. Best price first.
+        source = self.no_levels if side == "YES" else self.yes_levels
+        offers = sorted(
+            ((round(1.0 - p, 4), q) for p, q in source if 0.0 < p < 1.0),
+            key=lambda pq: pq[0],
+        )
+        taken = 0.0
+        spend = 0.0
+        for price, qty in offers:
+            if taken >= contracts:
+                break
+            lot = min(qty, contracts - taken)
+            spend += lot * price
+            taken += lot
+        if taken <= 0:
+            return None
+        return spend / taken, taken
 
     @property
     def yes_mid(self) -> float | None:
@@ -307,6 +523,12 @@ class KalshiBook:
         yes_ask = round(1.0 - no_bid, 4) if no_bid is not None else None
         no_ask = round(1.0 - yes_bid, 4) if yes_bid is not None else None
 
+        raw_seq = payload.get("seq") or payload.get("sequence")
+        try:
+            seq = int(raw_seq) if raw_seq is not None else None
+        except (TypeError, ValueError):
+            seq = None
+
         return cls(
             yes_bid=yes_bid,
             yes_ask=yes_ask,
@@ -314,6 +536,14 @@ class KalshiBook:
             no_ask=no_ask,
             yes_bid_size=next((q for p, q in yes if p == yes_bid), 0.0),
             yes_ask_size=next((q for p, q in no if p == no_bid), 0.0),
+            yes_levels=tuple(yes),
+            no_levels=tuple(no),
+            seq=seq,
+            # A sequence when the venue gives one; otherwise the content itself
+            # is the identity, so an unchanged book keeps the same version.
+            version=seq if seq is not None else hash((tuple(yes), tuple(no))),
+            received_mono=time.monotonic(),
+            received_ts=time.time(),
         )
 
 
@@ -485,6 +715,18 @@ class CompositeBasis:
         self.offset: float = 0.0  # add this to the venue tick to reach composite
         self.samples: int = 0
         self.last_composite: float | None = None
+        self.updated_mono: float = 0.0
+        #: How far the venues disagreed on the last poll, in dollars. A wide
+        #: spread means the "composite" is an average of prices that are not
+        #: describing the same instant, and the correction it produces is not
+        #: trustworthy.
+        self.dispersion: float = 0.0
+        self.venues: int = 0
+
+    @property
+    def age(self) -> float | None:
+        """Seconds since the composite last updated, or None if never."""
+        return time.monotonic() - self.updated_mono if self.updated_mono else None
 
     async def poll_once(self) -> float | None:
         """One composite reading, as the median of the reachable USD venues."""
@@ -506,7 +748,20 @@ class CompositeBasis:
         prices.sort()
         mid = len(prices) // 2
         composite = prices[mid] if len(prices) % 2 else (prices[mid - 1] + prices[mid]) / 2.0
+
+        # Discard venues far from the median before committing. A single stale
+        # or wrong quote drags a mean and can drag a two-venue median outright;
+        # 50 bps is far wider than these venues ever legitimately diverge.
+        kept = [p for p in prices if abs(p - composite) / composite < 0.005]
+        if len(kept) >= 2:
+            kept.sort()
+            k = len(kept) // 2
+            composite = kept[k] if len(kept) % 2 else (kept[k - 1] + kept[k]) / 2.0
+
+        self.dispersion = max(kept) - min(kept) if kept else 0.0
+        self.venues = len(kept)
         self.last_composite = composite
+        self.updated_mono = time.monotonic()
         return composite
 
     async def run(self, buffer, interval: float = 20.0) -> None:
@@ -680,12 +935,18 @@ class CoinbaseSpotStream:
                             if msg.get("type") != "ticker":
                                 continue
                             price = float(msg["price"])
+                            # Coinbase stamps every ticker with its own event
+                            # time. Passing 0 here made the buffer's feed-latency
+                            # diagnostic compute `now - 0` - an epoch-sized
+                            # number - so a latency-sensitive strategy had no
+                            # working measure of how late its own tape was.
+                            exch_ms = _iso_ms(msg.get("time"))
                         except (ValueError, KeyError, TypeError):
                             continue
                         if price > 0:
                             if self._basis is not None:
                                 price = self._basis.correct(price)
-                            self._buffer.add(price, 0, t1)
+                            self._buffer.add(price, exch_ms, t1)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the tape alive
@@ -695,6 +956,19 @@ class CoinbaseSpotStream:
                 self._buffer.reset("coinbase tape disconnect")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
+
+
+def _iso_ms(value: Any) -> int:
+    """Coinbase's RFC3339 event time as epoch milliseconds; 0 if unusable."""
+    if not value:
+        return 0
+    try:
+        import datetime as _dt
+
+        text = str(value).replace("Z", "+00:00")
+        return int(_dt.datetime.fromisoformat(text).timestamp() * 1000.0)
+    except (ValueError, TypeError):
+        return 0
 
 
 async def usd_spot_rest(

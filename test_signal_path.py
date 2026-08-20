@@ -2059,6 +2059,27 @@ async def test_setup_and_confirmation() -> None:
             sigma_used=1.2e-4,
         )
 
+    # -- a confirmation must be NEW market data, not another loop pass ------ #
+    # The evaluator runs every 0.1s while the book refreshes every 0.4s, so
+    # counting passes counted the same snapshot ~4 times. A live log read
+    # "confirmed over 1.0s / 11 passes" on roughly two distinct books.
+    def versioned(v):
+        s = sig()
+        s.book_version = v
+        return s
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.05, 3, tmp)
+        for _ in range(30):
+            mon._emit(versioned(1021))       # the SAME book, thirty times
+            _time.sleep(0.003)
+        check("an unchanged book cannot confirm itself, however many passes",
+              not mon._pending_orders, "book 1021 x30")
+        mon._emit(versioned(1024))
+        mon._emit(versioned(1027))
+        check("three DISTINCT books do confirm it",
+              len(mon._pending_orders) == 1, "1021 -> 1024 -> 1027")
+
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.05, 3, tmp)
         mon._emit(sig())
@@ -3067,6 +3088,273 @@ async def test_multi_asset_and_preset() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Data quality, depth, reconciliation, and the STALE time-decay correction
+# --------------------------------------------------------------------------- #
+
+
+async def test_accuracy_upgrades() -> None:
+    print("\n--- accuracy: fees, freshness, depth, decay, reconciliation ---")
+
+    import math as _m
+    from statistics import NormalDist as _ND
+    from types import SimpleNamespace as _NS
+
+    from kalshi import KalshiBook, fee_at_size, fee_per_contract, trading_fee
+    from kalshi_execution import KalshiTrader, RiskLimits
+    from kalshi_monitor import (
+        BOOK_SEQUENCE_GAP, EXCESSIVE_TIME_SKEW, STALE_BOOK, STALE_REFERENCE,
+        STALE_SPOT, freshness_problem,
+    )
+    from strategies import scan_stale
+
+    def book(levels_yes, levels_no):
+        return KalshiBook.from_payload({"orderbook_fp": {
+            "yes_dollars": [[f"{p:.4f}", f"{q}"] for p, q in levels_yes],
+            "no_dollars": [[f"{p:.4f}", f"{q}"] for p, q in levels_no],
+        }})
+
+    # -- fees: rounding is charged on the ORDER, not per contract ------------ #
+    check("fee_at_size reflects the rounding a small order actually pays",
+          abs(fee_at_size(0.99, 3) - trading_fee(0.99, 3) / 3) < 1e-12
+          and fee_at_size(0.99, 3) > 4 * fee_per_contract(0.99),
+          f"{fee_at_size(0.99, 3):.5f}/c vs {fee_per_contract(0.99):.5f} modelled")
+    check("it converges to the marginal rate as size grows",
+          abs(fee_at_size(0.50, 200) - fee_per_contract(0.50)) < 5e-4)
+    check("a 1-lot at 0.99 is charged a whole cent",
+          abs(fee_at_size(0.99, 1) - 0.01) < 1e-9)
+
+    # -- book identity: an unchanged snapshot is the SAME book --------------- #
+    b1 = book([(0.60, 2)], [(0.36, 5)])
+    b2 = book([(0.60, 2)], [(0.36, 5)])
+    b3 = book([(0.61, 2)], [(0.36, 5)])
+    check("identical books share a version", b1.version == b2.version)
+    check("any change gives a new version", b1.version != b3.version)
+    check("books carry their arrival time", b1.received_mono > 0 and b1.age >= 0.0)
+
+    # -- depth: what a real order actually pays ------------------------------ #
+    # 2 @ 0.63, 1 @ 0.64, 20 @ 0.67 - a 20-lot does NOT trade at 0.63.
+    deep = book([], [(0.33, 20), (0.36, 1), (0.37, 2)])
+    check("top of book is what a 1-lot pays",
+          abs(deep.cost_for("YES", 1)[0] - 0.63) < 1e-9)
+    vwap, filled = deep.cost_for("YES", 20)
+    check("a larger order walks the ladder to a worse average",
+          vwap > 0.63 and abs(filled - 20) < 1e-9, f"20 lots average {vwap:.4f}")
+    check("it reports short fill rather than inventing depth",
+          deep.cost_for("YES", 500)[1] == 23.0)
+    check("an empty book cannot be priced at all",
+          book([], []).cost_for("YES", 1) is None)
+
+    # -- freshness: connected is not the same as current --------------------- #
+    now = time.monotonic()
+
+    def inst(spot_age=0.1, book_age=0.1, basis_age=1.0):
+        buf = PriceBuffer()
+        buf.add(63_000.0, 0, 1)
+        buf._ticks[-1] = buf._ticks[-1].__class__(
+            now - spot_age, 63_000.0, 0, 1)
+        bk = book([(0.60, 5)], [(0.36, 5)])
+        object.__setattr__(bk, "received_mono", now - book_age)
+        return _NS(buffer=buf, book=bk,
+                   basis=_NS(age=basis_age) if basis_age is not None else None)
+
+    check("fresh data is allowed through",
+          freshness_problem(inst(), now, 5.0, 3.0, 4.0, 180.0) is None)
+    check("an old spot tick is refused by name",
+          freshness_problem(inst(spot_age=30), now, 5.0, 3.0, 4.0, 180.0) == STALE_SPOT)
+    check("an old book is refused by name",
+          freshness_problem(inst(book_age=30), now, 5.0, 3.0, 4.0, 180.0) == STALE_BOOK)
+    check("two individually fresh feeds that disagree about 'now' are refused",
+          freshness_problem(inst(spot_age=0.1, book_age=2.9), now,
+                            5.0, 3.0, 1.0, 180.0) == EXCESSIVE_TIME_SKEW,
+          "a fresh book against a fresh spot is still useless if they are "
+          "seconds apart from each other")
+    check("a stale USD reference is refused by name",
+          freshness_problem(inst(basis_age=9999), now, 5.0, 3.0, 4.0, 180.0)
+          == STALE_REFERENCE)
+    check("reference checking can be switched off",
+          freshness_problem(inst(basis_age=9999), now, 5.0, 3.0, 4.0, 0.0) is None)
+
+    # -- STALE time decay ---------------------------------------------------- #
+    # z = ln(S/K)/(sigma*sqrt(tau)), so the same moneyness is a LARGER z as tau
+    # shrinks. Carrying the anchor's z forward unscaled assumes no time passed.
+    def closing_in(seconds):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+    from kalshi import parse_market
+
+    def mkt(close_s):
+        return parse_market({
+            "ticker": "T", "event_ticker": "E", "title": "t",
+            "floor_strike": "63000.00", "open_time": "2026-08-19T00:00:00Z",
+            "close_time": closing_in(close_s), "status": "active",
+            "volume_fp": "1", "open_interest_fp": "1"})
+
+    quote = book([(0.10, 500)], [(0.88, 500)])   # yes 0.10/0.12
+    for left, label in ((900.0, "long dated"), (200.0, "mid"), (75.0, "near expiry")):
+        m = mkt(left)
+        tau = m.effective_tau()
+        spot = 62_600.0
+        old = scan_stale(m, quote, 62_540.0, 0.30, spot, 20.0, -9.0, 0.8e-4,
+                         require_implied=False, max_edge=0.0, anchor_tau=0.0)
+        new = scan_stale(m, quote, 62_540.0, 0.30, spot, 20.0, -9.0, 0.8e-4,
+                         require_implied=False, max_edge=0.0, anchor_tau=tau * 2.0)
+        if old and new:
+            drift = abs(new.fair_yes - old.fair_yes)
+            check(f"time decay shifts fair value at {label}", drift > 0.0,
+                  f"tau {tau * 2:.0f}->{tau:.0f}s moves it {drift:+.4f}")
+
+    z0 = _ND().inv_cdf(0.70)
+    check("the correction matches the closed form z0*sqrt(tau0/tau1)",
+          abs(_ND().cdf(z0 * _m.sqrt(90.0 / 30.0)) - 0.8181) < 1e-3,
+          "a 0.70 anchor at tau 90 is really 0.818 by tau 30")
+
+    # -- ENDGAME prices the settlement average, not the original strike ------ #
+    # Inside the final 60s the contract settles on a mean that is PART PRINTED.
+    # The terminal model treats all of it as still random, which is how it can
+    # read 0.99 on a contract whose average is already lost.
+    from kalshi import MIN_TWAP_COVERAGE
+    from strategies import scan_endgame
+
+    SIG = 0.4e-4          # bps/s, measured
+    STRIKE = 63_000.0
+
+    def realized_fv(left, mean, covered=None, spot=63_020.0, ref=0.0):
+        m = mkt(left)
+        cov = (m.twap_lookback - min(left, m.twap_lookback)) if covered is None else covered
+        return m.fair_value_realized(spot, SIG, (mean, cov), reference_error=ref)
+
+    check("before the averaging window opens there is nothing realized to use",
+          realized_fv(120.0, 62_990.0, covered=60.0) is None,
+          "falls back to the terminal model")
+    check("a tape that did not watch the window refuses to price it",
+          realized_fv(25.0, 62_980.0, covered=35.0 * MIN_TWAP_COVERAGE - 1.0) is None,
+          "no silent extrapolation across the unwatched part")
+    check("adequate coverage does price it",
+          realized_fv(25.0, 62_980.0, covered=35.0) is not None)
+
+    lost = realized_fv(25.0, 62_980.0)
+    terminal = mkt(25.0).fair_value(63_020.0, SIG)
+    check("an average already running against us is NOT near-certain",
+          lost is not None and lost < 0.25 and terminal > 0.95,
+          f"realized {lost:.3f} vs terminal {terminal:.3f} - the whole point")
+    check("the observed mean actually moves the answer",
+          realized_fv(25.0, 63_060.0) > realized_fv(25.0, 62_980.0) + 0.5,
+          "a moving effective strike, not a constant one")
+
+    # The moving strike amplifies any error in our reading of the realized part
+    # by e/r, so the last seconds are the LEAST trustworthy, not the most.
+    tight = realized_fv(25.0, 62_999.0, ref=0.0)
+    wide = realized_fv(25.0, 62_999.0, ref=6.0)
+    check("a disputed reference makes the realized model less certain, not more",
+          wide < tight - 0.02,
+          f"{tight:.3f} -> {wide:.3f} with $6 of venue disagreement")
+    check("and it dominates as the remaining window vanishes",
+          abs(realized_fv(3.0, 62_999.0, ref=6.0) - 0.5) < 0.15,
+          "3s out, a 19x-amplified reference error is most of what we know")
+
+    # z is reported outside clamp_prob's [0.01, 0.99] band, whose z is only
+    # 2.33: inverting the clamped probability would cap every reading below a
+    # 2.5 or 3.0 gate and disable the strategy on this path entirely.
+    z_settled = mkt(25.0).realized_z(63_060.0, SIG, (63_060.0, 35.0))
+    check("certainty is reported in sigma, not through the probability clamp",
+          z_settled is not None and z_settled > 3.0,
+          f"z {z_settled:.1f} would have been capped at 2.33 via inv_cdf(0.99)")
+
+    # Coverage must be a DENSITY. A span would read a feed that died 30s ago as
+    # full coverage (its endpoints are still far apart), which is exactly the
+    # reading that lets a dead tape pose as a known settlement average.
+    from btc_polymarket_arb import PriceBuffer as _PB
+
+    def seeded(bars):
+        buf = _PB()
+        buf._bars.clear()
+        for mono, price in bars:
+            buf._bars.append((mono, price))
+        return buf
+
+    full = seeded([(1000.0 + i, 63_000.0) for i in range(40)])
+    gapped = seeded([(1000.0 + i, 63_000.0) for i in range(10)])
+    check("coverage counts the seconds actually observed",
+          abs(full.mean_since(1000.0, 1039.0)[1] - 39.0) < 1.5,
+          f"{full.mean_since(1000.0, 1039.0)[1]:.0f}s of a 39s window")
+    check("a tape that stopped 30s ago reports the gap, not the span",
+          gapped.mean_since(1000.0, 1039.0)[1] <= 10.0,
+          f"{gapped.mean_since(1000.0, 1039.0)[1]:.0f}s - below the "
+          f"{MIN_TWAP_COVERAGE:.0%} bar, so the model declines")
+
+    # End to end: the setup where the two models disagree.
+    near = book([(0.10, 500)], [(0.03, 500)])    # YES ask 0.97
+    fires = scan_endgame(mkt(25.0), near, 63_030.0, 5.0, SIG,
+                         min_z=3.0, require_implied=False)
+    refuses = scan_endgame(mkt(25.0), near, 63_030.0, 5.0, SIG,
+                           min_z=3.0, require_implied=False,
+                           realized=(62_980.0, 35.0))
+    check("ENDGAME still fires when only the strike is known",
+          fires is not None and fires.legs[0].side == "YES",
+          "terminal model sees 4.1 sigma")
+    check("and refuses the same trade once the printed average contradicts it",
+          refuses is None,
+          "35s of the settlement mean came in below the strike")
+
+    # -- reconciliation: a timed-out POST must never be guessed at ----------- #
+    class Recon(KalshiTrader):
+        def __init__(self, history, fail_history=False):
+            super().__init__(_NS(), RiskLimits(), dry_run=False)
+            self.starting_balance = 50.0
+            self._history = history
+            self._fail = fail_history
+            self.slept = 0.0
+
+        async def _order_history(self, ticker):
+            if self._fail:
+                raise RuntimeError("gateway down")
+            return self._history
+
+        async def _post(self, path, body):
+            self._sent = body
+            raise TimeoutError("no response")
+
+    real_sleep = asyncio.sleep
+
+    async def _fast(_s):
+        return None
+
+    asyncio.sleep = _fast
+    try:
+        landed = Recon({"orders": [{"client_order_id": "WILL-BE-SET",
+                                    "order_id": "srv-1", "fill_count": "2",
+                                    "average_fill_price": "0.4000"}]})
+        # The id is generated inside place(); patch the history to match it.
+        orig_post = landed._post
+
+        async def post_and_record(path, body):
+            landed._history["orders"][0]["client_order_id"] = body["client_order_id"]
+            raise TimeoutError("no response")
+
+        landed._post = post_and_record
+        res = await landed.place("T", "YES", 0.40, 2)
+        check("an order the venue HAS is reconciled, not resent",
+              res.ok and res.count == 2,
+              "recovered from the venue's own record after a timeout")
+
+        absent = Recon({"orders": []})
+        res = await absent.place("T", "YES", 0.40, 2)
+        check("an order the venue does NOT have is a clean failure",
+              not res.ok and not absent.halted,
+              "safe to treat as never sent")
+
+        unknown = Recon({}, fail_history=True)
+        res = await unknown.place("T", "YES", 0.40, 2)
+        check("an order whose state cannot be established HALTS the session",
+              not res.ok and unknown.halted and "unknown state" in unknown.halt_reason,
+              "an untracked position is worse than a missed trade")
+        check("the halt names the order so a human can reconcile it",
+              "T" in unknown.halt_reason)
+    finally:
+        asyncio.sleep = real_sleep
+
+
+# --------------------------------------------------------------------------- #
 # Telegram control
 # --------------------------------------------------------------------------- #
 
@@ -3267,6 +3555,7 @@ async def main() -> None:
     await test_strategies()
     await test_setup_and_confirmation()
     await test_autopilot()
+    await test_accuracy_upgrades()
     await test_telegram()
     await test_take_profit()
     await test_multi_asset_and_preset()

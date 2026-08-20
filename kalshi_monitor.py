@@ -56,11 +56,57 @@ from kalshi import (
     KalshiCredentials,
     KalshiMarket,
     breakeven_fair_value,
+    fee_at_size,
     fee_per_contract,
     quantize_kalshi_price,
     net_edge,
     trading_fee,
 )
+
+
+#: Why a trade was refused on data quality alone. Named rather than boolean so
+#: a session log can be asked which failure is actually costing opportunities.
+STALE_SPOT = "STALE_SPOT"
+STALE_BOOK = "STALE_BOOK"
+BOOK_SEQUENCE_GAP = "BOOK_SEQUENCE_GAP"
+EXCESSIVE_TIME_SKEW = "EXCESSIVE_TIME_SKEW"
+STALE_REFERENCE = "STALE_REFERENCE"
+
+
+def freshness_problem(
+    inst, now_mono: float, max_spot_age: float, max_book_age: float,
+    max_skew: float, max_reference_age: float,
+) -> str | None:
+    """Is the information this decision rests on new enough to act on?
+
+    Connectivity is not freshness. A websocket can be open while its last
+    message is ten seconds old, and a REST book can be "current" in the sense
+    that it arrived without being current in the sense that matters. For a
+    strategy whose entire claim is that it sees a move before the book does,
+    acting on old data is worse than not acting: the move it is reacting to has
+    already been priced.
+
+    Returns the reason, or None when the data is good enough to trade on.
+    """
+    tick = inst.buffer.last()
+    if tick is None or now_mono - tick.mono > max_spot_age:
+        return STALE_SPOT
+
+    book = inst.book
+    if book is None or (book.received_mono and book.age > max_book_age):
+        return STALE_BOOK
+
+    # The two feeds must describe the same moment. A fresh book compared against
+    # a fresh spot is still useless if they are seconds apart from each other.
+    if book.received_mono and abs(tick.mono - book.received_mono) > max_skew:
+        return EXCESSIVE_TIME_SKEW
+
+    basis = inst.basis
+    if basis is not None and max_reference_age > 0.0:
+        age = basis.age
+        if age is not None and age > max_reference_age:
+            return STALE_REFERENCE
+    return None
 
 
 class _ExitStub:
@@ -90,7 +136,9 @@ class Instrument:
         self.stream = None
         self.market: KalshiMarket | None = None
         self.book: KalshiBook | None = None
-        self.anchors: deque[tuple[float, float, float]] = deque(maxlen=600)
+        #: (monotonic, spot, market mid, effective tau) - tau is needed because
+        #: the anchor's probability was measured with more time on the clock.
+        self.anchors: deque[tuple[float, float, float, float]] = deque(maxlen=600)
         # Per-instrument diagnostics, so the summary can say which underlying
         # the numbers came from rather than blending two different markets.
         self.observations = 0
@@ -107,6 +155,9 @@ class Instrument:
         self.signal_by_market: dict[str, int] = {}
         self.last_eval_mono = 0.0
         self.edge_seconds = 0.0
+        #: Data-quality refusals by reason, so the summary can say which feed
+        #: problem is actually costing trades.
+        self.stale_rejections: dict[str, int] = {}
 
     @property
     def name(self) -> str:
@@ -331,6 +382,15 @@ class Monitor:
         if not inst.buffer.vol_is_measured:
             inst.fallback_vol_obs += 1
 
+        stale = freshness_problem(
+            inst, now_mono,
+            self._args.max_spot_age, self._args.max_book_age,
+            self._args.max_feed_skew, self._args.max_reference_age,
+        )
+        if stale is not None:
+            inst.stale_rejections[stale] = inst.stale_rejections.get(stale, 0) + 1
+            return
+
         # The one number that decides whether any of this is real. See
         # strategies.vol_agreement.
         sigma_implied = implied_sigma(market, book, tick.price)
@@ -345,13 +405,19 @@ class Monitor:
         if not vol_ok and not self._args.allow_unvalidated_vol:
             inst.vol_gated_obs += 1
 
-        fair = market.fair_value(tick.price, sigma)
+        fair = market.fair_value(
+            tick.price, sigma,
+            realized=self._realized_twap(inst, market, now_mono),
+            reference_error=self._reference_error(inst),
+        )
         best_this_pass = -1.0
 
         # Keep a rolling (time, spot, market mid) anchor for the STALE model.
         mid = book.yes_mid
         if mid is not None:
-            inst.anchors.append((now_mono, tick.price, mid))
+            inst.anchors.append(
+                (now_mono, tick.price, mid, market.effective_tau())
+            )
         self._run_strategies(inst, market, book, tick.price, sigma, now_mono, vol_ok)
 
         if fair is None:
@@ -478,6 +544,14 @@ class Monitor:
             f"   observations  : {inst.observations:,}",
             f"   signals       : {inst.signals}",
         ]
+        if inst.stale_rejections:
+            total = sum(inst.stale_rejections.values())
+            lines.append(
+                f"   data refusals : {total:,} ("
+                + ", ".join(f"{k} {v:,}" for k, v in
+                            sorted(inst.stale_rejections.items(), key=lambda kv: -kv[1]))
+                + ")"
+            )
         if inst.no_strike_obs:
             lines.append(
                 f"   no-strike     : {inst.no_strike_obs:,} passes skipped while "
@@ -609,9 +683,9 @@ class Monitor:
             # our spot at the same moment, so only the CHANGE is used.
             cutoff = now_mono - args.anchor_age
             anchor = None
-            for ts, price, mid in inst.anchors:
+            for ts, price, mid, atau in inst.anchors:
                 if ts <= cutoff:
-                    anchor = (price, mid)
+                    anchor = (price, mid, atau)
                 else:
                     break
             if anchor:
@@ -626,6 +700,7 @@ class Monitor:
                         0.0 if args.allow_unvalidated_vol else args.vol_ratio_max
                     ),
                     max_edge=args.max_edge,
+                    anchor_tau=anchor[2],
                 )
                 if sig:
                     found.append(sig)
@@ -638,12 +713,43 @@ class Monitor:
                 max_seconds_left=args.endgame_window,
                 min_z=args.endgame_z,
                 require_implied=not args.allow_unvalidated_vol,
+                realized=self._realized_twap(inst, market, now_mono),
+                reference_error=self._reference_error(inst),
             )
             if sig:
                 found.append(sig)
 
         for sig in found:
             self._emit(sig, inst)
+
+    def _realized_twap(self, inst, market, now_mono: float):
+        """What our tape has printed since this contract's averaging window opened.
+
+        Returns None outside the window, or whenever the buffer cannot speak for
+        it - the model then falls back to the terminal one on its own.
+        """
+        remaining = market.seconds_remaining()
+        lookback = market.twap_lookback
+        if lookback <= 0.0 or remaining >= lookback:
+            return None  # window has not opened yet
+        # The window opened `lookback - remaining` seconds ago in wall time,
+        # which is the same number of seconds ago on the monotonic clock the
+        # buffer is indexed by.
+        opened_mono = now_mono - (lookback - max(remaining, 0.0))
+        return inst.buffer.mean_since(opened_mono, now_mono)
+
+    def _reference_error(self, inst) -> float:
+        """1-sigma dollars our USD composite may sit away from the settlement index.
+
+        Half the observed cross-venue range is a crude proxy, but it is a
+        MEASURED one that widens exactly when the venues stop agreeing, which is
+        when our reference deserves less trust. With no composite yet we pass 0
+        rather than inventing a number - the caller is already gated on the
+        reference being fresh.
+        """
+        basis = getattr(inst, "basis", None)
+        dispersion = getattr(basis, "dispersion", 0.0) or 0.0
+        return max(dispersion, 0.0) / 2.0
 
     def _conflicts(self, sig) -> str | None:
         """Reject a signal that opposes a position we have already taken here.
@@ -700,15 +806,54 @@ class Monitor:
         if limit < leg.price:
             # Even the quoted ask no longer clears the bar.
             return None
-        market = next(
-            (i.market for i in self.instruments
+        inst = next(
+            (i for i in self.instruments
              if i.market is not None and i.market.ticker == sig.ticker),
             None,
         )
+        market = inst.market if inst is not None else None
         ranges = market.price_ranges if market is not None else ()
         # Round DOWN: rounding a buy up could push us past the ceiling.
         snapped = quantize_kalshi_price(limit, ranges, buy=False)
         return snapped if snapped >= leg.price else leg.price
+
+    def executable_size(self, sig, leg, fair_leg: float, wanted: int) -> int:
+        """Largest quantity whose VWAP still clears the edge, given real depth.
+
+        Top-of-book is what a 1-lot pays. A book offering
+
+            2 @ 0.63   1 @ 0.64   20 @ 0.67
+
+        fills 20 contracts at a 0.667 average, not 0.63 - and an edge computed
+        against 0.63 can be entirely spent walking the ladder. Shrinking the
+        order until its own average price still clears `--min-fill-edge` keeps
+        the trade honest instead of quietly turning a good signal into a bad
+        fill. Never increases size beyond what risk already allowed.
+        """
+        inst = next(
+            (i for i in self.instruments
+             if i.market is not None and i.market.ticker == sig.ticker),
+            None,
+        )
+        book = inst.book if inst is not None else None
+        if book is None or not (book.yes_levels or book.no_levels):
+            return wanted  # no depth visible; nothing to refine
+        for count in range(wanted, 0, -1):
+            quote = book.cost_for(leg.side, count)
+            if quote is None:
+                continue
+            vwap, available = quote
+            if available < count - 1e-9:
+                continue
+            if fair_leg - vwap - fee_at_size(vwap, count) >= self._args.min_fill_edge:
+                if count < wanted:
+                    log.info(
+                        " execution: [%s] %s trimmed %d -> %d contracts; depth "
+                        "puts the average at %.4f, not %.4f",
+                        sig.strategy, sig.ticker, wanted, count, vwap, leg.price,
+                    )
+                return count
+        return 0
 
     def _record_execution(self, sig, outcome: str, **kw) -> None:
         """Write the companion execution row, so nothing downstream can read a
@@ -766,18 +911,35 @@ class Monitor:
             # A gap longer than the window means the edge closed and reopened;
             # that is a new candidate, not a continuation of the old one.
             if cand is None or now - cand["last"] > max(need_s, 2.0):
-                self._candidates[ckey] = {"first": now, "last": now, "passes": 1}
+                self._candidates[ckey] = {
+                    "first": now, "last": now, "passes": 1,
+                    "version": getattr(sig, "book_version", None),
+                }
                 log.info(
                     "candidate [%s] %s: confirming over %.1fs (%d passes)...",
                     sig.strategy, sig.ticker, need_s, need_n,
                 )
                 return
             cand["last"] = now
-            cand["passes"] += 1
+            # A confirmation must require NEW market information. The evaluator
+            # runs every --eval-interval (0.1s) while the book refreshes every
+            # --book-interval (0.4s), so counting passes counted the SAME
+            # snapshot up to four times - a live log read "confirmed over 1.0s /
+            # 11 passes" on roughly two distinct books. Versions make the
+            # requirement honest: three confirmations means three books.
+            version = getattr(sig, "book_version", None)
+            if version is not None and version != cand.get("version"):
+                cand["version"] = version
+                cand["passes"] += 1
+            elif version is None:
+                cand["passes"] += 1  # no version available; fall back to passes
             if now - cand["first"] < need_s or cand["passes"] < need_n:
                 return
             held = now - cand["first"]
-            sig.note = f"{sig.note} | confirmed over {held:.1f}s / {cand['passes']} passes"
+            sig.note = (
+                f"{sig.note} | confirmed over {held:.1f}s / "
+                f"{cand['passes']} distinct books"
+            )
 
         ckey_conflict = (sig.strategy, sig.ticker,
                          tuple(leg.side for leg in sig.legs))
@@ -895,6 +1057,16 @@ class Monitor:
                                 detail=f"no legal size at {limit:.4f}",
                             )
                             continue
+                        # Risk says how much we MAY buy; depth says how much is
+                        # still worth buying. Take the smaller.
+                        count = self.executable_size(sig, leg, fair_leg, count)
+                        if count < 1:
+                            self._record_execution(
+                                sig, "skipped",
+                                detail="no size clears the edge once depth is walked",
+                            )
+                            self._funnel["unpriceable"] += 1
+                            continue
                         self._funnel["attempted"] += 1
                         result = await trader.place(
                             sig.ticker, leg.side, limit, count,
@@ -988,7 +1160,11 @@ class Monitor:
             log.info("hb | [%s] no live %s market", inst.name, inst.series)
             return
         sigma = inst.buffer.sigma_per_sqrt_second()
-        fair = market.fair_value(tick.price, sigma) if tick else None
+        fair = market.fair_value(
+            tick.price, sigma,
+            realized=self._realized_twap(inst, market, time.monotonic()),
+            reference_error=self._reference_error(inst),
+        ) if tick else None
         implied = implied_sigma(market, book, tick.price) if tick and book else None
         ratio = vol_agreement(sigma, implied)
         log.info(
@@ -1209,6 +1385,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "ask we saw fills only if the book stood still. A whole "
                         "session filled zero strategy orders that way. The limit "
                         "never exceeds the price that still clears --min-edge.")
+    p.add_argument("--max-spot-age", type=float, default=5.0,
+                   help="refuse to trade on a spot tick older than this (seconds)")
+    p.add_argument("--max-book-age", type=float, default=3.0,
+                   help="refuse to trade on a Kalshi book older than this")
+    p.add_argument("--max-feed-skew", type=float, default=4.0,
+                   help="refuse when the spot tick and the book describe moments "
+                        "further apart than this. Two individually fresh feeds "
+                        "can still be useless if they disagree about when 'now' is.")
+    p.add_argument("--max-reference-age", type=float, default=180.0,
+                   help="refuse when the USD composite basis has not updated in "
+                        "this long; 0 disables")
     p.add_argument("--max-edge", type=float, default=0.35,
                    help="refuse any signal claiming more than this net edge per "
                         "contract. An edge this large on a liquid book is a model "

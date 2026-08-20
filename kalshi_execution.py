@@ -457,6 +457,46 @@ class KalshiTrader:
         self.side_mapping_verified = True
         return True
 
+    async def _order_history(self, ticker: str) -> dict:
+        """GET the account's orders for one market.
+
+        Deliberately here rather than on KalshiClient. That module is provably
+        read-only - the suite refuses any method whose NAME suggests order
+        handling, not just any that can write - and reconciliation is an
+        execution concern that belongs beside the code that can spend money.
+        """
+        return await self._client._get(
+            "/portfolio/orders", {"ticker": ticker, "limit": 50}, signed=True
+        )
+
+    async def _reconcile(self, client_order_id: str, ticker: str, exc: Exception):
+        """What became of an order whose POST did not return cleanly?
+
+        Three outcomes, and conflating them is how ghost positions happen:
+
+            "found"    the venue has it - use its record, do not resend
+            "absent"   the venue does not have it - safe to treat as failed
+            "unknown"  we could not find out - halt rather than guess
+
+        Only a definitely-absent order may be retried. "Unknown" deliberately
+        stops the session: an untracked position is worse than a missed trade,
+        and it cannot be detected later by any of our own bookkeeping.
+        """
+        for attempt, delay in enumerate((0.5, 1.5, 3.0), start=1):
+            await asyncio.sleep(delay)
+            try:
+                payload = await self._order_history(ticker)
+            except Exception as probe:  # noqa: BLE001
+                log.warning("Reconcile attempt %d failed: %s", attempt, probe)
+                continue
+            rows = (payload or {}).get("orders") or []
+            for row in rows:
+                if str(row.get("client_order_id") or "") == client_order_id:
+                    return "found", {"order": row}
+            # The endpoint answered and our id is not in it: it never landed.
+            return "absent", {}
+        return "unknown", {}
+
     async def _balance_or_none(self) -> float | None:
         """Account balance in dollars, or None if it cannot be read."""
         try:
@@ -595,11 +635,35 @@ class KalshiTrader:
             try:
                 response = await self._post(ORDERS_PATH, body)
             except Exception as exc:  # noqa: BLE001
-                result.error = f"{type(exc).__name__}: {exc}"
-                log.error("Order failed (%s %s x%d): %s", outcome, ticker, count, exc)
-                self.consecutive_losses += 1
-                self.check_halt()
-                return result
+                # A POST that fails may still have reached Kalshi. Never assume
+                # either way: ask the venue what became of this client_order_id
+                # before deciding, or the account can silently hold a position
+                # our books know nothing about.
+                verdict, response = await self._reconcile(
+                    body["client_order_id"], ticker, exc
+                )
+                if verdict == "absent":
+                    result.error = f"{type(exc).__name__}: {exc}"
+                    log.error("Order failed and is absent at the venue (%s %s x%d): %s",
+                              outcome, ticker, count, exc)
+                    return result
+                if verdict == "unknown":
+                    # The dangerous case: we cannot prove it did not land, so we
+                    # must not retry and must not pretend it filled. Halt and
+                    # let a human reconcile rather than trade blind.
+                    self.halted = True
+                    self.halt_reason = (
+                        f"order {body['client_order_id'][:8]} on {ticker} has "
+                        f"unknown state after {type(exc).__name__}; the account "
+                        f"may hold an untracked position"
+                    )
+                    result.error = self.halt_reason
+                    log.error("TRADING HALTED: %s", self.halt_reason)
+                    return result
+                log.warning(
+                    "Order POST failed (%s) but the venue HAS the order; "
+                    "reconciled from its own record", type(exc).__name__,
+                )
 
             order = (response or {}).get("order") or response or {}
             result.order_id = str(order.get("order_id") or "") or None

@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import NormalDist
 
-from kalshi import KalshiBook, KalshiMarket, fee_per_contract, trading_fee
+from kalshi import KalshiBook, KalshiMarket, fee_at_size, fee_per_contract, trading_fee
 
 _N = NormalDist()
 
@@ -70,6 +70,10 @@ class Signal:
     strike: float
     seconds_left: float
     sigma_used: float
+    #: Which book snapshot produced this signal. The confirmation gate counts
+    #: DISTINCT books rather than evaluation passes, so an unchanged snapshot
+    #: cannot confirm itself repeatedly.
+    book_version: int | None = None
     note: str = ""
     ts: float = field(default_factory=time.time)
 
@@ -180,6 +184,7 @@ def scan_cross(
     return Signal(
         strategy="CROSS",
         ticker=market.ticker,
+        book_version=book.version,
         legs=[Leg("YES", book.yes_ask, size), Leg("NO", book.no_ask, size)],
         fair_yes=book.yes_mid or 0.5,
         expected_net=profit,
@@ -210,6 +215,7 @@ def scan_stale(
     min_move_bps: float = 8.0,
     max_vol_ratio: float = 0.0,
     max_edge: float = 0.35,
+    anchor_tau: float = 0.0,
 ) -> Signal | None:
     """Trade the repricing a spot move implies, not the level.
 
@@ -270,7 +276,21 @@ def scan_stale(
     if denom <= 0:
         return None
 
+    # The anchor's probability was measured when the contract had MORE time
+    # left, and z is ln(S/K)/(sigma*sqrt(tau)) - so the same moneyness is a
+    # larger z as tau shrinks. Carrying z0 forward unscaled silently assumes
+    # time has not passed, which understates how decided the outcome has
+    # become. The error is small early and large late:
+    #
+    #   tau 800 -> 780 : a 0.70 anchor is really 0.702   (+0.2 points)
+    #   tau 200 -> 150 : a 0.70 anchor is really 0.728   (+2.8 points)
+    #   tau  90 ->  30 : a 0.70 anchor is really 0.818  (+11.8 points)
+    #
+    # Correct transform, from z = ln(S/K)/(sigma*sqrt(tau)):
+    #     z1 = z0*sqrt(tau0/tau1) + delta/(sigma*sqrt(tau1))
     z0 = _N.inv_cdf(_clamp(anchor_mid))
+    if anchor_tau > 0.0 and tau > 0.0:
+        z0 *= math.sqrt(anchor_tau / tau)
     fair_yes = _clamp(_N.cdf(z0 + delta / denom))
 
     if delta > 0:
@@ -280,7 +300,9 @@ def scan_stale(
     if ask is None or not (0.0 < ask < 1.0):
         return None
 
-    edge = fair_side - ask - fee_per_contract(ask)
+    # Size-aware: Kalshi rounds the fee up on the whole order, so the marginal
+    # rate understates what a small order is actually charged.
+    edge = fair_side - ask - fee_at_size(ask, size)
     if edge < min_edge:
         return None
     # An edge this large on a liquid book is a model error, not an opportunity.
@@ -293,6 +315,7 @@ def scan_stale(
     return Signal(
         strategy="STALE",
         ticker=market.ticker,
+        book_version=book.version,
         legs=[Leg(side, ask, size)],
         fair_yes=fair_yes,
         expected_net=edge * size,
@@ -304,6 +327,7 @@ def scan_stale(
         note=(
             f"spot {delta * 1e4:+.1f} bps vs anchor, market mid was {anchor_mid:.3f}, "
             f"implied sigma {sigma * 1e4:.2f} bps/s"
+            + (f", tau {anchor_tau:.0f}->{tau:.0f}s" if anchor_tau > 0.0 else "")
         ),
     )
 
@@ -324,6 +348,8 @@ def scan_endgame(
     min_edge: float = 0.005,
     max_price: float = 0.99,
     require_implied: bool = True,
+    realized: tuple[float, float] | None = None,
+    reference_error: float = 0.0,
 ) -> Signal | None:
     """Late in the window, buy the side that is nearly decided.
 
@@ -371,15 +397,31 @@ def scan_endgame(
     # invent an edge - it can only refuse one.
     sigma_used = max(sigma, implied) if implied is not None else sigma
 
-    tau = market.effective_tau()
-    denom = sigma_used * math.sqrt(tau)
-    if denom <= 0:
-        return None
-    z = math.log(spot / market.strike) / denom
+    # Once the settlement window has opened, price against the part of the
+    # average that has already printed rather than against the original strike.
+    # This is where ENDGAME lives by definition, and it is the regime where the
+    # terminal model is furthest from the truth: it can read 0.99 on a contract
+    # whose settlement average is already lost. Returns None when the tape
+    # cannot support it, which drops us back to the terminal model below.
+    settled_z = market.realized_z(
+        spot, sigma_used, realized, reference_error=reference_error
+    ) if realized is not None else None
+
+    if settled_z is not None:
+        # `min_z` keeps meaning "this is nearly decided" on both paths: the
+        # realized model reports its certainty in the same sigma units.
+        z = settled_z
+        fair_yes = _clamp(_N.cdf(z))
+    else:
+        tau = market.effective_tau()
+        denom = sigma_used * math.sqrt(tau)
+        if denom <= 0:
+            return None
+        z = math.log(spot / market.strike) / denom
+        fair_yes = _clamp(_N.cdf(z))
     if abs(z) < min_z:
         return None
 
-    fair_yes = _clamp(_N.cdf(z))
     if z > 0:
         side, ask, fair_side = "YES", book.yes_ask, fair_yes
     else:
@@ -387,13 +429,14 @@ def scan_endgame(
     if ask is None or not (0.0 < ask <= max_price):
         return None
 
-    edge = fair_side - ask - fee_per_contract(ask)
+    edge = fair_side - ask - fee_at_size(ask, size)
     if edge < min_edge:
         return None
 
     return Signal(
         strategy="ENDGAME",
         ticker=market.ticker,
+        book_version=book.version,
         legs=[Leg(side, ask, size)],
         fair_yes=fair_yes,
         expected_net=edge * size,
@@ -403,7 +446,10 @@ def scan_endgame(
         seconds_left=left,
         sigma_used=sigma_used,
         note=(
-            f"{abs(z):.1f} sigma from the strike with {left:.0f}s left "
+            f"{abs(z):.1f} sigma from the "
+            + ("moving strike (settlement average part-printed)"
+               if settled_z is not None else "strike")
+            + f" with {left:.0f}s left "
             f"(sigma {sigma_used * 1e4:.2f} bps/s"
             + (f", ours {sigma * 1e4:.2f}, market {implied * 1e4:.2f}"
                if implied is not None else "")
