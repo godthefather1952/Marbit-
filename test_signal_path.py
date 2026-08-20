@@ -3092,6 +3092,189 @@ async def test_multi_asset_and_preset() -> None:
 # --------------------------------------------------------------------------- #
 
 
+async def test_book_stream() -> None:
+    print("\n--- kalshi websocket order book ---")
+
+    import contextlib
+    import inspect as _insp
+
+    import kalshi as kx
+    from kalshi import KalshiBookStream
+
+    sent: list[dict] = []
+    pushed: list[tuple[str, object]] = []
+    resets: list[int] = []
+
+    class FakeWS:
+        """Enough of a websocket to drive the stream deterministically."""
+
+        def __init__(self, script):
+            self._script = list(script)
+            self.closed = False
+
+        async def send(self, raw):
+            sent.append(json.loads(raw))
+
+        async def recv(self):
+            if not self._script:
+                raise asyncio.CancelledError
+            item = self._script.pop(0)
+            if item is None:
+                raise asyncio.TimeoutError
+            return json.dumps(item)
+
+        async def close(self):
+            self.closed = True
+
+    def snap(seq, ticker="T", yes=(("0.40", "100"),), no=(("0.55", "200"),)):
+        return {"type": "orderbook_snapshot", "sid": 1, "seq": seq,
+                "msg": {"market_ticker": ticker, "market_id": "u",
+                        "yes_dollars_fp": [list(x) for x in yes],
+                        "no_dollars_fp": [list(x) for x in no]}}
+
+    def delta(seq, price, amount, side, ticker="T"):
+        return {"type": "orderbook_delta", "sid": 1, "seq": seq,
+                "msg": {"market_ticker": ticker, "market_id": "u",
+                        "price_dollars": price, "delta_fp": amount, "side": side}}
+
+    def stream(script, tickers=("T",)):
+        s = KalshiBookStream(
+            signer=None, tickers=tickers,
+            on_book=lambda t, b: pushed.append((t, b)),
+            on_reset=lambda: resets.append(1),
+        )
+        return s, FakeWS(script)
+
+    # -- a snapshot builds the book, resolving Kalshi's two-bid convention --- #
+    s, ws = stream([snap(1)])
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    book = s.book("T")
+    check("a snapshot builds a book",
+          book is not None and book.yes_bid == 0.40 and book.no_bid == 0.55,
+          f"yes_bid {book.yes_bid} no_bid {book.no_bid}")
+    check("and the YES ask is the complement of the best NO bid, not a yes level",
+          abs(book.yes_ask - 0.45) < 1e-9,
+          f"yes_ask {book.yes_ask} = 1 - {book.no_bid}")
+    check("the subscription names the channel and the markets",
+          sent and sent[0]["cmd"] == "subscribe"
+          and sent[0]["params"]["channels"] == ["orderbook_delta"]
+          and sent[0]["params"]["market_tickers"] == ["T"],
+          f"{sent[0] if sent else None}")
+
+    # -- deltas patch levels, including removal ------------------------------ #
+    s, ws = stream([snap(1), delta(2, "0.41", "50", "yes"),
+                    delta(3, "0.40", "-100", "yes")])
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    book = s.book("T")
+    check("a delta adds a level and moves the top of book",
+          book.yes_bid == 0.41, f"yes_bid {book.yes_bid}")
+    check("a delta that empties a level removes it",
+          all(p != 0.40 for p, _ in book.yes_levels),
+          f"levels {book.yes_levels}")
+    check("every applied change publishes a book",
+          len(pushed) >= 3, f"{len(pushed)} pushes")
+
+    # -- a missed sequence number is the dangerous case ---------------------- #
+    sent.clear()
+    resets.clear()
+    s, ws = stream([snap(1), delta(2, "0.41", "50", "yes"),
+                    delta(9, "0.99", "500", "yes")])   # 3..8 missed
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("a sequence gap is counted, not absorbed", s.gaps == 1, f"gaps {s.gaps}")
+    check("the local book is DISCARDED rather than patched from a gap",
+          s.book("T") is None,
+          "a book built on a missed delta is wrong in a way no age check sees")
+    check("and a fresh snapshot is requested without resubscribing",
+          any(m["cmd"] == "update_subscription"
+              and m["params"]["action"] == "get_snapshot" for m in sent),
+          f"{[m['cmd'] for m in sent]}")
+    check("holders of the old book are told it is no longer maintained",
+          resets, "on_reset fired")
+
+    # The delta that arrived after the gap must not be applied: it is exactly
+    # the message we cannot place relative to the snapshot on its way.
+    check("the post-gap delta is dropped, not applied to an empty book",
+          s.book("T") is None and s.deltas == 1,
+          f"{s.deltas} deltas applied (only the pre-gap one)")
+
+    # -- a gapping stream must be rebuilt, not endlessly resnapshotted ------- #
+    # Note the shape: every gap is followed by an in-sequence snapshot, so a
+    # CONSECUTIVE-gap counter would reset each time and never fire. The rate is
+    # the thing that says the socket is broken.
+    s, ws = stream([snap(1), delta(5, "0.41", "1", "yes"), snap(6),
+                    delta(20, "0.41", "1", "yes"), snap(21),
+                    delta(40, "0.41", "1", "yes")])
+    raised = None
+    try:
+        await s._read_until_closed(ws)
+    except ConnectionError as exc:
+        raised = exc
+    except asyncio.CancelledError:
+        pass
+    check("gaps arriving faster than the window force a reconnect",
+          raised is not None and s.gaps == 3, f"{raised} after {s.gaps} gaps")
+
+    # -- a delta with no snapshot cannot be applied -------------------------- #
+    s, ws = stream([delta(1, "0.41", "50", "yes")])
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("a delta for a market we have no snapshot for is ignored",
+          s.book("T") is None and s.deltas == 0,
+          "guessing a base book would invent depth nobody quoted")
+
+    # -- subscription changes when the tracked contract rolls ---------------- #
+    # A 15-minute contract expires roughly every 15 minutes, so this path runs
+    # on every roll for the whole session.
+    sent.clear()
+    s, ws = stream([snap(1)], tickers=("T",))
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("the first sync is a plain subscribe", sent[0]["cmd"] == "subscribe")
+
+    s.track("T", "U")
+    await s._sync_subscription(ws)
+    check("adding a market updates the subscription in place",
+          sent[-1]["cmd"] == "update_subscription"
+          and sent[-1]["params"]["action"] == "add_markets"
+          and sent[-1]["params"]["market_tickers"] == ["U"],
+          f"{sent[-1]}")
+    check("and the existing book survives the change",
+          s.book("T") is not None, "no needless resubscribe")
+
+    s.track("U")
+    check("dropping a market drops its book immediately",
+          s.book("T") is None,
+          "an untracked contract must not be readable back out of the stream")
+    await s._sync_subscription(ws)
+    check("and tells the venue to stop sending it",
+          sent[-1]["params"]["action"] == "delete_markets"
+          and sent[-1]["params"]["market_tickers"] == ["T"],
+          f"{sent[-1]}")
+
+    # -- identity: version is content, seq is continuity --------------------- #
+    s, ws = stream([snap(1), snap(2)])
+    versions = []
+    s._on_book = lambda t, b: versions.append((b.version, b.seq))
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("an identical book keeps its version even as seq advances",
+          len(versions) == 2 and versions[0][0] == versions[1][0]
+          and versions[0][1] != versions[1][1],
+          f"{versions}")
+
+    # -- still no order surface --------------------------------------------- #
+    src = _insp.getsource(kx)
+    check("the module still issues no POST/PUT/DELETE",
+          sum(src.count(f".{v}(") for v in ("post", "put", "delete")) == 0)
+    cmds = {m["cmd"] for m in sent}
+    check("the stream sends market-data commands only",
+          cmds <= {"subscribe", "update_subscription", "unsubscribe"},
+          f"{sorted(cmds)}")
+
+
 async def test_accuracy_upgrades() -> None:
     print("\n--- accuracy: fees, freshness, depth, decay, reconciliation ---")
 
@@ -3173,6 +3356,18 @@ async def test_accuracy_upgrades() -> None:
           == STALE_REFERENCE)
     check("reference checking can be switched off",
           freshness_problem(inst(basis_age=9999), now, 5.0, 3.0, 4.0, 0.0) is None)
+
+    # An orphaned book is the failure an age check cannot see: the stream
+    # stopped maintaining it, but it still carries a recent timestamp.
+    orphan = inst(book_age=0.1)
+    orphan.book_gap_mono = now      # the gap happened after that book arrived
+    check("a book the stream stopped maintaining is refused by name",
+          freshness_problem(orphan, now, 5.0, 3.0, 4.0, 180.0) == BOOK_SEQUENCE_GAP,
+          "recent timestamp, no longer true")
+    replaced = inst(book_age=0.1)
+    replaced.book_gap_mono = now - 60.0   # a REST poll has since replaced it
+    check("and a book fetched after the gap is fine again",
+          freshness_problem(replaced, now, 5.0, 3.0, 4.0, 180.0) is None)
 
     # -- STALE time decay ---------------------------------------------------- #
     # z = ln(S/K)/(sigma*sqrt(tau)), so the same moneyness is a LARGER z as tau
@@ -3555,6 +3750,7 @@ async def main() -> None:
     await test_strategies()
     await test_setup_and_confirmation()
     await test_autopilot()
+    await test_book_stream()
     await test_accuracy_upgrades()
     await test_telegram()
     await test_take_profit()

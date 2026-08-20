@@ -51,7 +51,9 @@ from kalshi import (
     CompositeBasis,
     asset_for,
     usd_spot_rest,
+    KalshiAuthError,
     KalshiBook,
+    KalshiBookStream,
     KalshiClient,
     KalshiCredentials,
     KalshiMarket,
@@ -95,6 +97,15 @@ def freshness_problem(
     book = inst.book
     if book is None or (book.received_mono and book.age > max_book_age):
         return STALE_BOOK
+
+    # A book the stream has stopped maintaining - because a sequence number was
+    # missed, or the socket dropped - is not stale, it is ORPHANED. It carries a
+    # recent timestamp and will pass every age check while describing a market
+    # that has moved on, which is the one failure mode a freshness test cannot
+    # otherwise see.
+    gap_mono = getattr(inst, "book_gap_mono", 0.0)
+    if gap_mono and book.received_mono and book.received_mono <= gap_mono:
+        return BOOK_SEQUENCE_GAP
 
     # The two feeds must describe the same moment. A fresh book compared against
     # a fresh spot is still useless if they are seconds apart from each other.
@@ -158,6 +169,20 @@ class Instrument:
         #: Data-quality refusals by reason, so the summary can say which feed
         #: problem is actually costing trades.
         self.stale_rejections: dict[str, int] = {}
+        #: Which path last supplied the book, and how often each did. A run that
+        #: silently fell back to REST polling all session looks identical in the
+        #: log to one on a healthy stream unless this is counted.
+        self.book_source = "none"
+        self.ws_books = 0
+        self.rest_books = 0
+        #: Times the REST resync disagreed with the streamed top of book. A few
+        #: are normal (the two reads are seconds apart); a mismatch on nearly
+        #: every resync means our delta application is wrong.
+        self.book_mismatches = 0
+        self.book_resyncs = 0
+        #: When the stream last discarded its books. Anything we are still
+        #: holding from before this moment is orphaned, not merely old.
+        self.book_gap_mono = 0.0
 
     @property
     def name(self) -> str:
@@ -208,6 +233,9 @@ class Monitor:
             "sighted": 0, "confirmed": 0, "conflicted": 0,
             "attempted": 0, "filled": 0, "unpriceable": 0,
         }
+        #: Websocket order book, when the session can sign for one. None means
+        #: every book in this run came from REST polling.
+        self._book_stream: KalshiBookStream | None = None
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -248,6 +276,8 @@ class Monitor:
                     basis=inst.basis,
                 )
 
+            self._book_stream = self._make_book_stream(client)
+
             try:
                 status = await client.exchange_status()
                 log.info(
@@ -276,6 +306,10 @@ class Monitor:
                 asyncio.create_task(self._execution_loop(), name="execution"),
                 asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
             ]
+            if self._book_stream is not None:
+                tasks.append(asyncio.create_task(
+                    self._book_stream.run(), name="book-stream"
+                ))
             for inst in self.instruments:
                 tasks += [
                     asyncio.create_task(inst.stream.run(), name=f"spot-{inst.name}"),
@@ -336,17 +370,133 @@ class Monitor:
                 log.warning("[%s] Discovery failed: %s", inst.name, exc)
             await asyncio.sleep(self._args.discovery_interval)
 
+    def _make_book_stream(self, client: KalshiClient) -> KalshiBookStream | None:
+        """The websocket book, when we can sign for it.
+
+        Kalshi authenticates the socket itself even for market data, so a paper
+        run with no keys configured simply does not get one and keeps polling.
+        Signing costs nothing and sends nothing on its own, so a DRY run WITH
+        keys gets the same book quality as a live one - otherwise every measured
+        result on paper would come from a slower book than the one that will be
+        traded against, which is the wrong direction for a dry run to be wrong.
+        """
+        if self._args.no_book_stream:
+            return None
+        try:
+            if not client.authenticated:
+                client.authenticate()
+            signer = client.signer
+            if signer is None:
+                raise KalshiAuthError("no signer available")
+            return KalshiBookStream(
+                signer,
+                on_book=self._on_stream_book,
+                on_reset=self._on_stream_reset,
+            )
+        except Exception as exc:  # noqa: BLE001 - REST still works
+            log.info(
+                "Book stream unavailable (%s); polling the book over REST", exc
+            )
+            return None
+
+    def _on_stream_book(self, ticker: str, book: KalshiBook) -> None:
+        """Push a streamed book straight onto its instrument.
+
+        Deliberately not routed through the poll loop: the whole point of the
+        stream is that the book reaches the evaluator when the venue changes
+        it, not when our timer next fires.
+        """
+        for inst in self.instruments:
+            if inst.market is not None and inst.market.ticker == ticker:
+                inst.book = book
+                inst.book_source = "ws"
+                inst.ws_books += 1
+                return
+
+    def _on_stream_reset(self) -> None:
+        """The stream dropped its books; ours are orphaned from this moment on.
+
+        We do not clear `inst.book` here. The REST loop will replace it within a
+        poll, and a None book and an orphaned book are different problems worth
+        telling apart in the refusal counters.
+        """
+        now = time.monotonic()
+        for inst in self.instruments:
+            if inst.book_source == "ws":
+                inst.book_gap_mono = now
+
     async def _book_loop(self, client: KalshiClient, inst: Instrument) -> None:
+        """REST book: bootstrap, fallback, and periodic resync.
+
+        The stream owns the fast path. This loop exists so that (a) there is a
+        book before the first snapshot arrives, (b) a dropped stream degrades to
+        the old behaviour instead of trading on nothing, and (c) the streamed
+        book gets checked against the venue's own view often enough that a bug
+        in delta application shows up as a logged mismatch rather than as a
+        series of confusing fills.
+        """
+        last_resync = 0.0
         while True:
             market = inst.market
             if market is not None:
-                try:
-                    inst.book = await client.book(market.ticker)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("[%s] Book fetch failed: %s", inst.name, exc)
+                stream = self._book_stream
+                if stream is not None:
+                    stream.track(*[
+                        i.market.ticker for i in self.instruments
+                        if i.market is not None
+                    ])
+                streamed = stream.book(market.ticker) if stream else None
+                fresh = (
+                    streamed is not None
+                    and (streamed.age or 0.0) <= self._args.max_book_age
+                )
+                now = time.monotonic()
+                due = now - last_resync >= self._args.book_resync
+                if not fresh or due:
+                    try:
+                        rest = await client.book(market.ticker)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("[%s] Book fetch failed: %s", inst.name, exc)
+                    else:
+                        if fresh and due:
+                            last_resync = now
+                            inst.book_resyncs += 1
+                            self._check_resync(inst, streamed, rest)
+                        else:
+                            inst.book = rest
+                            inst.book_source = "rest"
+                            inst.rest_books += 1
             await asyncio.sleep(self._args.book_interval)
+
+    def _check_resync(
+        self, inst: Instrument, streamed: KalshiBook, rest: KalshiBook
+    ) -> None:
+        """Compare the streamed top of book against the venue's own REST view.
+
+        A mismatch is not corrected here on purpose. The two reads are seconds
+        apart and the book genuinely moves between them, so overwriting on every
+        difference would just reintroduce the stale REST quote. What matters is
+        that a systematic error becomes visible - a delta applied to the wrong
+        side or the wrong sign shows up as a mismatch on essentially every
+        resync, which no amount of normal book movement produces.
+        """
+        def close(a, b):
+            if a is None or b is None:
+                return a is None and b is None
+            return abs(a - b) <= 0.01
+
+        if close(streamed.yes_bid, rest.yes_bid) and close(streamed.no_bid, rest.no_bid):
+            return
+        inst.book_mismatches += 1
+        log.warning(
+            "[%s] streamed book disagrees with REST: yes_bid %s vs %s, "
+            "no_bid %s vs %s (%d mismatches in %d resyncs)",
+            inst.name, streamed.yes_bid, rest.yes_bid,
+            streamed.no_bid, rest.no_bid,
+            inst.book_mismatches, inst.book_resyncs,
+        )
 
     async def _eval_loop(self, inst: Instrument) -> None:
         while True:
@@ -515,6 +665,7 @@ class Monitor:
             f"confirmation  : {self._args.confirm_seconds:.1f}s / "
             f"{self._args.confirm_passes} passes, book polled every "
             f"{self._args.book_interval:.2f}s",
+            f"order book    : {self._book_stream_line()}",
             f"preset        : {'AGGRESSIVE' if getattr(self._args, 'aggressive', False) else 'standard'}",
             f"paper trades  : {self.ledger.count if self.ledger else 0} "
             f"(score with: python kalshi_score.py)",
@@ -530,6 +681,31 @@ class Monitor:
         for inst in self.instruments:
             lines += [""] + self._instrument_lines(inst, elapsed)
         return lines
+
+    def _book_stream_line(self) -> str:
+        """Where the books actually came from - not where they were meant to.
+
+        A stream that failed to connect, or dropped an hour in, leaves a run
+        that looks entirely normal in the log while pricing off a book up to a
+        second old. Saying so in the summary is the difference between reading
+        a result and guessing at one.
+        """
+        stream = self._book_stream
+        ws = sum(i.ws_books for i in self.instruments)
+        rest = sum(i.rest_books for i in self.instruments)
+        if stream is None:
+            reason = "disabled" if self._args.no_book_stream else "unavailable"
+            return f"REST polling only ({reason}); {rest:,} fetches"
+        share = 100.0 * ws / max(ws + rest, 1)
+        bad = sum(i.book_mismatches for i in self.instruments)
+        resyncs = sum(i.book_resyncs for i in self.instruments)
+        return (
+            f"websocket {'connected' if stream.connected else 'DISCONNECTED'} | "
+            f"{ws:,} pushed / {rest:,} polled ({share:.0f}% streamed) | "
+            f"{stream.snapshots} snapshots, {stream.gaps} gaps, "
+            f"{stream.reconnects} reconnects | "
+            f"resync {bad}/{resyncs} mismatched"
+        )
 
     def _instrument_lines(self, inst: Instrument, elapsed: float) -> list[str]:
         edges = inst.net_edges
@@ -1323,6 +1499,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-seconds-left", type=float, default=20.0,
                    help="ignore a market closer than this to expiry")
     p.add_argument("--book-interval", type=float, default=1.0, help="book poll seconds")
+    p.add_argument("--no-book-stream", action="store_true",
+                   help="do not open the Kalshi websocket book; poll over REST only. "
+                        "The stream is the current book by construction, so this is a "
+                        "diagnostic switch, not a tuning knob.")
+    p.add_argument("--book-resync", type=float, default=30.0,
+                   help="seconds between REST cross-checks of the streamed book. The "
+                        "check only logs: a delta applied to the wrong side would "
+                        "otherwise surface as inexplicable fills rather than an error.")
     p.add_argument("--discovery-interval", type=float, default=10.0, help="market poll seconds")
     p.add_argument("--cooldown", type=float, default=5.0, help="seconds between reports")
     p.add_argument("--heartbeat", type=float, default=15.0, help="heartbeat seconds")

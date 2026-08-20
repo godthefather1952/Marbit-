@@ -41,11 +41,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlencode
 
 import aiohttp
@@ -63,6 +65,11 @@ from btc_polymarket_arb import (
 
 API_HOST = "https://api.elections.kalshi.com"
 API_BASE = "/trade-api/v2"
+
+#: The websocket lives on its own host. The signed message is
+#: `timestamp + "GET" + WS_PATH`, exactly as for a REST GET.
+WS_HOST = "wss://api.elections.kalshi.com"
+WS_PATH = "/trade-api/ws/v2"
 
 #: The 15-minute BTC up/down series - the direct analogue of btc-updown-15m.
 BTC_15M_SERIES = "KXBTC15M"
@@ -539,9 +546,13 @@ class KalshiBook:
             yes_levels=tuple(yes),
             no_levels=tuple(no),
             seq=seq,
-            # A sequence when the venue gives one; otherwise the content itself
-            # is the identity, so an unchanged book keeps the same version.
-            version=seq if seq is not None else hash((tuple(yes), tuple(no))),
+            # Identity is the CONTENT, never the sequence number. `seq` counts
+            # messages, and a websocket delta that moves a level ten deep bumps
+            # it without changing the quote we would trade against - counting
+            # that as a new book would re-break the confirmation rule that
+            # `version` exists to enforce ("three confirmations means three
+            # books"). `seq` is kept alongside, for stream continuity only.
+            version=hash((tuple(yes), tuple(no))),
             received_mono=time.monotonic(),
             received_ts=time.time(),
         )
@@ -958,6 +969,322 @@ class CoinbaseSpotStream:
             backoff = min(backoff * 2.0, 30.0)
 
 
+class KalshiBookStream:
+    """Live order books over the websocket: one snapshot, then deltas.
+
+    REST polling tops out at a few hundred milliseconds per market and returns
+    the same snapshot most of the time, so the book we priced against was
+    routinely older than the quote we were trying to take - the single largest
+    source of "the ask moved before the order landed". The websocket pushes
+    every price-level change, so the book is current by construction.
+
+    What this class is careful about:
+
+    * A delta can only be applied to a book we already have. Kalshi numbers
+      every message on the subscription with `seq`; if one is missed the local
+      book is a fiction from that point on, silently and permanently. On a gap
+      we DISCARD the affected state and re-request a snapshot rather than
+      carrying on, because a book that is quietly wrong is worse than no book:
+      the caller has a freshness check for missing data and none at all for
+      data that merely lies.
+    * REST is not retired. It bootstraps, it covers the stream while it is
+      down, and `KalshiClient.book()` remains the resync and diagnostic path.
+      This is an accelerator, not a replacement.
+    * Nothing here places, cancels, or modifies anything. The only frames sent
+      are `subscribe` and `update_subscription` for market data.
+    """
+
+    #: Rebuild the connection after this many gaps inside GAP_WINDOW seconds.
+    #: Counting CONSECUTIVE gaps does not work: a resnapshot arrives in sequence
+    #: immediately after every gap and resets the count, so the threshold would
+    #: never be reached no matter how badly the socket was behaving. What
+    #: matters is the rate.
+    MAX_GAPS_IN_WINDOW = 3
+    GAP_WINDOW = 60.0
+
+    def __init__(
+        self,
+        signer: "RsaPssSigner",
+        tickers: Iterable[str] = (),
+        host: str = WS_HOST,
+        path: str = WS_PATH,
+        on_book: Callable[[str, "KalshiBook"], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
+    ) -> None:
+        self._signer = signer
+        self._host = host.rstrip("/")
+        self._path = path
+        self._on_book = on_book
+        #: Fired whenever local books are discarded - a gap, a drop, a
+        #: reconnect. Callers holding a reference to a previously streamed book
+        #: need to know it is no longer being maintained; without this the book
+        #: object simply stops updating and still looks like a book.
+        self._on_reset = on_reset
+        self._desired: set[str] = {t for t in tickers if t}
+        self._subscribed: set[str] = set()
+        #: ticker -> side ("yes"/"no") -> price -> contracts
+        self._levels: dict[str, dict[str, dict[float, float]]] = {}
+        self._seq: int | None = None
+        self._cmd_id = 0
+        self._ws: Any = None
+        self._recent_gaps: deque[float] = deque(maxlen=32)
+
+        self.books: dict[str, KalshiBook] = {}
+        self.connected = False
+        self.reconnects = 0
+        self.gaps = 0
+        self.snapshots = 0
+        self.deltas = 0
+        self.last_message_mono: float = 0.0
+
+    # -- public surface ----------------------------------------------------- #
+
+    def track(self, *tickers: str) -> None:
+        """Replace the set of markets we want books for.
+
+        Takes effect on the next pass of the read loop. Books for markets that
+        are no longer wanted are dropped immediately so a stale contract cannot
+        be read back out of `books` after it stops being maintained.
+        """
+        wanted = {t for t in tickers if t}
+        for gone in self._desired - wanted:
+            self._levels.pop(gone, None)
+            self.books.pop(gone, None)
+        self._desired = wanted
+
+    def book(self, ticker: str) -> "KalshiBook | None":
+        return self.books.get(ticker)
+
+    def age(self, ticker: str) -> float | None:
+        book = self.books.get(ticker)
+        return None if book is None else book.age
+
+    async def run(self) -> None:
+        try:
+            from websockets.asyncio.client import connect as ws_connect
+            header_kw = "additional_headers"
+        except ImportError:  # pragma: no cover - older websockets
+            from websockets.client import connect as ws_connect  # type: ignore
+            header_kw = "extra_headers"
+
+        url = self._host + self._path
+        backoff = 1.0
+        while True:
+            try:
+                headers = self._signer.headers("GET", self._path)
+                headers.pop("Content-Type", None)
+                async with ws_connect(
+                    url, ping_interval=20, ping_timeout=20, **{header_kw: headers}
+                ) as ws:
+                    self._ws = ws
+                    self.connected = True
+                    backoff = 1.0
+                    self._reset_state()
+                    log.info("Kalshi book stream connected")
+                    await self._read_until_closed(ws)
+            except asyncio.CancelledError:
+                await self._close_quietly()
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the book stream alive
+                log.warning("Kalshi book stream dropped (%s)", exc)
+            finally:
+                self.connected = False
+                self._ws = None
+                self._reset_state()
+            self.reconnects += 1
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+    # -- internals ---------------------------------------------------------- #
+
+    def _reset_state(self) -> None:
+        """Forget every local book. Called on connect, disconnect, and gaps.
+
+        Clearing `books` is the point: a disconnected stream must not leave a
+        book behind that looks current to a caller checking only for presence.
+        """
+        self._levels.clear()
+        self.books.clear()
+        self._subscribed.clear()
+        self._seq = None
+        self._notify_reset()
+
+    def _notify_reset(self) -> None:
+        if self._on_reset is not None:
+            with contextlib.suppress(Exception):
+                self._on_reset()
+
+    async def _close_quietly(self) -> None:
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+    async def _send(self, ws, cmd: str, params: Mapping[str, Any]) -> None:
+        self._cmd_id += 1
+        await ws.send(_json_dumps({"id": self._cmd_id, "cmd": cmd, "params": dict(params)}))
+
+    async def _sync_subscription(self, ws) -> None:
+        """Make the venue's subscription match what we actually want."""
+        if self._desired == self._subscribed:
+            return
+        if not self._subscribed:
+            if not self._desired:
+                return
+            await self._send(ws, "subscribe", {
+                "channels": ["orderbook_delta"],
+                "market_tickers": sorted(self._desired),
+            })
+        else:
+            added = sorted(self._desired - self._subscribed)
+            removed = sorted(self._subscribed - self._desired)
+            if added:
+                await self._send(ws, "update_subscription",
+                                 {"action": "add_markets", "market_tickers": added})
+            if removed:
+                await self._send(ws, "update_subscription",
+                                 {"action": "delete_markets", "market_tickers": removed})
+        for gone in self._subscribed - self._desired:
+            self._levels.pop(gone, None)
+            self.books.pop(gone, None)
+        self._subscribed = set(self._desired)
+
+    async def _resnapshot(self, ws) -> None:
+        """Throw away local books and ask for fresh ones, without resubscribing."""
+        self._levels.clear()
+        self.books.clear()
+        self._notify_reset()
+        if self._desired:
+            await self._send(ws, "update_subscription", {
+                "action": "get_snapshot",
+                "market_tickers": sorted(self._desired),
+            })
+
+    async def _read_until_closed(self, ws) -> None:
+        while True:
+            await self._sync_subscription(ws)
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue  # idle: loop back so subscription changes take effect
+            self.last_message_mono = time.monotonic()
+            try:
+                msg = json_loads(raw)
+            except Exception:  # noqa: BLE001 - a malformed frame is not fatal
+                continue
+            if not isinstance(msg, dict):
+                continue
+            kind = msg.get("type")
+            if kind == "error":
+                log.warning("Kalshi book stream error frame: %s", msg.get("msg"))
+                continue
+            if kind not in ("orderbook_snapshot", "orderbook_delta"):
+                continue
+            if not await self._check_sequence(ws, msg):
+                continue
+            body = msg.get("msg") or {}
+            if kind == "orderbook_snapshot":
+                self._apply_snapshot(body, msg.get("seq"))
+            else:
+                self._apply_delta(body, msg.get("seq"))
+
+    async def _check_sequence(self, ws, msg: Mapping[str, Any]) -> bool:
+        """False when this message cannot be trusted to follow the last one."""
+        try:
+            seq = int(msg.get("seq"))
+        except (TypeError, ValueError):
+            return True  # no sequence to check against
+        if self._seq is not None and seq != self._seq + 1:
+            self.gaps += 1
+            log.warning(
+                "Kalshi book stream sequence gap (%s -> %s); rebuilding from a "
+                "snapshot", self._seq, seq,
+            )
+            self._seq = seq
+            now = time.monotonic()
+            self._recent_gaps.append(now)
+            recent = sum(1 for t in self._recent_gaps if now - t <= self.GAP_WINDOW)
+            if recent >= self.MAX_GAPS_IN_WINDOW:
+                self._recent_gaps.clear()
+                raise ConnectionError(
+                    f"{recent} sequence gaps in {self.GAP_WINDOW:.0f}s; reconnecting"
+                )
+            await self._resnapshot(ws)
+            # A snapshot is on its way; this message predates it.
+            return False
+        self._seq = seq
+        return True
+
+    def _apply_snapshot(self, body: Mapping[str, Any], seq: Any) -> None:
+        ticker = body.get("market_ticker")
+        if not ticker:
+            return
+        self._levels[ticker] = {
+            "yes": _level_map(body.get("yes_dollars_fp") or body.get("yes")),
+            "no": _level_map(body.get("no_dollars_fp") or body.get("no")),
+        }
+        self.snapshots += 1
+        self._publish(ticker, seq)
+
+    def _apply_delta(self, body: Mapping[str, Any], seq: Any) -> None:
+        ticker = body.get("market_ticker")
+        side = str(body.get("side") or "").lower()
+        sides = self._levels.get(ticker) if ticker else None
+        if sides is None or side not in sides:
+            # No snapshot for this market yet, so there is nothing to patch.
+            # Deltas are meaningless in isolation and guessing a base book from
+            # one would invent depth that was never quoted.
+            return
+        try:
+            price = float(body["price_dollars"])
+            delta = float(body["delta_fp"])
+        except (KeyError, TypeError, ValueError):
+            return
+        levels = sides[side]
+        qty = levels.get(price, 0.0) + delta
+        if qty > 1e-9:
+            levels[price] = qty
+        else:
+            levels.pop(price, None)
+        self.deltas += 1
+        self._publish(ticker, seq)
+
+    def _publish(self, ticker: str, seq: Any) -> None:
+        sides = self._levels.get(ticker)
+        if sides is None:
+            return
+        book = KalshiBook.from_payload({
+            "seq": seq,
+            "orderbook_fp": {
+                "yes_dollars": sorted(sides["yes"].items()),
+                "no_dollars": sorted(sides["no"].items()),
+            },
+        })
+        self.books[ticker] = book
+        if self._on_book is not None:
+            with contextlib.suppress(Exception):
+                self._on_book(ticker, book)
+
+
+def _level_map(raw: Any) -> dict[float, float]:
+    """Kalshi's [[price, contracts], ...] as a price -> contracts dict."""
+    out: dict[float, float] = {}
+    for entry in raw or []:
+        try:
+            price, qty = float(entry[0]), float(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if qty > 0:
+            out[price] = qty
+    return out
+
+
+def _json_dumps(payload: Mapping[str, Any]) -> str:
+    import json as _json
+
+    return _json.dumps(payload)
+
+
 def _iso_ms(value: Any) -> int:
     """Coinbase's RFC3339 event time as epoch milliseconds; 0 if unusable."""
     if not value:
@@ -1015,6 +1342,11 @@ class KalshiClient:
     @property
     def authenticated(self) -> bool:
         return self._signer is not None
+
+    @property
+    def signer(self) -> "RsaPssSigner | None":
+        """The signer, for the websocket handshake. Read-only either way."""
+        return self._signer
 
     def authenticate(self) -> None:
         self._signer = RsaPssSigner(self._creds)
