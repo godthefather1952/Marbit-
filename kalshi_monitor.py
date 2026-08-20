@@ -30,6 +30,7 @@ from run_log import run_log_name, start_run_log
 from kalshi_execution import KalshiTrader, RiskLimits
 from strategies import (
     PaperLedger,
+    ReplayLog,
     implied_sigma,
     scan_cross,
     scan_endgame,
@@ -330,6 +331,8 @@ class Monitor:
         self._strategy_stats: dict[str, StrategyStats] = {}
         #: ticker -> monotonic time of the fill, so time-to-exit is measurable.
         self._entry_mono: dict[tuple[str, str], float] = {}
+        #: Structured replay record. None when recording is off.
+        self._replay: ReplayLog | None = None
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -633,6 +636,10 @@ class Monitor:
         )
         if stale is not None:
             inst.stale_rejections[stale] = inst.stale_rejections.get(stale, 0) + 1
+            # Recorded too. A replay that only holds the passes we acted on
+            # cannot answer "why did nothing happen for twenty minutes?", which
+            # is the question a refusal counter raises and cannot settle.
+            self._replay_observe(inst, market, book, tick, sigma, refused=stale)
             return
 
         # The one number that decides whether any of this is real. See
@@ -649,12 +656,18 @@ class Monitor:
         if not vol_ok and not self._args.allow_unvalidated_vol:
             inst.vol_gated_obs += 1
 
+        realized = self._realized_twap(inst, market, now_mono)
         fair = market.fair_value(
             tick.price, sigma,
-            realized=self._realized_twap(inst, market, now_mono),
+            realized=realized,
             reference_error=self._reference_error(inst),
         )
         best_this_pass = -1.0
+        self._replay_observe(
+            inst, market, book, tick, sigma,
+            sigma_implied=sigma_implied, vol_ratio=ratio, vol_ok=vol_ok,
+            fair=fair, realized=realized,
+        )
 
         # Keep a rolling (time, spot, market mid) anchor for the STALE model.
         mid = book.yes_mid
@@ -772,6 +785,11 @@ class Monitor:
                if self._funnel["unpriceable"] else ""),
             f"execution     : {self.trader.stats() if self.trader else 'none'}",
         ]
+        if self._replay is not None:
+            lines.append(
+                f"replay record : {self._replay.rows:,} rows "
+                f"({self._replay.dropped:,} thinned) -> {self._replay.path.name}"
+            )
         lines += self._strategy_lines()
         for inst in self.instruments:
             lines += [""] + self._instrument_lines(inst, elapsed)
@@ -1007,6 +1025,79 @@ class Monitor:
 
         for sig in found:
             self._emit(sig, inst)
+
+    @property
+    def replay(self) -> ReplayLog | None:
+        return self._replay
+
+    def attach_replay(self, path, interval: float) -> None:
+        """Start recording the structured replay stream to `path`."""
+        self._replay = ReplayLog(path, interval)
+        log.info(
+            "Recording replay observations to %s (every %.1fs per market)",
+            self._replay.path, interval,
+        )
+
+    def close_replay(self) -> None:
+        if self._replay is not None:
+            self._replay.close()
+
+    def _replay_observe(
+        self, inst, market, book, tick, sigma: float,
+        refused: str | None = None,
+        sigma_implied: float | None = None,
+        vol_ratio: float | None = None,
+        vol_ok: bool | None = None,
+        fair: float | None = None,
+        realized: tuple[float, float] | None = None,
+    ) -> None:
+        """One replay row: everything the decision rested on, flat and named.
+
+        Wrapped in a blanket suppress on purpose. This is a recorder; if it
+        throws - a odd field, a full disk, a renamed attribute - the run must
+        carry on trading and simply lose the row.
+        """
+        replay = self._replay
+        if replay is None:
+            return
+        with contextlib.suppress(Exception):
+            basis = inst.basis
+            replay.observe(
+                market.ticker,
+                asset=inst.name,
+                refused=refused,
+                spot=round(tick.price, 4),
+                spot_age=round(time.monotonic() - tick.mono, 3),
+                strike=market.strike,
+                seconds_left=round(market.seconds_remaining(), 2),
+                tau_eff=round(market.effective_tau(), 2),
+                yes_bid=book.yes_bid, yes_ask=book.yes_ask,
+                no_bid=book.no_bid, no_ask=book.no_ask,
+                yes_bid_size=book.yes_bid_size, yes_ask_size=book.yes_ask_size,
+                # Enough depth to replay a size decision, not the whole ladder.
+                yes_levels=list(book.yes_levels[-5:]),
+                no_levels=list(book.no_levels[-5:]),
+                book_age=round(book.age, 3) if book.received_mono else None,
+                book_version=book.version, book_seq=book.seq,
+                book_source=inst.book_source,
+                sigma=sigma, sigma_implied=sigma_implied,
+                vol_ratio=vol_ratio, vol_ok=vol_ok,
+                vol_measured=inst.buffer.vol_is_measured,
+                fair=fair,
+                realized_mean=realized[0] if realized else None,
+                realized_covered=realized[1] if realized else None,
+                basis_offset=getattr(basis, "offset", None),
+                basis_dispersion=getattr(basis, "dispersion", None),
+                basis_venues=getattr(basis, "venues", None),
+                basis_age=getattr(basis, "age", None),
+            )
+
+    def _replay_event(self, kind: str, **fields) -> None:
+        replay = self._replay
+        if replay is None:
+            return
+        with contextlib.suppress(Exception):
+            replay.event(kind, **fields)
 
     def _realized_twap(self, inst, market, now_mono: float):
         """What our tape has printed since this contract's averaging window opened.
@@ -1304,6 +1395,16 @@ class Monitor:
             self._pending_orders.append(sig)
             self._funnel["confirmed"] += 1
             self._work.set()
+            self._replay_event(
+                "signal", ticker=sig.ticker, strategy=sig.strategy,
+                legs=[{"side": l.side, "price": l.price, "size": l.size}
+                      for l in sig.legs],
+                fair_yes=sig.fair_yes, expected_net=sig.expected_net,
+                spot=sig.spot, strike=sig.strike,
+                seconds_left=round(sig.seconds_left, 1),
+                sigma_used=sig.sigma_used, book_version=sig.book_version,
+                note=sig.note,
+            )
             log.warning(
                 "\n---- PAPER TRADE ----\n %s\n %s\n"
                 " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
@@ -1434,6 +1535,14 @@ class Monitor:
                         self._track_strategy(
                             sig, outcome, leg, result, elapsed_ms
                         )
+                        self._replay_event(
+                            "order", ticker=sig.ticker, strategy=sig.strategy,
+                            side=leg.side, outcome=outcome,
+                            signal_price=leg.price, limit=limit,
+                            fill_price=result.price, count=result.count,
+                            requested=count, elapsed_ms=round(elapsed_ms, 1),
+                            error=result.error or "",
+                        )
                 await self._manage_exits()
                 await self._settle_finished()
             except asyncio.CancelledError:
@@ -1476,7 +1585,14 @@ class Monitor:
                 # reliable than recomputing it from a partially filled result.
                 before = trader.realized
                 await trader.close_position(order, price, reason)
-                self._track_close(order, price, trader.realized - before)
+                booked = trader.realized - before
+                self._track_close(order, price, booked)
+                self._replay_event(
+                    "exit", ticker=order.ticker, strategy=order.strategy,
+                    side=order.outcome, reason=reason, entry=order.price,
+                    exit=price, count=order.count, realized=round(booked, 4),
+                    seconds_left=round(left, 1),
+                )
                 self._committed.get(order.ticker, set()).discard(order.outcome)
                 if self.ledger is not None:
                     with contextlib.suppress(Exception):
@@ -1511,6 +1627,14 @@ class Monitor:
                 trader.settle(ticker, result)
                 booked = trader.realized - before
                 self._attribute_settlement(held, result, booked)
+                self._replay_event(
+                    "settlement", ticker=ticker, result=result,
+                    realized=round(booked, 4),
+                    positions=[
+                        {"strategy": o.strategy, "side": o.outcome,
+                         "count": o.count, "price": o.price} for o in held
+                    ],
+                )
                 self._settled.add(ticker)
 
     def _attribute_settlement(self, held: list, result: str, booked: float) -> None:
@@ -1711,6 +1835,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="do not open the Kalshi websocket book; poll over REST only. "
                         "The stream is the current book by construction, so this is a "
                         "diagnostic switch, not a tuning knob.")
+    p.add_argument("--no-replay", action="store_true",
+                   help="do not write the structured replay log. The analyzer falls "
+                        "back to scraping heartbeat lines, which are 15s apart and "
+                        "carry top of book only.")
+    p.add_argument("--replay-interval", type=float, default=1.0,
+                   help="seconds between replay observations PER MARKET. 0 records "
+                        "every evaluation pass.")
     p.add_argument("--book-resync", type=float, default=30.0,
                    help="seconds between REST cross-checks of the streamed book. The "
                         "check only logs: a delta applied to the wrong side would "
@@ -1893,12 +2024,17 @@ def main() -> None:
         stem = (run_log.path.stem if run_log else run_log_name().replace(".log", ""))
         monitor.ledger = PaperLedger(Path(args.log_dir) / f"paper_{stem}.jsonl")
         log.info("Recording paper trades to %s", monitor.ledger.path)
+        if not args.no_replay:
+            monitor.attach_replay(
+                Path(args.log_dir) / f"replay_{stem}.jsonl", args.replay_interval
+            )
 
     try:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(amain(args, monitor))
     finally:
         # Written even on Ctrl+C, which is how a long monitoring run ends.
+        monitor.close_replay()
         if run_log is not None:
             run_log.close(monitor.build_summary())
         log.info("Monitor stopped")

@@ -38,6 +38,7 @@ import asyncio
 import collections
 import datetime as dt
 import glob
+import json
 import math
 import re
 import statistics
@@ -132,6 +133,48 @@ def parse_log(path: Path) -> list[Obs]:
             yes_bid=None if ybid == "-" else float(ybid),
             yes_ask=None if yask == "-" else float(yask),
             left=float(left),
+        ))
+    return out
+
+
+def parse_replay(path: Path) -> list[Obs]:
+    """Observations from a structured replay file.
+
+    Strictly better input than the heartbeat scrape this falls back to: rows
+    arrive once a second rather than once every fifteen, they carry the real
+    book rather than a formatted summary, and they include the passes where we
+    refused to act - so "why did nothing happen" becomes answerable.
+
+    Rows we refused to price on are kept. They are exactly the ones that show
+    whether a filter is protecting us or costing us, and dropping them would
+    reproduce the survivorship bias the heartbeat parse already suffers from.
+    """
+    out: list[Obs] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("kind") != "observation":
+            continue
+        try:
+            strike = float(row["strike"])
+            spot = float(row["spot"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if strike <= 0 or spot <= 0:
+            continue
+        yes_bid, yes_ask = row.get("yes_bid"), row.get("yes_ask")
+        out.append(Obs(
+            ts=float(row.get("ts") or 0.0),
+            asset=str(row.get("asset") or ""),
+            ticker=str(row.get("ticker") or ""),
+            spot=spot, strike=strike,
+            yes_bid=None if yes_bid is None else float(yes_bid),
+            yes_ask=None if yes_ask is None else float(yes_ask),
+            left=float(row.get("seconds_left") or 0.0),
         ))
     return out
 
@@ -456,7 +499,10 @@ def report(samples, settled, buckets, take_profit: float, min_move: float = 0.0)
 async def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("logs", nargs="*", help="session logs (default: every logs/L_*.log)")
+    p.add_argument("logs", nargs="*",
+                   help="replay files (logs/replay_*.jsonl) or session logs "
+                        "(logs/L_*.log). Default: every replay file, plus the "
+                        "session logs of runs that have no replay file.")
     p.add_argument("--anchor-age", type=float, default=20.0,
                    help="lookback for the spot move, seconds (match --anchor-age)")
     p.add_argument("--min-seconds-left", type=float, default=20.0,
@@ -472,7 +518,18 @@ async def main() -> int:
                    help="comma-separated bucket edges in bps")
     args = p.parse_args()
 
-    paths = [Path(x) for x in (args.logs or sorted(glob.glob("logs/L_*.log")))]
+    if args.logs:
+        paths = [Path(x) for x in args.logs]
+    else:
+        # Replay files first: same sessions, far denser data. A session that
+        # has both contributes only its replay rows, so one run cannot be
+        # counted twice under two different resolutions.
+        paths = [Path(x) for x in sorted(glob.glob("logs/replay_*.jsonl"))]
+        covered = {p.stem.replace("replay_", "") for p in paths}
+        paths += [
+            Path(x) for x in sorted(glob.glob("logs/L_*.log"))
+            if Path(x).stem not in covered
+        ]
     paths = [x for x in paths if x.is_file()]
     if not paths:
         print("No logs found. Run a session first.", file=sys.stderr)
@@ -480,11 +537,14 @@ async def main() -> int:
 
     obs: list[Obs] = []
     for path in paths:
-        found = parse_log(path)
+        replayed = path.suffix == ".jsonl"
+        found = parse_replay(path) if replayed else parse_log(path)
         obs.extend(found)
-        print(f"  {path.name}: {len(found):,} observations", file=sys.stderr)
+        print(f"  {path.name}: {len(found):,} observations"
+              f"{' (replay)' if replayed else ' (heartbeat scrape)'}",
+              file=sys.stderr)
     if not obs:
-        print("No parseable heartbeats in those logs.", file=sys.stderr)
+        print("No parseable observations in those files.", file=sys.stderr)
         return 1
 
     samples = build_samples(obs, args.anchor_age, args.min_seconds_left)

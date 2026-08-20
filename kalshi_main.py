@@ -441,6 +441,13 @@ def main() -> int:
     stem = run_log.path.stem if run_log else run_log_name().replace(".log", "")
     monitor.ledger = PaperLedger(Path(margs.log_dir) / f"paper_{stem}.jsonl")
     log.info("Recording trades to %s", monitor.ledger.path)
+    if not margs.no_replay:
+        # Separate from the ledger on purpose: the ledger holds trades to be
+        # graded, this holds the market state every decision was made from,
+        # including the passes where we decided not to act.
+        monitor.attach_replay(
+            Path(margs.log_dir) / f"replay_{stem}.jsonl", margs.replay_interval
+        )
 
     control = _StopControl()
     notes: list[str] = []
@@ -456,12 +463,15 @@ def main() -> int:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(amain())
     finally:
+        monitor.close_replay()
         summary = monitor.build_summary() + [""] + notes
         if run_log is not None:
             run_log.close(summary)
             print(f"\nSession log   : {run_log.path}")
         if monitor.ledger is not None:
             print(f"Paper ledger  : {monitor.ledger.path}")
+        if monitor.replay is not None:
+            print(f"Replay record : {monitor.replay.path} ({monitor.replay.rows:,} rows)")
         print("Send the session log file to review the run.")
     return 0
 

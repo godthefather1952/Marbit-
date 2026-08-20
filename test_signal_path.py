@@ -2487,6 +2487,80 @@ async def test_autopilot() -> None:
               abs(row["signal_price"] - 0.40) < 1e-9 and row["elapsed_ms"] == 850.0,
               "2c of slippage is not recoverable later by joining rows")
 
+    # -- the structured replay record ---------------------------------------- #
+    # The analyzer reconstructs history by scraping heartbeat lines: 15s apart,
+    # top of book only, and silent about the volatility and freshness state that
+    # actually gated each decision.
+    with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path as _P
+
+        from strategies import ReplayLog
+
+        rp = ReplayLog(_P(tmp) / "r.jsonl", interval=10.0)
+        check("the first observation for a market is recorded",
+              rp.observe("M1", spot=1.0) is True)
+        check("a second one inside the interval is thinned",
+              rp.observe("M1", spot=1.1) is False)
+        check("but a different market is not starved by the first",
+              rp.observe("M2", spot=2.0) is True,
+              "the rate limit is per market, not per file")
+
+        rp.event("order", ticker="M1", outcome="filled")
+        rows = [json.loads(l) for l in
+                _P(rp.path).read_text().splitlines() if l.strip()]
+        check("an event is flushed immediately, along with what preceded it",
+              len(rows) == 3 and rows[-1]["kind"] == "order",
+              f"{[r['kind'] for r in rows]} - losing a decision boundary to a "
+              f"buffer would leave a replay unable to explain a position")
+        check("every row carries a timestamp without the caller supplying one",
+              all(r.get("ts") for r in rows))
+
+        # A recorder must never take the run down with it.
+        rp2 = ReplayLog(_P(tmp) / "r2.jsonl", interval=0.0)
+        class _Odd:
+            def __repr__(self):
+                return "odd"
+        rp2.observe("M3", weird=_Odd(), ok=1)
+        rp2.close()
+        row = json.loads(_P(rp2.path).read_text().splitlines()[0])
+        check("an unserialisable field is coerced, not raised",
+              row["weird"] == "odd" and row["ok"] == 1)
+
+        # The analyzer must be able to read it back.
+        from kalshi_analyze import parse_replay
+
+        feed = _P(tmp) / "replay_s.jsonl"
+        feed.write_text("\n".join([
+            json.dumps({"kind": "observation", "ts": 1000.0, "asset": "BTC",
+                        "ticker": "T1", "spot": 71_000.0, "strike": 71_050.0,
+                        "yes_bid": 0.42, "yes_ask": 0.45, "seconds_left": 300.0}),
+            json.dumps({"kind": "observation", "ts": 1001.0, "asset": "BTC",
+                        "ticker": "T1", "spot": 71_090.0, "strike": 71_050.0,
+                        "yes_bid": 0.44, "yes_ask": 0.47, "seconds_left": 299.0,
+                        "refused": "STALE_BOOK"}),
+            json.dumps({"kind": "order", "ticker": "T1", "outcome": "filled"}),
+            json.dumps({"kind": "observation", "spot": 0.0, "strike": 0.0}),
+            "{ this is not json",
+        ]))
+        parsed = parse_replay(feed)
+        check("the analyzer reads replay rows back as observations",
+              len(parsed) == 2 and parsed[0].ticker == "T1"
+              and abs(parsed[1].spot - 71_090.0) < 1e-9,
+              f"{len(parsed)} of 5 rows - events and unpriceable rows skipped")
+        check("passes we REFUSED to trade are kept, not filtered out",
+              any(o.left == 299.0 for o in parsed),
+              "dropping them would hide whether a filter protects or costs us")
+        check("a malformed line does not lose the file",
+              len(parsed) == 2, "one bad row is one bad row")
+
+        buffered = ReplayLog(_P(tmp) / "r3.jsonl", interval=0.0)
+        for i in range(buffered.FLUSH_EVERY):
+            buffered.observe("M4", i=i)
+        check("rows flush on their own once the buffer fills",
+              _P(buffered.path).exists()
+              and len(_P(buffered.path).read_text().splitlines())
+              == buffered.FLUSH_EVERY)
+
     # -- per-strategy execution quality -------------------------------------- #
     # "Did the model call it right" and "did we get a price worth having" are
     # different questions, and a strategy can pass the first while failing the

@@ -33,6 +33,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import NormalDist
+from typing import Any
 
 from kalshi import KalshiBook, KalshiMarket, fee_at_size, fee_per_contract, trading_fee
 
@@ -461,6 +462,97 @@ def scan_endgame(
 # --------------------------------------------------------------------------- #
 # Paper ledger - what turns a run into evidence
 # --------------------------------------------------------------------------- #
+
+
+class ReplayLog:
+    """Dense, machine-readable record of the state behind every decision.
+
+    The analyzer currently reconstructs history by scraping heartbeat lines out
+    of the human-readable log. That works, and it produced the threshold study
+    this project runs on, but it inherits three hard limits: the heartbeat fires
+    every 15 seconds, it carries top of book only, and it says nothing about the
+    volatility, freshness, or reference state that actually gated each decision.
+    So the record can show WHAT the market did and not WHY we did or did not act
+    - which is the question every future change needs answered.
+
+    This writes one JSON object per observation, at its own cadence, plus an
+    unthrottled row for every event that matters (signal, order, exit,
+    settlement). Rows are flat and self-describing so a replay does not need to
+    know which version of the code produced them, and unknown keys can be added
+    later without invalidating older files.
+
+    Deliberately NOT a second source of truth: nothing reads this back during a
+    run, and the paper ledger remains what the scorecard grades. A recorder that
+    the live path depended on would be a recorder that could halt trading.
+    """
+
+    #: Flush after this many buffered rows. A crash costs at most this much
+    #: history, which is the right trade for a file written at several hertz.
+    FLUSH_EVERY = 64
+
+    def __init__(self, path: str | Path, interval: float = 1.0) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.interval = max(interval, 0.0)
+        self.rows = 0
+        self.dropped = 0
+        self._buffer: list[str] = []
+        self._last: dict[str, float] = {}
+
+    def observe(self, ticker: str, **fields: Any) -> bool:
+        """Record one evaluated observation, rate-limited per market.
+
+        Returns False when this one was thinned out. The evaluator runs at 10 Hz
+        and most passes see an unchanged book, so writing every one would be
+        mostly duplicate rows - and the rate limit is per MARKET so a second
+        instrument cannot starve the first.
+        """
+        now = time.monotonic()
+        if self.interval > 0.0 and now - self._last.get(ticker, 0.0) < self.interval:
+            self.dropped += 1
+            return False
+        self._last[ticker] = now
+        self._write({"kind": "observation", "ticker": ticker, **fields})
+        return True
+
+    def event(self, kind: str, **fields: Any) -> None:
+        """Record something that happened. Never thinned, always flushed.
+
+        Events are rare and each one is a decision boundary, so losing one to a
+        buffer would leave a replay unable to explain a position it can see.
+        """
+        self._write({"kind": kind, **fields})
+        self.flush()
+
+    def _write(self, row: dict) -> None:
+        row.setdefault("ts", time.time())
+        try:
+            self._buffer.append(json.dumps(row, default=_jsonable))
+        except (TypeError, ValueError):
+            return  # a recorder must never take the run down with it
+        self.rows += 1
+        if len(self._buffer) >= self.FLUSH_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._buffer:
+            return
+        chunk, self._buffer = self._buffer, []
+        try:
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write("\n".join(chunk) + "\n")
+        except OSError:
+            pass  # a full disk must not stop trading
+
+    def close(self) -> None:
+        self.flush()
+
+
+def _jsonable(value: Any) -> Any:
+    """Last-resort encoder, so one odd field cannot lose a whole row."""
+    if isinstance(value, (set, frozenset, tuple)):
+        return list(value)
+    return str(value)
 
 
 class PaperLedger:
