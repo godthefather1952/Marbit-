@@ -730,47 +730,101 @@ class CompositeBasis:
         #: How far the venues disagreed on the last poll, in dollars. A wide
         #: spread means the "composite" is an average of prices that are not
         #: describing the same instant, and the correction it produces is not
-        #: trustworthy.
+        #: trustworthy. Downstream this is the measured size of our reference
+        #: error, so it has to mean venue DISAGREEMENT and not our own
+        #: sampling skew - hence the concurrent poll below.
         self.dispersion: float = 0.0
         self.venues: int = 0
+        #: Per-venue detail from the last poll: name -> (price, seconds late).
+        self.venue_prices: dict[str, tuple[float, float]] = {}
+        #: Spread between the earliest and latest venue reply, in seconds.
+        self.venue_skew: float = 0.0
+        #: Venues dropped for disagreeing with the median, and for replying too
+        #: late to describe the same instant as the others.
+        self.rejected_outlier: int = 0
+        self.rejected_late: int = 0
 
     @property
     def age(self) -> float | None:
         """Seconds since the composite last updated, or None if never."""
         return time.monotonic() - self.updated_mono if self.updated_mono else None
 
-    async def poll_once(self) -> float | None:
-        """One composite reading, as the median of the reachable USD venues."""
-        prices: list[float] = []
-        for name, url in self._sources:
-            try:
-                async with self._session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = json_loads(await resp.read())
-                prices.append(_extract_price(name, data))
-            except Exception:  # noqa: BLE001 - a venue being down is routine
-                continue
-        prices = [p for p in prices if p and p > 0]
-        if len(prices) < 2:
+    #: A venue replying this much later than the fastest one is describing a
+    #: different instant, not a different price.
+    MAX_VENUE_SKEW = 2.0
+
+    async def _fetch(self, name: str, url: str) -> tuple[str, float, float] | None:
+        """One venue's price, stamped with when the reply actually landed."""
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = json_loads(await resp.read())
+        except Exception:  # noqa: BLE001 - a venue being down is routine
             return None
-        prices.sort()
-        mid = len(prices) // 2
-        composite = prices[mid] if len(prices) % 2 else (prices[mid - 1] + prices[mid]) / 2.0
+        price = _extract_price(name, data)
+        if not price or price <= 0:
+            return None
+        return name, float(price), time.monotonic()
+
+    async def poll_once(self) -> float | None:
+        """One composite reading, as the median of the reachable USD venues.
+
+        The venues are polled CONCURRENTLY and each reply is timestamped. Polled
+        in sequence, four venues at an 8s timeout could span half a minute, and
+        BTC moves enough in half a minute that the resulting spread would mostly
+        measure our own sampling lag. Since that spread is what tells the
+        settlement model how far our reference might be from BRTI, a number
+        inflated by our own polling would make the model refuse good trades and
+        trust bad ones in the same breath.
+        """
+        results = await asyncio.gather(
+            *(self._fetch(name, url) for name, url in self._sources),
+            return_exceptions=True,
+        )
+        observations = [
+            r for r in results
+            if isinstance(r, tuple) and len(r) == 3
+        ]
+        if len(observations) < 2:
+            return None
+
+        # Drop venues that answered far later than the rest: their price
+        # describes a different moment, which is a staleness problem wearing a
+        # disagreement costume.
+        earliest = min(mono for _, _, mono in observations)
+        latest = max(mono for _, _, mono in observations)
+        timely = [o for o in observations if o[2] - earliest <= self.MAX_VENUE_SKEW]
+        self.rejected_late = len(observations) - len(timely)
+        if len(timely) < 2:
+            return None
+
+        prices = sorted(p for _, p, _ in timely)
+        composite = _median(prices)
 
         # Discard venues far from the median before committing. A single stale
         # or wrong quote drags a mean and can drag a two-venue median outright;
         # 50 bps is far wider than these venues ever legitimately diverge.
-        kept = [p for p in prices if abs(p - composite) / composite < 0.005]
-        if len(kept) >= 2:
-            kept.sort()
-            k = len(kept) // 2
-            composite = kept[k] if len(kept) % 2 else (kept[k - 1] + kept[k]) / 2.0
+        kept_obs = [o for o in timely if abs(o[1] - composite) / composite < 0.005]
+        self.rejected_outlier = len(timely) - len(kept_obs)
+        if len(kept_obs) < 2:
+            # With fewer than two venues agreeing there is no composite worth
+            # the name. Refusing leaves the previous offset in place and lets
+            # the reference-age check notice, which beats publishing a number
+            # built from one venue and a disagreement.
+            return None
 
-        self.dispersion = max(kept) - min(kept) if kept else 0.0
-        self.venues = len(kept)
+        kept = sorted(p for _, p, _ in kept_obs)
+        composite = _median(kept)
+
+        self.dispersion = kept[-1] - kept[0]
+        self.venues = len(kept_obs)
+        self.venue_skew = latest - earliest
+        self.venue_prices = {
+            name: (price, mono - earliest) for name, price, mono in kept_obs
+        }
         self.last_composite = composite
         self.updated_mono = time.monotonic()
         return composite
@@ -789,11 +843,15 @@ class CompositeBasis:
                     self.samples += 1
                     if self.samples == 1 or self.samples % 15 == 0:
                         log.info(
-                            "%s feed basis vs USD composite: %+.2f USD (%+.1f bps), n=%d",
+                            "%s feed basis vs USD composite: %+.2f USD (%+.1f bps), "
+                            "n=%d | %d venues spread $%.2f, replies within %.1fs",
                             self._label,
                             self.offset,
                             self.offset / composite * 1e4,
                             self.samples,
+                            self.venues,
+                            self.dispersion,
+                            self.venue_skew,
                         )
             except asyncio.CancelledError:
                 raise
@@ -803,6 +861,14 @@ class CompositeBasis:
 
     def correct(self, price: float) -> float:
         return price + self.offset
+
+
+def _median(values: Sequence[float]) -> float:
+    """Median of an already-sorted sequence."""
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
 
 
 def _extract_price(name: str, data) -> float | None:

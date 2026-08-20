@@ -3369,6 +3369,97 @@ async def test_accuracy_upgrades() -> None:
     check("and a book fetched after the gap is fine again",
           freshness_problem(replaced, now, 5.0, 3.0, 4.0, 180.0) is None)
 
+    # -- the USD composite must describe ONE instant ------------------------- #
+    from kalshi import CompositeBasis
+
+    class FakeResp:
+        def __init__(self, payload):
+            self.status = 200
+            self._payload = payload
+
+        async def read(self):
+            return json.dumps(self._payload).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        """Each venue answers after its own delay, so lag is expressible."""
+
+        def __init__(self, book):
+            self._book = book      # url-substring -> (price, delay)
+            self.calls = 0
+
+        def get(self, url, **_):
+            self.calls += 1
+            for key, (price, delay) in self._book.items():
+                if key in url:
+                    return _DelayedResp(price, delay)
+            raise AssertionError(f"unexpected url {url}")
+
+    class _DelayedResp:
+        def __init__(self, price, delay):
+            self._price, self._delay = price, delay
+
+        async def __aenter__(self):
+            await asyncio.sleep(self._delay)
+            return FakeResp({"last": f"{self._price}"})
+
+        async def __aexit__(self, *a):
+            return False
+
+    sources = (("bitstamp", "//b/"), ("gemini", "//g/"),
+               ("kraken2", "//k/"), ("stamp2", "//s/"))
+
+    def basis_for(book, srcs=sources):
+        # All four extract via the "last" key, which bitstamp/gemini share.
+        named = tuple((("bitstamp" if i % 2 == 0 else "gemini"), url)
+                      for i, (_, url) in enumerate(srcs))
+        return CompositeBasis(FakeSession(book), sources=named), named
+
+    slow = {"//b/": (63_000.0, 0.30), "//g/": (63_010.0, 0.30),
+            "//k/": (63_005.0, 0.30), "//s/": (63_002.0, 0.30)}
+    b, _ = basis_for(slow)
+    t0 = time.monotonic()
+    composite = await b.poll_once()
+    elapsed = time.monotonic() - t0
+    check("the venues are polled concurrently, not one after another",
+          elapsed < 0.30 * 2 and composite is not None,
+          f"{elapsed:.2f}s for 4 venues at 0.30s each")
+    check("a concurrent poll leaves almost no self-inflicted skew",
+          b.venue_skew < 0.15, f"skew {b.venue_skew:.3f}s")
+    check("dispersion measures venue disagreement in dollars",
+          abs(b.dispersion - 10.0) < 1e-6, f"${b.dispersion:.2f}")
+
+    late = {"//b/": (63_000.0, 0.0), "//g/": (63_010.0, 0.0),
+            "//k/": (63_005.0, 0.0), "//s/": (63_900.0, 2.5)}
+    b, _ = basis_for(late)
+    composite = await b.poll_once()
+    check("a venue that answers far later is dropped, not averaged in",
+          b.rejected_late == 1 and b.venues == 3,
+          f"{b.rejected_late} late, {b.venues} kept - it describes another moment")
+
+    wrong = {"//b/": (63_000.0, 0.0), "//g/": (63_010.0, 0.0),
+             "//k/": (63_005.0, 0.0), "//s/": (70_000.0, 0.0)}
+    b, _ = basis_for(wrong)
+    await b.poll_once()
+    check("a venue far from the median is dropped as an outlier",
+          b.rejected_outlier == 1 and b.venues == 3,
+          f"{b.rejected_outlier} outlier, {b.venues} kept")
+
+    split = {"//b/": (63_000.0, 0.0), "//g/": (70_000.0, 0.0),
+             "//k/": (55_000.0, 0.0), "//s/": (80_000.0, 0.0)}
+    b, _ = basis_for(split)
+    b.offset = -3.0
+    check("venues that cannot agree produce NO composite",
+          await b.poll_once() is None,
+          "one venue and a disagreement is not a reference price")
+    check("and the last good correction is left standing",
+          b.offset == -3.0, "refusing to update beats publishing a guess")
+
     # -- STALE time decay ---------------------------------------------------- #
     # z = ln(S/K)/(sigma*sqrt(tau)), so the same moneyness is a LARGER z as tau
     # shrinks. Carrying the anchor's z forward unscaled assumes no time passed.

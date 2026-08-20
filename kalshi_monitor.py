@@ -120,6 +120,26 @@ def freshness_problem(
     return None
 
 
+def _reference_line(basis) -> str:
+    """How much the USD venues disagreed, and how much of that is our own lag.
+
+    This is the number the settlement model uses as the size of our reference
+    error, so it is worth saying out loud rather than leaving inside an object.
+    """
+    if basis is None:
+        return "none (uncorrected venue tape)"
+    if not basis.venues:
+        return "no composite formed - fewer than two venues agreed"
+    detail = ", ".join(
+        f"{name} ${price:,.0f}" for name, (price, _) in sorted(basis.venue_prices.items())
+    )
+    return (
+        f"{basis.venues} venues spread ${basis.dispersion:,.2f} "
+        f"(+/-${basis.dispersion / 2.0:,.2f} assumed vs BRTI), "
+        f"replies within {basis.venue_skew:.1f}s | {detail}"
+    )
+
+
 class _ExitStub:
     """Minimal shape `PaperLedger.record_execution` needs for an exit row."""
 
@@ -716,6 +736,7 @@ class Monitor:
             f" {inst.name}  ({inst.series} priced off {inst.asset.coinbase_product})",
             bar,
             f"   feed basis    : {('%+.2f USD (n=%d polls)' % (inst.basis.offset, inst.basis.samples)) if inst.basis else 'not corrected'}",
+            f"   reference     : {_reference_line(inst.basis)}",
             f"   markets seen  : {len(inst.markets_seen)}",
             f"   observations  : {inst.observations:,}",
             f"   signals       : {inst.signals}",
