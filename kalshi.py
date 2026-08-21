@@ -1329,6 +1329,7 @@ class KalshiBookStream:
             if kind == "subscribed":
                 self._sid = _int_or_none((msg.get("msg") or {}).get("sid"))
                 self._resubscribes = 0
+                self._seq = _int_or_none(msg.get("seq")) or self._seq
                 log.info("Kalshi book stream subscribed (sid %s)", self._sid)
                 continue
             if kind == "error":
@@ -1340,14 +1341,21 @@ class KalshiBookStream:
                 log.warning("Kalshi book stream error frame: %s", msg.get("msg"))
                 await self._force_resubscribe(ws)
                 continue
+            # The sequence numbers every message on the subscription, not just
+            # the book ones - so it must be checked BEFORE filtering by type. A
+            # live session logged nine gaps, every single one exactly n -> n+2,
+            # and every one immediately after a market roll: the venue's
+            # acknowledgement of our own subscription change was being dropped
+            # here without its sequence number ever being counted. Three of
+            # those phantom gaps inside a minute tripped the reconnect guard.
+            if not await self._check_sequence(ws, msg):
+                continue
             if kind not in ("orderbook_snapshot", "orderbook_delta"):
                 continue
             # Every book frame carries the sid too, so the id is recovered even
             # if the confirmation was missed.
             if self._sid is None:
                 self._sid = _int_or_none(msg.get("sid"))
-            if not await self._check_sequence(ws, msg):
-                continue
             body = msg.get("msg") or {}
             if kind == "orderbook_snapshot":
                 self._apply_snapshot(body, msg.get("seq"))

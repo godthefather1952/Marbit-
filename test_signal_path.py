@@ -3336,6 +3336,24 @@ async def test_book_stream() -> None:
     check("gaps arriving faster than the window force a reconnect",
           raised is not None and s.gaps == 3, f"{raised} after {s.gaps} gaps")
 
+    # -- a frame we do not act on still advances the sequence ---------------- #
+    # Nine gaps in a live session, every one exactly n -> n+2, every one right
+    # after a market roll: the venue's acknowledgement of our own subscription
+    # change was dropped before its sequence number was counted, so the next
+    # delta looked like a lost message. Three inside a minute tripped the
+    # reconnect guard, discarding books that were perfectly good.
+    s, ws = stream([
+        snap(1),
+        {"type": "subscription_updated", "sid": 1, "seq": 2, "msg": {}},
+        delta(3, "0.41", "50", "yes"),
+    ])
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("a frame of an unhandled type still advances the sequence",
+          s.gaps == 0 and s.book("T") is not None
+          and s.book("T").yes_bid == 0.41,
+          f"{s.gaps} gaps - an ack we ignore is not a message we lost")
+
     # -- a delta with no snapshot cannot be applied -------------------------- #
     s, ws = stream([delta(1, "0.41", "50", "yes")])
     with contextlib.suppress(asyncio.CancelledError):
