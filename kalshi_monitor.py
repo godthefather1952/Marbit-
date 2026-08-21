@@ -265,6 +265,11 @@ class Instrument:
         self.book_source = "none"
         self.ws_books = 0
         self.rest_books = 0
+        #: Books counted where it matters: at the moment a price was formed.
+        #: The message counts above can read 99% streamed while the stream has
+        #: stopped feeding the evaluator entirely - it need only have delivered
+        #: a great many messages before it stopped.
+        self.priced_from: dict[str, int] = {}
         #: Times the REST resync disagreed with the streamed top of book. A few
         #: are normal (the two reads are seconds apart); a mismatch on nearly
         #: every resync means our delta application is wrong.
@@ -450,6 +455,13 @@ class Monitor:
                     )
                     inst.market = current
                     inst.book = None
+                    # Anchors belong to the CONTRACT, not the instrument. A
+                    # live session carried anchors across the roll and STALE
+                    # compared a fresh at-the-money contract against the mid of
+                    # the one that had just settled - "market mid was 0.001,
+                    # tau 7->831s". That produced the two largest predicted
+                    # edges of the run out of nothing.
+                    inst.anchors.clear()
                 elif current:
                     # Keep quotes and status fresh on the tracked contract.
                     current_book = inst.book
@@ -626,6 +638,7 @@ class Monitor:
             return
 
         inst.observations += 1
+        inst.priced_from[inst.book_source] = inst.priced_from.get(inst.book_source, 0) + 1
         if not inst.buffer.vol_is_measured:
             inst.fallback_vol_obs += 1
 
@@ -823,12 +836,22 @@ class Monitor:
         if stream is None:
             reason = "disabled" if self._args.no_book_stream else "unavailable"
             return f"REST polling only ({reason}); {rest:,} fetches"
-        share = 100.0 * ws / max(ws + rest, 1)
         bad = sum(i.book_mismatches for i in self.instruments)
         resyncs = sum(i.book_resyncs for i in self.instruments)
+        # The share of DECISIONS the stream fed, not of messages it delivered.
+        # A live run read "99% streamed" off the message counts while the stream
+        # had stopped feeding the evaluator entirely after the first contract
+        # roll - it had simply delivered a great many messages before it did.
+        priced: dict[str, int] = {}
+        for inst in self.instruments:
+            for source, n in inst.priced_from.items():
+                priced[source] = priced.get(source, 0) + n
+        decisions = sum(priced.values())
+        share = 100.0 * priced.get("ws", 0) / max(decisions, 1)
         return (
-            f"websocket {'connected' if stream.connected else 'DISCONNECTED'} | "
-            f"{ws:,} pushed / {rest:,} polled ({share:.0f}% streamed) | "
+            f"websocket {'live' if stream.connected else 'closed'} at shutdown | "
+            f"priced {share:.0f}% of {decisions:,} decisions off the stream "
+            f"({ws:,} pushed / {rest:,} polled) | "
             f"{stream.snapshots} snapshots, {stream.gaps} gaps, "
             f"{stream.reconnects} reconnects | "
             f"resync {bad}/{resyncs} mismatched"

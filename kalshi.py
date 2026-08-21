@@ -1102,6 +1102,9 @@ class KalshiBookStream:
     MAX_GAPS_IN_WINDOW = 3
     GAP_WINDOW = 60.0
 
+    #: Rebuild the connection after this many rejected subscription attempts.
+    MAX_RESUBSCRIBES = 3
+
     def __init__(
         self,
         signer: "RsaPssSigner",
@@ -1128,6 +1131,11 @@ class KalshiBookStream:
         self._cmd_id = 0
         self._ws: Any = None
         self._recent_gaps: deque[float] = deque(maxlen=32)
+        #: Server-assigned subscription id. `update_subscription` is rejected
+        #: without it, so until this arrives the only way to change the tracked
+        #: set is a fresh `subscribe`.
+        self._sid: int | None = None
+        self._resubscribes = 0
 
         self.books: dict[str, KalshiBook] = {}
         self.connected = False
@@ -1207,6 +1215,8 @@ class KalshiBookStream:
         self.books.clear()
         self._subscribed.clear()
         self._seq = None
+        self._sid = None
+        self._resubscribes = 0
         self._notify_reset()
 
     def _notify_reset(self) -> None:
@@ -1225,40 +1235,81 @@ class KalshiBookStream:
         await ws.send(_json_dumps({"id": self._cmd_id, "cmd": cmd, "params": dict(params)}))
 
     async def _sync_subscription(self, ws) -> None:
-        """Make the venue's subscription match what we actually want."""
+        """Make the venue's subscription match what we actually want.
+
+        `update_subscription` carries the server-assigned `sid`. Without it the
+        venue answers "Exactly one subscription ID is required" and silently
+        keeps the old market set - which in a live session meant the stream
+        stayed pinned to contracts that had already expired and never delivered
+        another book after the first roll. The REST fallback covered it, so the
+        run looked healthy while pricing off a half-second-old book for thirty
+        minutes.
+        """
         if self._desired == self._subscribed:
             return
-        if not self._subscribed:
-            if not self._desired:
-                return
+        if not self._desired:
+            return
+        if not self._subscribed or self._sid is None:
+            # No subscription yet, or no id to amend one with: start clean.
             await self._send(ws, "subscribe", {
                 "channels": ["orderbook_delta"],
                 "market_tickers": sorted(self._desired),
             })
+            self._levels.clear()
+            self.books.clear()
+            self._notify_reset()
         else:
             added = sorted(self._desired - self._subscribed)
             removed = sorted(self._subscribed - self._desired)
             if added:
-                await self._send(ws, "update_subscription",
-                                 {"action": "add_markets", "market_tickers": added})
+                await self._send(ws, "update_subscription", {
+                    "sid": self._sid, "action": "add_markets",
+                    "market_tickers": added,
+                })
             if removed:
-                await self._send(ws, "update_subscription",
-                                 {"action": "delete_markets", "market_tickers": removed})
+                await self._send(ws, "update_subscription", {
+                    "sid": self._sid, "action": "delete_markets",
+                    "market_tickers": removed,
+                })
         for gone in self._subscribed - self._desired:
             self._levels.pop(gone, None)
             self.books.pop(gone, None)
         self._subscribed = set(self._desired)
+
+    async def _force_resubscribe(self, ws) -> None:
+        """Throw the subscription away so the next sync rebuilds it from scratch.
+
+        Bounded: if rebuilding keeps failing, the connection itself is the
+        problem and reconnecting is the only remaining move. Without the bound
+        this would resubscribe every half second forever, which is how a
+        degraded stream turns into a busy one.
+        """
+        self._subscribed.clear()
+        self._sid = None
+        self._levels.clear()
+        self.books.clear()
+        self._notify_reset()
+        self._resubscribes += 1
+        if self._resubscribes >= self.MAX_RESUBSCRIBES:
+            raise ConnectionError(
+                f"subscription rejected {self._resubscribes} times; reconnecting"
+            )
 
     async def _resnapshot(self, ws) -> None:
         """Throw away local books and ask for fresh ones, without resubscribing."""
         self._levels.clear()
         self.books.clear()
         self._notify_reset()
-        if self._desired:
+        if self._desired and self._sid is not None:
             await self._send(ws, "update_subscription", {
+                "sid": self._sid,
                 "action": "get_snapshot",
                 "market_tickers": sorted(self._desired),
             })
+        elif self._desired:
+            # No id to ask against; rebuilding the subscription is the only way
+            # to get a snapshot back.
+            self._subscribed.clear()
 
     async def _read_until_closed(self, ws) -> None:
         while True:
@@ -1275,11 +1326,26 @@ class KalshiBookStream:
             if not isinstance(msg, dict):
                 continue
             kind = msg.get("type")
+            if kind == "subscribed":
+                self._sid = _int_or_none((msg.get("msg") or {}).get("sid"))
+                self._resubscribes = 0
+                log.info("Kalshi book stream subscribed (sid %s)", self._sid)
+                continue
             if kind == "error":
+                # Not just logged. A rejected command means the venue's idea of
+                # what we are subscribed to no longer matches ours, and every
+                # book we hold is from that point on unmaintained. Tear the
+                # subscription state down so the next pass rebuilds it, rather
+                # than continuing to serve books nobody is updating.
                 log.warning("Kalshi book stream error frame: %s", msg.get("msg"))
+                await self._force_resubscribe(ws)
                 continue
             if kind not in ("orderbook_snapshot", "orderbook_delta"):
                 continue
+            # Every book frame carries the sid too, so the id is recovered even
+            # if the confirmation was missed.
+            if self._sid is None:
+                self._sid = _int_or_none(msg.get("sid"))
             if not await self._check_sequence(ws, msg):
                 continue
             body = msg.get("msg") or {}
@@ -1364,6 +1430,13 @@ class KalshiBookStream:
         if self._on_book is not None:
             with contextlib.suppress(Exception):
                 self._on_book(ticker, book)
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _level_map(raw: Any) -> dict[float, float]:

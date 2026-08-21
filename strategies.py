@@ -289,6 +289,18 @@ def scan_stale(
     #
     # Correct transform, from z = ln(S/K)/(sigma*sqrt(tau)):
     #     z1 = z0*sqrt(tau0/tau1) + delta/(sigma*sqrt(tau1))
+    # Within one contract the clock only runs one way, so an anchor taken
+    # earlier must have had MORE time left than we have now. Less means the
+    # anchor belongs to a different contract - and comparing a fresh
+    # at-the-money market against the mid of one that has just settled is not a
+    # stale quote, it is two unrelated numbers. A live session did exactly this
+    # across a market roll and the decay term below rescued the arithmetic into
+    # something plausible: inv_cdf(0.001) scaled by sqrt(7/831) came back as a
+    # respectable-looking 0.18 fair value, and it was the biggest "edge" of the
+    # run. Refusing here makes that state unexpressible even if some future
+    # caller forgets to clear its anchors.
+    if anchor_tau > 0.0 and anchor_tau < tau:
+        return None
     z0 = _N.inv_cdf(_clamp(anchor_mid))
     if anchor_tau > 0.0 and tau > 0.0:
         z0 *= math.sqrt(anchor_tau / tau)

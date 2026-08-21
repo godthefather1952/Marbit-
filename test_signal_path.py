@@ -3238,6 +3238,13 @@ async def test_book_stream() -> None:
         async def close(self):
             self.closed = True
 
+    def subbed(sid=7, cmd_id=1):
+        return {"type": "subscribed", "id": cmd_id,
+                "msg": {"channel": "orderbook_delta", "sid": sid}}
+
+    def err(msg="Exactly one subscription ID is required", code=12):
+        return {"type": "error", "msg": {"code": code, "msg": msg}}
+
     def snap(seq, ticker="T", yes=(("0.40", "100"),), no=(("0.55", "200"),)):
         return {"type": "orderbook_snapshot", "sid": 1, "seq": seq,
                 "msg": {"market_ticker": ticker, "market_id": "u",
@@ -3341,10 +3348,12 @@ async def test_book_stream() -> None:
     # A 15-minute contract expires roughly every 15 minutes, so this path runs
     # on every roll for the whole session.
     sent.clear()
-    s, ws = stream([snap(1)], tickers=("T",))
+    s, ws = stream([subbed(sid=7), snap(1)], tickers=("T",))
     with contextlib.suppress(asyncio.CancelledError):
         await s._read_until_closed(ws)
     check("the first sync is a plain subscribe", sent[0]["cmd"] == "subscribe")
+    check("the server-assigned subscription id is captured", s._sid == 7,
+          "without it every later update_subscription is rejected")
 
     s.track("T", "U")
     await s._sync_subscription(ws)
@@ -3353,7 +3362,13 @@ async def test_book_stream() -> None:
           and sent[-1]["params"]["action"] == "add_markets"
           and sent[-1]["params"]["market_tickers"] == ["U"],
           f"{sent[-1]}")
-    check("and the existing book survives the change",
+    # A live session sent this without the sid. The venue answered "Exactly one
+    # subscription ID is required", kept the old market set, and the stream
+    # never delivered another book after the first contract roll - for thirty
+    # minutes, while the run looked healthy.
+    check("and it carries the subscription id",
+          sent[-1]["params"].get("sid") == 7, f"{sent[-1]['params']}")
+    check("the existing book survives the change",
           s.book("T") is not None, "no needless resubscribe")
 
     s.track("U")
@@ -3361,10 +3376,43 @@ async def test_book_stream() -> None:
           s.book("T") is None,
           "an untracked contract must not be readable back out of the stream")
     await s._sync_subscription(ws)
-    check("and tells the venue to stop sending it",
+    check("and tells the venue to stop sending it, with the id",
           sent[-1]["params"]["action"] == "delete_markets"
-          and sent[-1]["params"]["market_tickers"] == ["T"],
+          and sent[-1]["params"]["market_tickers"] == ["T"]
+          and sent[-1]["params"].get("sid") == 7,
           f"{sent[-1]}")
+
+    # The sid can be recovered from a book frame if the confirmation is missed.
+    s, ws = stream([snap(1)], tickers=("T",))
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("a missed confirmation does not cost us the id",
+          s._sid == 1, f"sid {s._sid} recovered from the snapshot frame")
+
+    # -- a rejected command must not be logged and ignored ------------------- #
+    sent.clear()
+    resets.clear()
+    s, ws = stream([subbed(sid=7), snap(1), err(), None], tickers=("T",))
+    with contextlib.suppress(asyncio.CancelledError):
+        await s._read_until_closed(ws)
+    check("a rejected command tears down the subscription, not just the log line",
+          s.book("T") is None and resets,
+          "books nobody is updating must stop being served")
+    check("and the next pass rebuilds it from scratch",
+          sent[-1]["cmd"] == "subscribe",
+          f"{[m['cmd'] for m in sent]}")
+
+    s, ws = stream([subbed(sid=7), err(), err(), err(), err()], tickers=("T",))
+    raised = None
+    try:
+        await s._read_until_closed(ws)
+    except ConnectionError as exc:
+        raised = exc
+    except asyncio.CancelledError:
+        pass
+    check("a subscription that keeps being rejected forces a reconnect",
+          raised is not None,
+          "otherwise it resubscribes every half second forever")
 
     # -- identity: version is content, seq is continuity --------------------- #
     s, ws = stream([snap(1), snap(2)])
@@ -3627,6 +3675,30 @@ async def test_accuracy_upgrades() -> None:
     check("the correction matches the closed form z0*sqrt(tau0/tau1)",
           abs(_ND().cdf(z0 * _m.sqrt(90.0 / 30.0)) - 0.8181) < 1e-3,
           "a 0.70 anchor at tau 90 is really 0.818 by tau 30")
+
+    # -- an anchor from a DIFFERENT contract ---------------------------------- #
+    # A live session carried anchors across the market roll and compared a fresh
+    # at-the-money contract against the mid of the one that had just settled:
+    # "market mid was 0.001, tau 7->831s". Worse, the decay term rescued the
+    # arithmetic - inv_cdf(0.001) scaled by sqrt(7/831) came back as a
+    # respectable 0.18 - so it produced the two largest "edges" of the run.
+    fresh_mkt = mkt(850.0)
+    tau_now = fresh_mkt.effective_tau()
+    settled_anchor = scan_stale(
+        fresh_mkt, book([(0.20, 500)], [(0.76, 500)]),
+        71_890.0, 0.001, 71_640.0, 20.0, -9.0, 1.8e-4,
+        require_implied=False, max_edge=0.0, anchor_tau=7.0)
+    check("an anchor with LESS time left than now is refused",
+          settled_anchor is None,
+          f"tau 7->{tau_now:.0f}s: the clock only runs one way inside one "
+          f"contract, so this anchor is another market's")
+    ok_anchor = scan_stale(
+        fresh_mkt, book([(0.20, 500)], [(0.76, 500)]),
+        71_890.0, 0.30, 71_640.0, 20.0, -9.0, 1.8e-4,
+        require_implied=False, max_edge=0.0, anchor_tau=tau_now + 20.0)
+    check("a genuine anchor from 20s ago still works",
+          ok_anchor is not None,
+          "the guard must not fire on the normal case")
 
     # -- ENDGAME prices the settlement average, not the original strike ------ #
     # Inside the final 60s the contract settles on a mean that is PART PRINTED.
