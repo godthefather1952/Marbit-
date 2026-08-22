@@ -2445,6 +2445,27 @@ async def test_autopilot() -> None:
           "$+" in net_line and "$-" not in net_line,
           f"bought NO at 0.89, sold at 0.919, market then settled YES ->{net_line}")
 
+    # A live session had reduce_only refuse a probe's take-profit - the position
+    # was already gone - and a "closed" row at 0.9990 was written anyway. The
+    # scorer reads a closed row as THE outcome, so it graded a sale that never
+    # happened. A refused exit must leave the trade graded on its settlement.
+    failed = [_sig("STALE", "M7", "ETH", 0.65, 1.0)]
+    failed_rows = [_exe("STALE", "M7", "filled"), _exe("STALE", "M7", "exit_failed")]
+    failed_rows[0].update(count=1, price=0.65)
+    failed_rows[1].update(count=1, price=0.65)
+    idx = _execution_index(failed_rows)
+    check("an exit that did not fill is not an exit price",
+          idx[("STALE", "M7")]["exit_price"] is None
+          and idx[("STALE", "M7")]["outcome"] == "filled",
+          "the position rode to settlement and must be graded there")
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        score_trades(failed, {"M7": {"result": "yes"}}, failed_rows)
+    net_line = next((l for l in buf.getvalue().splitlines() if "ACTUAL net" in l), "")
+    check("so a refused take-profit is graded on the real outcome",
+          "$+" in net_line,
+          f"held YES at 0.65, settled YES ->{net_line}")
+
     idx = _execution_index(exit_rows)
     check("the exit price is carried alongside the entry",
           abs(idx[("STALE", "M2")]["exit_price"] - 0.919) < 1e-9

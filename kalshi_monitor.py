@@ -1646,24 +1646,58 @@ class Monitor:
                 # this call, so the delta across it IS this exit's P&L - more
                 # reliable than recomputing it from a partially filled result.
                 before = trader.realized
-                await trader.close_position(order, price, reason)
+                result = await trader.close_position(order, price, reason)
                 booked = trader.realized - before
+                self._committed.get(order.ticker, set()).discard(order.outcome)
+
+                if not result.ok:
+                    # An exit that did not fill is not an exit. A live session
+                    # had reduce_only refuse a probe's take-profit - the
+                    # position was already gone - and still wrote a "closed"
+                    # row at 0.9990 into the ledger. The scorer reads a closed
+                    # row as THE outcome of the trade, so it would have graded
+                    # a sale that never happened. close_position has already
+                    # dropped the position from tracking and said why; the only
+                    # honest record here is that we tried and could not.
+                    self._replay_event(
+                        "exit_failed", ticker=order.ticker,
+                        strategy=order.strategy, side=order.outcome,
+                        reason=reason, entry=order.price, wanted=price,
+                        count=order.count, error=result.error or "",
+                        seconds_left=round(left, 1),
+                    )
+                    if self.ledger is not None:
+                        with contextlib.suppress(Exception):
+                            self.ledger.record_execution(
+                                _ExitStub(order.strategy, order.ticker),
+                                "exit_failed",
+                                count=order.count,
+                                price=order.price,
+                                detail=(
+                                    f"{reason} at {price:.4f} did not fill; "
+                                    f"position untracked from here"
+                                ),
+                            )
+                    continue
+
                 self._track_close(order, price, booked)
                 self._replay_event(
                     "exit", ticker=order.ticker, strategy=order.strategy,
                     side=order.outcome, reason=reason, entry=order.price,
-                    exit=price, count=order.count, realized=round(booked, 4),
+                    exit=price, count=result.count, realized=round(booked, 4),
                     seconds_left=round(left, 1),
                 )
-                self._committed.get(order.ticker, set()).discard(order.outcome)
                 if self.ledger is not None:
                     with contextlib.suppress(Exception):
                         self.ledger.record_execution(
                             _ExitStub(order.strategy, order.ticker),
                             "closed",
-                            count=order.count,
-                            price=price,
-                            detail=f"{reason} at {price:.4f} from {order.price:.4f}",
+                            count=result.count,
+                            price=result.price,
+                            detail=(
+                                f"{reason} at {result.price:.4f} "
+                                f"from {order.price:.4f}"
+                            ),
                             signal_price=order.price,
                         )
 
