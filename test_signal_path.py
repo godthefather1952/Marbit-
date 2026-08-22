@@ -2580,6 +2580,42 @@ async def test_autopilot() -> None:
     check("predicted and realized edge are compared per contract",
           "per contract" in out and "predicted" in out)
 
+    # A live session blended warm-up paper fills with real ones and reported
+    # "ETH:STALE ... realized $-5.24" for an account that ended the hour up
+    # seven cents: $4.61 of it was a paper fill of 94 contracts sized off the
+    # assumed $75 balance, on an account holding $20.75. The same blend printed
+    # "slip +1.29c/contract" beside real fills that slipped 0.09c and 0.00c.
+    from kalshi_monitor import StrategyStats as _SS
+
+    st = _SS()
+    st.attempted = 3
+    paper = st.book(False)
+    paper.count, paper.contracts = 1, 94
+    paper.slippage_cents, paper.slippage_n = 1.7 * 94, 94
+    paper.realized, paper.predicted, paper.settled = -4.61, 2.09, 1
+    real = st.book(True)
+    real.count, real.contracts = 2, 32
+    real.slippage_cents, real.slippage_n = 0.09 * 28, 32
+    real.realized, real.predicted = -0.62, 0.65
+    real.closed, real.settled, real.wins = 1, 1, 1
+
+    check("real and paper fills are never summed into one P&L",
+          abs(st.real.realized + 0.62) < 1e-9
+          and abs(st.paper.realized + 4.61) < 1e-9,
+          "the account moved -0.62, not -5.23")
+    check("nor into one slippage figure",
+          st.real.avg_slippage < 0.1 < st.paper.avg_slippage,
+          f"real {st.real.avg_slippage:+.2f}c vs paper "
+          f"{st.paper.avg_slippage:+.2f}c - the simulator fills at our own "
+          f"limit, which is a bound and not a measurement")
+    rendered = st.line()
+    check("and the summary line reports them apart",
+          "REAL" in rendered and "paper" in rendered
+          and "-0.62" in rendered and "-4.61" in rendered,
+          rendered)
+    check("fill rate still counts every fill",
+          st.filled == 3 and abs(st.fill_rate - 1.0) < 1e-9)
+
     missed = [_sig("STALE", "M8", "BTC", 0.40, 10.0)]
     miss_rows = [_exe("STALE", "M8", "rejected"), _exe("STALE", "M8", "rejected"),
                  _exe("STALE", "M8", "filled")]

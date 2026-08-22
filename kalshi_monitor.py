@@ -154,19 +154,62 @@ class StrategyStats:
     about direction on every trade and still lose, if the price it pays is
     consistently worse than the quote that justified the trade - and that shows
     up here as a healthy predicted edge against a negative realized one.
+
+    REAL and SIMULATED fills are kept apart, always. A live session blended them
+    and reported "ETH:STALE ... realized $-5.24" for an account that ended the
+    hour up seven cents: $4.61 of that was a warm-up paper fill of 94 contracts
+    sized off the assumed $75 balance, on an account holding $20.75. The same
+    blend put "slip +1.29c/contract" next to real fills that had slipped 0.09c,
+    0.00c and 0.00c - because the dry simulator fills at our own marketable
+    limit, which is an upper bound and not an execution measurement at all.
+    Mixing the two makes exactly the numbers you would use to judge live
+    execution the ones you cannot trust.
     """
 
-    __slots__ = (
-        "attempted", "filled", "rejected", "skipped", "contracts",
-        "slippage_cents", "slippage_n", "fill_ms", "exit_ms",
-        "predicted", "realized", "closed", "settled", "wins",
-    )
+    __slots__ = ("attempted", "rejected", "skipped", "real", "paper")
 
     def __init__(self) -> None:
         self.attempted = 0
-        self.filled = 0
         self.rejected = 0
         self.skipped = 0
+        self.real = _Fills()
+        self.paper = _Fills()
+
+    @property
+    def filled(self) -> int:
+        return self.real.count + self.paper.count
+
+    @property
+    def fill_rate(self) -> float:
+        return self.filled / self.attempted if self.attempted else 0.0
+
+    def book(self, real: bool) -> "_Fills":
+        return self.real if real else self.paper
+
+    def line(self) -> str:
+        parts = [
+            f"attempted {self.attempted}",
+            f"filled {self.filled} ({self.fill_rate * 100:.0f}%)",
+        ]
+        if self.real.count:
+            parts.append(f"REAL {self.real.summary()}")
+        if self.paper.count:
+            parts.append(f"paper {self.paper.summary()}")
+        if not self.filled:
+            parts.append("no fills")
+        return " | ".join(parts)
+
+
+class _Fills:
+    """One side of the real/paper split. See StrategyStats."""
+
+    __slots__ = (
+        "count", "contracts", "slippage_cents", "slippage_n",
+        "fill_ms", "exit_ms", "predicted", "realized", "closed", "settled", "wins",
+    )
+
+    def __init__(self) -> None:
+        self.count = 0
         self.contracts = 0.0
         self.slippage_cents = 0.0
         self.slippage_n = 0
@@ -179,15 +222,11 @@ class StrategyStats:
         self.wins = 0
 
     @property
-    def fill_rate(self) -> float:
-        return self.filled / self.attempted if self.attempted else 0.0
-
-    @property
     def avg_slippage(self) -> float:
         """Cents per contract paid above the quote that produced the signal."""
         return self.slippage_cents / self.slippage_n if self.slippage_n else 0.0
 
-    def line(self) -> str:
+    def summary(self) -> str:
         def med(values):
             if not values:
                 return "n/a"
@@ -195,19 +234,19 @@ class StrategyStats:
             return f"{ordered[len(ordered) // 2] / 1000.0:.1f}s"
 
         parts = [
-            f"attempted {self.attempted}",
-            f"filled {self.filled} ({self.fill_rate * 100:.0f}%)",
-            f"{self.contracts:g} contracts",
+            f"{self.count} fills, {self.contracts:g} contracts",
             f"slip {self.avg_slippage:+.2f}c/contract",
             f"fill {med(self.fill_ms)}",
         ]
         if self.closed:
             parts.append(f"exit {med(self.exit_ms)} ({self.closed} closed early)")
-        if self.settled or self.closed:
-            graded = self.settled + self.closed
+        graded = self.settled + self.closed
+        if graded:
             parts.append(f"won {self.wins}/{graded}")
-        parts.append(f"predicted ${self.predicted:+.2f} vs realized ${self.realized:+.2f}")
-        return " | ".join(parts)
+        parts.append(
+            f"predicted ${self.predicted:+.2f} vs realized ${self.realized:+.2f}"
+        )
+        return " (" + ", ".join(parts) + ")"
 
 
 class _ExitStub:
@@ -1279,18 +1318,19 @@ class Monitor:
         stats = self._stats_for(sig)
         stats.attempted += 1
         if outcome in ("filled", "simulated"):
-            stats.filled += 1
-            stats.contracts += result.count
-            stats.fill_ms.append(elapsed_ms)
+            book = stats.book(outcome == "filled")
+            book.count += 1
+            book.contracts += result.count
+            book.fill_ms.append(elapsed_ms)
             if result.price and leg.price:
                 # Positive means we paid MORE than the quote that justified the
                 # trade. Signed, because a limit that improves is real too.
-                stats.slippage_cents += (result.price - leg.price) * 100.0 * result.count
-                stats.slippage_n += result.count
+                book.slippage_cents += (result.price - leg.price) * 100.0 * result.count
+                book.slippage_n += result.count
             # The model's claim, scaled to what actually filled rather than to
             # the nominal size the signal was written against.
             nominal = sum(l.size for l in sig.legs) or 1.0
-            stats.predicted += sig.expected_net * (result.count / nominal)
+            book.predicted += sig.expected_net * (result.count / nominal)
             self._entry_mono[(sig.ticker, leg.side)] = time.monotonic()
         elif outcome == "rejected":
             stats.rejected += 1
@@ -1302,13 +1342,14 @@ class Monitor:
         stats = self._strategy_stats.get(self._stats_key(order))
         if stats is None:
             return
-        stats.closed += 1
-        stats.realized += realized
+        book = stats.book(not order.dry_run)
+        book.closed += 1
+        book.realized += realized
         if realized > 0:
-            stats.wins += 1
+            book.wins += 1
         entered = self._entry_mono.pop((order.ticker, order.outcome), None)
         if entered is not None:
-            stats.exit_ms.append((time.monotonic() - entered) * 1000.0)
+            book.exit_ms.append((time.monotonic() - entered) * 1000.0)
 
     def _record_execution(self, sig, outcome: str, **kw) -> None:
         """Write the companion execution row, so nothing downstream can read a
@@ -1671,10 +1712,11 @@ class Monitor:
             stats = self._strategy_stats.get(self._stats_key(order))
             if stats is None:
                 continue
-            stats.settled += 1
-            stats.realized += booked * (order.stake / total_stake)
+            book = stats.book(not order.dry_run)
+            book.settled += 1
+            book.realized += booked * (order.stake / total_stake)
             if (order.outcome == "YES") == (result == "yes"):
-                stats.wins += 1
+                book.wins += 1
             self._entry_mono.pop((order.ticker, order.outcome), None)
 
     async def _heartbeat_loop(self) -> None:
