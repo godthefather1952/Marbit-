@@ -1579,7 +1579,11 @@ class Monitor:
             log.error("TRADING HALTED: %s", trader.halt_reason)
             return False
 
+        before = trader.realized
         result = await trader.close_position(residual, mark, "cross-repair")
+        booked = trader.realized - before
+        if result.ok:
+            self._track_close(residual, result.price, booked)
         self._record_execution(
             sig,
             "closed" if result.ok else "exit_failed",
