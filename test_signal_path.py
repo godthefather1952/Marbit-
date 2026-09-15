@@ -2511,8 +2511,8 @@ async def test_autopilot() -> None:
     failed_rows[1].update(count=1, price=0.65)
     idx = _execution_index(failed_rows)
     check("an exit that did not fill is not an exit price",
-          idx[("STALE", "M7")]["exit_price"] is None
-          and idx[("STALE", "M7")]["outcome"] == "filled",
+          not idx[("STALE", "M7", "")]["closes"]
+          and idx[("STALE", "M7", "")]["outcome"] == "filled",
           "the position rode to settlement and must be graded there")
     buf = _io.StringIO()
     with redirect_stdout(buf):
@@ -2524,15 +2524,16 @@ async def test_autopilot() -> None:
 
     idx = _execution_index(exit_rows)
     check("the exit price is carried alongside the entry",
-          abs(idx[("STALE", "M2")]["exit_price"] - 0.919) < 1e-9
-          and idx[("STALE", "M2")]["count"] == 2)
+          abs(idx[("STALE", "M2", "")]["closes"][0]["price"] - 0.919) < 1e-9
+          and idx[("STALE", "M2", "")]["count"] == 2)
 
     # "filled" must win over an earlier "skipped" on the same market.
     idx = _execution_index([_exe("STALE", "M1", "skipped"), _exe("STALE", "M1", "filled")])
     check("a later fill outranks an earlier skip",
-          idx[("STALE", "M1")]["outcome"] == "filled")
+          idx[("STALE", "M1", "")]["outcome"] == "filled")
     idx = _execution_index([_exe("STALE", "M1", "filled"), _exe("STALE", "M1", "skipped")])
-    check("and order does not matter", idx[("STALE", "M1")]["outcome"] == "filled")
+    check("and order does not matter",
+          idx[("STALE", "M1", "")]["outcome"] == "filled")
 
     # The ledger must actually write these rows.
     with tempfile.TemporaryDirectory() as tmp:
