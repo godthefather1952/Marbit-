@@ -1658,6 +1658,16 @@ async def test_run_log() -> None:
     from pathlib import Path
 
     from run_log import run_log_name, start_run_log
+    from kalshi_main import git_identity
+
+    git_branch, git_commit, git_dirty = git_identity()
+    check(
+        "git identity logging returns safe strings",
+        isinstance(git_branch, str)
+        and isinstance(git_commit, str)
+        and git_dirty in {"true", "false", "unknown"},
+        f"branch={git_branch} commit={git_commit[:12]} dirty={git_dirty}",
+    )
 
     cases = [
         ("2026-08-13T06:32:45+00:00", "L_081326_063245.log"),
