@@ -31,6 +31,11 @@ class ProofGate:
         "LATENCY": 96.0,
         "TWAP_LOCK": 98.0,
     }
+    STRATEGY_PROOF = {
+        "CROSS": "ARBITRAGE",
+        "STALE": "LATENCY",
+        "TWAP_LOCK": "TWAP_LOCK",
+    }
 
     def validate(self, signal: Signal, min_edge: float = 0.0) -> ProofVerdict:
         proof = signal.proof
@@ -46,6 +51,19 @@ class ProofGate:
             return ProofVerdict(
                 False,
                 "proof predicate failed: " + ", ".join(sorted(failed)),
+            )
+
+        expected = self.STRATEGY_PROOF.get(signal.strategy)
+        if expected is None:
+            return ProofVerdict(
+                False,
+                f"strategy {signal.strategy} has no approved proof type",
+            )
+        if proof.proof_type != expected:
+            return ProofVerdict(
+                False,
+                f"strategy {signal.strategy} requires {expected}, got "
+                f"{proof.proof_type}",
             )
 
         required = self.MIN_SCORE.get(proof.proof_type, 100.0)
