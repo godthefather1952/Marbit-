@@ -1602,6 +1602,21 @@ class Monitor:
             )
             log.error("TRADING HALTED: %s", trader.halt_reason)
             return False
+
+        if not residual.closed and residual.count > 0:
+            # close_position correctly leaves a partially-exited position open.
+            # This residual was detached from the original matched leg, so put
+            # it back into the trader's tracked set before halting; otherwise a
+            # second partial fill would create invisible directional exposure.
+            if residual not in trader._orders:
+                trader._orders.append(residual)
+            trader.halted = True
+            trader.halt_reason = (
+                f"CROSS emergency flatten was partial; {residual.count} "
+                "unmatched contract(s) remain tracked"
+            )
+            log.error("TRADING HALTED: %s", trader.halt_reason)
+            return False
         return True
 
     def _signal_proof_context_problem(self, sig, inst) -> str | None:
