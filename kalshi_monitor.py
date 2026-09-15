@@ -1986,6 +1986,81 @@ class Monitor:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._work.wait(), timeout=1.0)
 
+    def _proof_exit_reason(self, order, inst, market, book):
+        """Exit when the machine-checkable reason for owning the position dies."""
+        trader = self.trader
+        if trader is None or not order.proof_id:
+            return None
+        proof = self._proof_by_id.get(order.proof_id)
+        if proof is None:
+            return None
+
+        mark = trader.mark(order, book)
+        if mark is None:
+            return None
+
+        if getattr(proof, "proof_type", "") == "LATENCY":
+            metrics = getattr(proof, "metrics", {})
+            anchor = float(metrics.get("anchor_spot") or 0.0)
+            entry = float(metrics.get("entry_spot") or 0.0)
+            direction = float(metrics.get("direction") or 0.0)
+            tick = inst.buffer.last()
+
+            # The latency thesis needs the same evidence after entry that it
+            # needed before entry: live external spot, reference quorum and a
+            # healthy streamed book.
+            stream_ok = (
+                self._book_stream is not None
+                and self._book_stream.connected
+                and inst.book_source == "ws"
+            )
+            quorum_ok = inst.basis is not None and inst.basis.venues >= 2
+            spot_ok = (
+                tick is not None
+                and time.monotonic() - tick.mono <= self._args.stale_max_spot_age
+            )
+            if not (stream_ok and quorum_ok and spot_ok):
+                return ("proof-invalidated: latency evidence degraded", mark)
+
+            if anchor > 0.0 and entry > 0.0 and tick is not None:
+                original = (entry - anchor) / anchor
+                current = (tick.price - anchor) / anchor
+                if direction * current <= 0.0:
+                    return ("proof-invalidated: impulse reversed", mark)
+                if abs(original) > 0.0 and abs(current) < abs(original) * 0.30:
+                    return ("proof-invalidated: impulse retraced >70%", mark)
+
+        elif getattr(proof, "proof_type", "") == "TWAP_LOCK":
+            realized = self._realized_twap(inst, market, time.monotonic())
+            tick = inst.buffer.last()
+            if realized is None or tick is None:
+                return ("proof-invalidated: settlement evidence unavailable", mark)
+
+            implied = implied_sigma(market, book, tick.price)
+            if implied is None:
+                return ("proof-invalidated: settlement volatility unvalidated", mark)
+
+            sigma = max(inst.buffer.sigma_per_sqrt_second(), implied)
+            z = market.realized_z(
+                tick.price,
+                sigma,
+                realized,
+                reference_error=self._reference_error(inst),
+            )
+            direction = float(getattr(proof, "metrics", {}).get("direction") or 0.0)
+            threshold = max(self._args.endgame_z, 3.5)
+            if z is None:
+                return ("proof-invalidated: settlement lock cannot be recomputed", mark)
+            if direction * z <= 0.0:
+                return ("proof-invalidated: settlement lock flipped", mark)
+            if abs(z) < threshold:
+                return (
+                    f"proof-invalidated: settlement lock fell to {abs(z):.2f}z",
+                    mark,
+                )
+
+        return None
+
     async def _manage_exits(self) -> None:
         """Mark open positions against the live book and take profits.
 
@@ -1998,7 +2073,7 @@ class Monitor:
         those into settlement.
         """
         trader = self.trader
-        if trader is None or trader.limits.take_profit_multiple <= 0:
+        if trader is None:
             return
         # Books are per-instrument, so a position can only be marked against
         # the instrument that owns its ticker.
@@ -2012,7 +2087,9 @@ class Monitor:
                 # payout. Selling one side independently destroys the hedge.
                 if order.strategy == "CROSS":
                     continue
-                decision = trader.exit_reason(order, book, left)
+                decision = self._proof_exit_reason(order, inst, market, book)
+                if decision is None:
+                    decision = trader.exit_reason(order, book, left)
                 if decision is None:
                     continue
                 reason, price = decision
