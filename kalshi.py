@@ -350,6 +350,38 @@ class KalshiMarket:
         )
         return None if z is None else clamp_prob(norm_cdf(z))
 
+    def required_remaining_average(
+        self,
+        realized: tuple[float, float],
+        now: float | None = None,
+    ) -> float | None:
+        """Average price the UNREALIZED settlement stub must print to reach strike.
+
+        This is the human-auditable form of the TWAP-lock proof. It uses clock
+        time to determine how much of the settlement window has elapsed and
+        refuses to speak when our tape did not cover enough of that elapsed
+        slice. A value far away from current spot means the losing outcome
+        requires an extreme remaining path; None means we cannot prove that.
+        """
+        observed_mean, covered = realized
+        lookback = self.twap_lookback
+        if (
+            lookback <= 0.0
+            or observed_mean <= 0.0
+            or covered <= 0.0
+            or not self.strike_known
+        ):
+            return None
+
+        remaining = self.seconds_remaining(now)
+        r = max(min(remaining, lookback), 0.0)
+        e = lookback - r
+        if e <= 0.0 or r <= 0.0:
+            return None
+        if covered < e * MIN_TWAP_COVERAGE:
+            return None
+        return (lookback * self.strike - e * observed_mean) / r
+
     def realized_z(
         self,
         spot: float,
@@ -513,6 +545,36 @@ class KalshiBook:
         if taken <= 0:
             return None
         return spend / taken, taken
+
+    def take_quote(
+        self, side: str, contracts: float
+    ) -> tuple[float, float, float] | None:
+        """VWAP, fillable quantity and worst price needed to take the quantity.
+
+        CROSS needs the worst touched level as its IOC limit, not just a VWAP.
+        The pair is only an arbitrage if both legs can be bounded before the
+        first order is sent.
+        """
+        source = self.no_levels if side == "YES" else self.yes_levels
+        offers = sorted(
+            ((round(1.0 - p, 4), q) for p, q in source if 0.0 < p < 1.0),
+            key=lambda pq: pq[0],
+        )
+        taken = 0.0
+        spend = 0.0
+        worst = 0.0
+        for price, qty in offers:
+            if taken >= contracts:
+                break
+            lot = min(qty, contracts - taken)
+            if lot <= 0:
+                continue
+            spend += lot * price
+            taken += lot
+            worst = price
+        if taken <= 0.0:
+            return None
+        return spend / taken, taken, worst
 
     @property
     def yes_mid(self) -> float | None:
