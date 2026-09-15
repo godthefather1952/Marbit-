@@ -2146,22 +2146,31 @@ async def test_setup_and_confirmation() -> None:
         check("a strategy opinion without TradeProof fails closed",
               not mon._pending_orders)
 
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        wrong = sig()
+        wrong.proof = _proof("TWAP_LOCK")
+        mon._emit(wrong)
+        check("a strategy cannot borrow another strategy's proof type",
+              not mon._pending_orders)
+
     # -- two strategies must not take opposite sides of one market ---------- #
     # L_081726_031221 bought ENDGAME NO @ 0.975 and, 32s later, STALE YES @
     # 0.820 on the SAME contract. Settlement pays exactly one, so the pair is a
     # guaranteed loss of both fees plus the gap - and it meant two of our own
     # strategies flatly disagreed while we funded both opinions.
     def named(strategy: str, side: str, price: float) -> Signal:
+        kind = "TWAP_LOCK" if strategy == "TWAP_LOCK" else "LATENCY"
         return Signal(
             strategy=strategy, ticker="KXBTC15M-SAME", legs=[Leg(side, price, 20.0)],
             fair_yes=0.5, expected_net=0.4, max_loss=8.0, spot=63_300.0,
             strike=63_337.0, seconds_left=100.0, sigma_used=2.5e-5,
-            proof=_proof(),
+            proof=_proof(kind),
         )
 
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.0, 1, tmp)
-        mon._emit(named("ENDGAME", "NO", 0.975))
+        mon._emit(named("TWAP_LOCK", "NO", 0.975))
         check("the first side is taken", len(mon._pending_orders) == 1)
         mon._emit(named("STALE", "YES", 0.820))
         check("a second strategy cannot buy the opposing side of the same market",
