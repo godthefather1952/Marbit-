@@ -1155,22 +1155,26 @@ class Monitor:
             if not model_ok:
                 _count_diag(twap_diag, "model_not_validated")
             else:
-                realized = self._realized_twap(inst, market, now_mono)
-                sig = scan_twap_lock(
-                    market,
-                    book,
-                    spot,
-                    args.size,
-                    sigma,
-                    realized=realized,
-                    reference_error=self._reference_error(inst),
-                    min_z=max(args.endgame_z, 3.5),
-                    min_edge=args.min_edge,
-                    diagnostics=twap_diag,
-                )
-                if sig:
-                    _count_diag(twap_diag, "proof_forwarded")
-                    found.append(sig)
+                remaining = market.seconds_remaining()
+                if market.twap_lookback <= 0.0 or remaining >= market.twap_lookback:
+                    _count_diag(twap_diag, "settlement_window_not_open")
+                else:
+                    realized = self._realized_twap(inst, market, now_mono)
+                    sig = scan_twap_lock(
+                        market,
+                        book,
+                        spot,
+                        args.size,
+                        sigma,
+                        realized=realized,
+                        reference_error=self._reference_error(inst),
+                        min_z=max(args.endgame_z, 3.5),
+                        min_edge=args.min_edge,
+                        diagnostics=twap_diag,
+                    )
+                    if sig:
+                        _count_diag(twap_diag, "proof_forwarded")
+                        found.append(sig)
 
         for sig in found:
             self._emit(sig, inst)
