@@ -77,6 +77,11 @@ EXCESSIVE_TIME_SKEW = "EXCESSIVE_TIME_SKEW"
 STALE_REFERENCE = "STALE_REFERENCE"
 
 
+def _count_diag(bucket: dict[str, int], key: str) -> None:
+    """Increment a strategy diagnostic counter without affecting decisions."""
+    bucket[key] = bucket.get(key, 0) + 1
+
+
 def freshness_problem(
     inst, now_mono: float, max_spot_age: float, max_book_age: float,
     max_skew: float, max_reference_age: float,
@@ -300,6 +305,9 @@ class Instrument:
         #: Data-quality refusals by reason, so the summary can say which feed
         #: problem is actually costing trades.
         self.stale_rejections: dict[str, int] = {}
+        #: Strategy-level proof diagnostics. These counters are write-only
+        #: telemetry: they explain refusals but never participate in decisions.
+        self.proof_diagnostics: dict[str, dict[str, int]] = {}
         #: Which path last supplied the book, and how often each did. A run that
         #: silently fell back to REST polling all session looks identical in the
         #: log to one on a healthy stream unless this is counted.
@@ -862,6 +870,24 @@ class Monitor:
             lines += [""] + self._instrument_lines(inst, elapsed)
         return lines
 
+    def _proof_diagnostic_lines(self, inst: Instrument) -> list[str]:
+        """Human-readable refusal accounting for proof-producing strategies."""
+        if not inst.proof_diagnostics:
+            return []
+        out = [
+            "   proof diagnostics (evaluation passes; predicate failures may overlap):"
+        ]
+        for strategy in ("STALE", "TWAP_LOCK"):
+            bucket = inst.proof_diagnostics.get(strategy, {})
+            if not bucket:
+                continue
+            out.append(f"      {strategy}:")
+            for reason, count in sorted(
+                bucket.items(), key=lambda item: (-item[1], item[0])
+            ):
+                out.append(f"         {reason:<30} {count:,}")
+        return out
+
     def _strategy_lines(self) -> list[str]:
         """Per-strategy, per-instrument record - six experiments, not one.
 
@@ -925,6 +951,7 @@ class Monitor:
             f"   observations  : {inst.observations:,}",
             f"   signals       : {inst.signals}",
         ]
+        lines += self._proof_diagnostic_lines(inst)
         if inst.stale_rejections:
             total = sum(inst.stale_rejections.values())
             lines.append(
@@ -1041,13 +1068,9 @@ class Monitor:
             ]
         return lines
 
-    def _run_strategies(self, inst, market, book, spot, sigma, now_mono, vol_ok: bool) -> None:
-        """Run proof-producing strategies.
 
-        CROSS is mechanical. STALE must prove a conservative latency residual.
-        TWAP_LOCK is allowed only when the realized settlement slice itself can
-        speak; the old terminal ENDGAME fallback is intentionally not run.
-        """
+    def _run_strategies(self, inst, market, book, spot, sigma, now_mono, vol_ok: bool) -> None:
+        """Run proof-producing strategies and account for every refusal stage."""
         args = self._args
         found = []
 
@@ -1059,9 +1082,7 @@ class Monitor:
         model_ok = vol_ok or args.allow_unvalidated_vol
 
         if not args.no_stale:
-            # Event-driven anchor: use the market state immediately BEFORE the
-            # largest spot impulse inside the short lookback. This turns STALE
-            # from "20-second momentum" into "Kalshi underreacted to THIS move".
+            stale_diag = inst.proof_diagnostics.setdefault("STALE", {})
             move = inst.buffer.largest_move(args.anchor_age)
             anchor = None
             if move is not None:
@@ -1070,7 +1091,11 @@ class Monitor:
                         anchor = (price, mid, atau, asigma, ts)
                     else:
                         break
-            if anchor and move is not None:
+            if move is None:
+                _count_diag(stale_diag, "no_impulse_history")
+            elif anchor is None:
+                _count_diag(stale_diag, "no_pre_impulse_anchor")
+            else:
                 sig = scan_stale(
                     market,
                     book,
@@ -1090,11 +1115,9 @@ class Monitor:
                     anchor_sigma=anchor[3] if anchor[3] > 0.0 else None,
                     anchor_elapsed=max(now_mono - anchor[4], 0.05),
                     min_move_z=args.stale_min_z,
+                    diagnostics=stale_diag,
                 )
                 if sig and sig.proof is not None:
-                    # Latency trades need independent reference quorum and the
-                    # low-latency websocket book. REST fallback remains valid
-                    # for other strategies but cannot prove who moved first.
                     basis = inst.basis
                     quorum = basis is not None and basis.venues >= 2
                     streamed = (
@@ -1114,28 +1137,43 @@ class Monitor:
                         basis.venues if basis is not None else 0
                     )
                     sig.proof.metrics["reference_error"] = self._reference_error(inst)
-                    if quorum and streamed and spot_fresh:
-                        found.append(sig)
 
-        if not args.no_endgame and model_ok:
-            realized = self._realized_twap(inst, market, now_mono)
-            sig = scan_twap_lock(
-                market,
-                book,
-                spot,
-                args.size,
-                sigma,
-                realized=realized,
-                reference_error=self._reference_error(inst),
-                min_z=max(args.endgame_z, 3.5),
-                min_edge=args.min_edge,
-            )
-            if sig:
-                found.append(sig)
+                    if quorum and streamed and spot_fresh:
+                        _count_diag(stale_diag, "proof_forwarded")
+                        found.append(sig)
+                    else:
+                        _count_diag(stale_diag, "external_predicate_refused")
+                        if not quorum:
+                            _count_diag(stale_diag, "reference_quorum_failed")
+                        if not streamed:
+                            _count_diag(stale_diag, "streamed_book_unavailable")
+                        if not spot_fresh:
+                            _count_diag(stale_diag, "spot_freshness_failed")
+
+        if not args.no_endgame:
+            twap_diag = inst.proof_diagnostics.setdefault("TWAP_LOCK", {})
+            if not model_ok:
+                _count_diag(twap_diag, "model_not_validated")
+            else:
+                realized = self._realized_twap(inst, market, now_mono)
+                sig = scan_twap_lock(
+                    market,
+                    book,
+                    spot,
+                    args.size,
+                    sigma,
+                    realized=realized,
+                    reference_error=self._reference_error(inst),
+                    min_z=max(args.endgame_z, 3.5),
+                    min_edge=args.min_edge,
+                    diagnostics=twap_diag,
+                )
+                if sig:
+                    _count_diag(twap_diag, "proof_forwarded")
+                    found.append(sig)
 
         for sig in found:
             self._emit(sig, inst)
-
     @property
     def replay(self) -> ReplayLog | None:
         return self._replay
@@ -1431,6 +1469,11 @@ class Monitor:
         key = f"{inst.name}:{sig.strategy}" if inst is not None else sig.strategy
         self._strategy_hits[key] = self._strategy_hits.get(key, 0) + 1
         self._funnel["sighted"] += 1
+        diag = (
+            inst.proof_diagnostics.setdefault(sig.strategy, {})
+            if inst is not None and sig.strategy in ("STALE", "TWAP_LOCK")
+            else None
+        )
 
         # A strategy opinion without a proof never reaches the ledger as a
         # trade. CROSS uses its locked pair edge; directional strategies must
@@ -1439,6 +1482,8 @@ class Monitor:
         verdict = self._proof_gate.validate(sig, min_edge=proof_edge)
         if not verdict.allowed:
             self._funnel["proof_rejected"] += 1
+            if diag is not None:
+                _count_diag(diag, "proof_gate_rejected")
             log.info(
                 " proof gate: [%s] %s refused: %s",
                 sig.strategy, sig.ticker, verdict.reason,
@@ -1446,6 +1491,8 @@ class Monitor:
             self._record_execution(sig, "skipped", detail=f"proof: {verdict.reason}")
             return
 
+        if diag is not None:
+            _count_diag(diag, "proof_gate_passed")
         now = time.monotonic()
 
         # Confirmation is STRATEGY-SPECIFIC. A CROSS arb is perishable and is
@@ -1502,6 +1549,8 @@ class Monitor:
             latest = self._proof_gate.revalidate(sig, inst.book, min_edge=proof_edge)
             if not latest.allowed:
                 self._funnel["proof_rejected"] += 1
+                if diag is not None:
+                    _count_diag(diag, "proof_revalidation_failed")
                 self._record_execution(
                     sig, "skipped", detail=f"proof revalidation: {latest.reason}"
                 )
@@ -1528,6 +1577,8 @@ class Monitor:
                 self._proof_by_id[sig.proof.proof_id] = sig.proof
             self._pending_orders.append(sig)
             self._funnel["confirmed"] += 1
+            if diag is not None:
+                _count_diag(diag, "confirmed_and_queued")
             self._work.set()
             self._replay_event(
                 "signal",
