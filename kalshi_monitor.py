@@ -1059,14 +1059,18 @@ class Monitor:
         model_ok = vol_ok or args.allow_unvalidated_vol
 
         if not args.no_stale:
-            cutoff = now_mono - args.anchor_age
+            # Event-driven anchor: use the market state immediately BEFORE the
+            # largest spot impulse inside the short lookback. This turns STALE
+            # from "20-second momentum" into "Kalshi underreacted to THIS move".
+            move = inst.buffer.largest_move(args.anchor_age)
             anchor = None
-            for ts, price, mid, atau, asigma in inst.anchors:
-                if ts <= cutoff:
-                    anchor = (price, mid, atau, asigma)
-                else:
-                    break
-            if anchor:
+            if move is not None:
+                for ts, price, mid, atau, asigma in inst.anchors:
+                    if ts <= move.from_mono:
+                        anchor = (price, mid, atau, asigma, ts)
+                    else:
+                        break
+            if anchor and move is not None:
                 sig = scan_stale(
                     market,
                     book,
@@ -1084,9 +1088,34 @@ class Monitor:
                     max_edge=args.max_edge,
                     anchor_tau=anchor[2],
                     anchor_sigma=anchor[3] if anchor[3] > 0.0 else None,
+                    anchor_elapsed=max(now_mono - anchor[4], 0.05),
+                    min_move_z=args.stale_min_z,
                 )
-                if sig:
-                    found.append(sig)
+                if sig and sig.proof is not None:
+                    # Latency trades need independent reference quorum and the
+                    # low-latency websocket book. REST fallback remains valid
+                    # for other strategies but cannot prove who moved first.
+                    basis = inst.basis
+                    quorum = basis is not None and basis.venues >= 2
+                    streamed = (
+                        inst.book_source == "ws"
+                        and self._book_stream is not None
+                        and self._book_stream.connected
+                    )
+                    tick = inst.buffer.last()
+                    spot_fresh = (
+                        tick is not None
+                        and now_mono - tick.mono <= args.stale_max_spot_age
+                    )
+                    sig.proof.checks["reference_quorum"] = quorum
+                    sig.proof.checks["streamed_book"] = streamed
+                    sig.proof.checks["spot_subsecond_fresh"] = spot_fresh
+                    sig.proof.metrics["reference_venues"] = float(
+                        basis.venues if basis is not None else 0
+                    )
+                    sig.proof.metrics["reference_error"] = self._reference_error(inst)
+                    if quorum and streamed and spot_fresh:
+                        found.append(sig)
 
         if not args.no_endgame and model_ok:
             realized = self._realized_twap(inst, market, now_mono)
@@ -2340,8 +2369,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "book thins to nothing there")
     p.add_argument("--min-profit", type=float, default=0.01,
                    help="CROSS: minimum locked dollar profit per pair")
-    p.add_argument("--anchor-age", type=float, default=20.0,
-                   help="STALE: how far back the market anchor is taken, seconds")
+    p.add_argument("--anchor-age", type=float, default=3.0,
+                   help="STALE: impulse lookback in seconds; anchor is the last "
+                        "market state before the largest move in this window")
+    p.add_argument("--stale-min-z", type=float, default=1.75,
+                   help="STALE: minimum volatility-normalized impulse z-score")
+    p.add_argument("--stale-max-spot-age", type=float, default=0.50,
+                   help="STALE: maximum age of the external spot tick, seconds")
     p.add_argument("--min-fill-edge", type=float, default=0.005,
                    help="edge per contract that must SURVIVE crossing the spread. "
                         "Distinct from --min-edge, which decides whether a signal "
