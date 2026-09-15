@@ -2700,7 +2700,7 @@ async def test_autopilot() -> None:
     miss_rows[2].update(count=10, price=0.40, signal_price=0.40, ts=1000.0)
     idx = _execution_index(miss_rows)
     check("attempts count every order sent, not just the one that filled",
-          idx[("STALE", "M8")]["attempts"] == 3,
+          idx[("STALE", "M8", "")]["attempts"] == 3,
           "a strategy that fills one order in three is not a 100% fill rate")
 
     # -- the probe's three outcomes ------------------------------------------- #
