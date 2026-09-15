@@ -1996,7 +1996,7 @@ async def test_setup_and_confirmation() -> None:
     from pathlib import Path
 
     from kalshi_setup import PEM_FILE, save_credentials
-    from strategies import Leg, PaperLedger, Signal
+    from strategies import Leg, PaperLedger, Signal, TradeProof
 
     # -- .env persistence ---------------------------------------------------- #
     with tempfile.TemporaryDirectory() as tmp:
@@ -2038,8 +2038,9 @@ async def test_setup_and_confirmation() -> None:
             min_seconds_left=20.0, book_interval=1.0, discovery_interval=10.0,
             cooldown=5.0, heartbeat=15.0, binance=False, live=False,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
-            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
-            assets=None, eval_interval=0.2, take_profit=1.5,
+            max_trades=40, min_profit=0.01, anchor_age=3.0,
+            stale_min_move=8.0, stale_min_z=1.75, stale_max_spot_age=0.5,
+            aggressive=False, assets=None, eval_interval=0.2, take_profit=1.5,
             stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
             max_edge=0.35, max_slippage=0.03, min_fill_edge=0.005,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
@@ -2051,18 +2052,35 @@ async def test_setup_and_confirmation() -> None:
         mon.ledger = PaperLedger(Path(tmp) / "paper_test.jsonl")
         return mon
 
+    def _proof(kind: str = "LATENCY", guaranteed: bool = False) -> TradeProof:
+        now = _time.monotonic()
+        return TradeProof(
+            proof_type=kind,
+            score=100.0 if guaranteed else 99.0,
+            guaranteed=guaranteed,
+            fair_estimate=0.60,
+            fair_lower_bound=0.56,
+            executable_price=0.40,
+            edge_estimate=0.10,
+            edge_lower_bound=0.05,
+            failure_probability=0.01,
+            created_mono=now,
+            expires_mono=now + 60.0,
+            checks={"test_fixture": True},
+            metrics={"matched_size": 20.0} if guaranteed else {},
+        )
+
     def sig(side: str = "YES") -> Signal:
         return Signal(
             strategy="STALE", ticker="KXBTC15M-TEST-15",
             legs=[Leg(side, 0.40, 20.0)], fair_yes=0.48, expected_net=0.60,
             max_loss=8.0, spot=63_400.0, strike=63_380.0, seconds_left=500.0,
-            sigma_used=1.2e-4,
+            sigma_used=1.2e-4, proof=_proof(),
         )
 
-    # -- a confirmation must be NEW market data, not another loop pass ------ #
-    # The evaluator runs every 0.1s while the book refreshes every 0.4s, so
-    # counting passes counted the same snapshot ~4 times. A live log read
-    # "confirmed over 1.0s / 11 passes" on roughly two distinct books.
+    # -- confirmation is strategy-specific ---------------------------------- #
+    # STALE is a latency thesis: an unchanged Kalshi book while the external
+    # impulse persists is supporting evidence, not a failed confirmation.
     def versioned(v):
         s = sig()
         s.book_version = v
@@ -2071,14 +2089,11 @@ async def test_setup_and_confirmation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.05, 3, tmp)
         for _ in range(30):
-            mon._emit(versioned(1021))       # the SAME book, thirty times
+            mon._emit(versioned(1021))
             _time.sleep(0.003)
-        check("an unchanged book cannot confirm itself, however many passes",
-              not mon._pending_orders, "book 1021 x30")
-        mon._emit(versioned(1024))
-        mon._emit(versioned(1027))
-        check("three DISTINCT books do confirm it",
-              len(mon._pending_orders) == 1, "1021 -> 1024 -> 1027")
+        check("STALE can confirm while the book remains unchanged",
+              len(mon._pending_orders) == 1,
+              "persistence of the external proof is what matters")
 
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.05, 3, tmp)
@@ -2120,6 +2135,17 @@ async def test_setup_and_confirmation() -> None:
         check("confirm-seconds 0 restores immediate recording",
               len(mon._pending_orders) == 1)
 
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        no_proof = Signal(
+            strategy="STALE", ticker="NO-PROOF", legs=[Leg("YES", 0.40, 1.0)],
+            fair_yes=0.60, expected_net=0.10, max_loss=0.40, spot=1.0,
+            strike=1.0, seconds_left=100.0, sigma_used=1e-4,
+        )
+        mon._emit(no_proof)
+        check("a strategy opinion without TradeProof fails closed",
+              not mon._pending_orders)
+
     # -- two strategies must not take opposite sides of one market ---------- #
     # L_081726_031221 bought ENDGAME NO @ 0.975 and, 32s later, STALE YES @
     # 0.820 on the SAME contract. Settlement pays exactly one, so the pair is a
@@ -2130,6 +2156,7 @@ async def test_setup_and_confirmation() -> None:
             strategy=strategy, ticker="KXBTC15M-SAME", legs=[Leg(side, price, 20.0)],
             fair_yes=0.5, expected_net=0.4, max_loss=8.0, spot=63_300.0,
             strike=63_337.0, seconds_left=100.0, sigma_used=2.5e-5,
+            proof=_proof(),
         )
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2161,6 +2188,7 @@ async def test_setup_and_confirmation() -> None:
             legs=[Leg("YES", 0.48, 20.0), Leg("NO", 0.49, 20.0)],
             fair_yes=0.5, expected_net=0.4, max_loss=0.0, spot=0.0,
             strike=63_337.0, seconds_left=100.0, sigma_used=0.0,
+            proof=_proof("ARBITRAGE", guaranteed=True),
         )
         mon._emit(both)
         check("CROSS may still hold both sides at once", len(mon._pending_orders) == 1)
