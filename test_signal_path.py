@@ -2132,7 +2132,10 @@ async def test_setup_and_confirmation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.0, 1, tmp)
         mon._emit(sig())
-        check("confirm-seconds 0 restores immediate recording",
+        check("STALE still requires a second proof sighting with zero time delay",
+              not mon._pending_orders)
+        mon._emit(sig())
+        check("the second persistent STALE proof can queue immediately",
               len(mon._pending_orders) == 1)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2170,15 +2173,31 @@ async def test_setup_and_confirmation() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.0, 1, tmp)
-        mon._emit(named("TWAP_LOCK", "NO", 0.975))
+        # STALE needs two persistent proof sightings even with zero time delay.
+        mon._emit(named("STALE", "NO", 0.975))
+        mon._emit(named("STALE", "NO", 0.975))
         check("the first side is taken", len(mon._pending_orders) == 1)
-        mon._emit(named("STALE", "YES", 0.820))
+
+        # TWAP_LOCK requires sustained evidence for one second / three reads.
+        mon._emit(named("TWAP_LOCK", "YES", 0.820))
+        _time.sleep(1.01)
+        mon._emit(named("TWAP_LOCK", "YES", 0.820))
+        mon._emit(named("TWAP_LOCK", "YES", 0.820))
         check("a second strategy cannot buy the opposing side of the same market",
               len(mon._pending_orders) == 1,
               "settlement pays one of them; holding both is a guaranteed loss")
-        mon._emit(named("STALE", "NO", 0.970))
+
+        # Same-side disagreement is not a hedge conflict. Use a fresh monitor
+        # because the prior TWAP_LOCK key was already conflict-tested.
+        mon2 = fresh_monitor(0.0, 1, tmp)
+        mon2._emit(named("STALE", "NO", 0.975))
+        mon2._emit(named("STALE", "NO", 0.975))
+        mon2._emit(named("TWAP_LOCK", "NO", 0.970))
+        _time.sleep(1.01)
+        mon2._emit(named("TWAP_LOCK", "NO", 0.970))
+        mon2._emit(named("TWAP_LOCK", "NO", 0.970))
         check("the SAME side from another strategy is still allowed",
-              len(mon._pending_orders) == 2)
+              len(mon2._pending_orders) == 2)
 
         rows = [json.loads(l) for l in
                 (mon.ledger.path).read_text().splitlines() if l.strip()]
