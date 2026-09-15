@@ -45,6 +45,12 @@ def _clamp(p: float, lo: float = 0.001, hi: float = 0.999) -> float:
     return min(max(p, lo), hi)
 
 
+def _bump(diagnostics: dict[str, int] | None, key: str) -> None:
+    """Increment an optional refusal/proof counter without affecting decisions."""
+    if diagnostics is not None:
+        diagnostics[key] = diagnostics.get(key, 0) + 1
+
+
 # --------------------------------------------------------------------------- #
 # Signals
 # --------------------------------------------------------------------------- #
@@ -306,104 +312,56 @@ def scan_stale(
     anchor_elapsed: float = 0.0,
     min_move_z: float = 1.75,
     uncertainty_floor: float = 0.01,
+    diagnostics: dict[str, int] | None = None,
 ) -> Signal | None:
-    """Trade the repricing a spot move implies, not the level.
+    """Trade a conservative residual after an abnormal spot impulse.
 
-    `anchor_mid` is the market's own mid from before the move, and `anchor_price`
-    the spot at that same moment. Both the starting probability and the
-    volatility come from the market, so:
-
-      * a constant error in our spot feed cancels in ln(spot / anchor_price)
-      * an error in our volatility estimate mostly cancels, because sigma is
-        taken from the quote rather than measured
-
-    What is left is the honest question: BTC moved this much, the market has
-    not repriced yet, and is the gap bigger than the fee.
-
-    `require_implied` defaults on. The fallback is our measured volatility, and
-    a measurement that reads low scales `delta / (sigma * sqrt(tau))` up, so
-    every spot wiggle is reported as a bigger repricing than it is. Falling
-    back reintroduces the exact error this strategy exists to be immune to, so
-    when the quote cannot be inverted the honest answer is no signal.
-
-    `min_move_bps` is what keeps this strategy being itself. Without a real
-    spot move there are two ways the numbers can still show "edge", and both
-    were bought and graded in a live session (1 winner in 4):
-
-      * the BOOK moved away from its own anchor mid while spot sat still, so
-        the model - anchored on the old mid - fades the book's repricing. The
-        book moves on order flow we cannot see; taking the other side of that
-        is adverse selection, the opposite of the latency thesis.
-      * a 1-3 bps wiggle of pure noise, amplified by sigma*sqrt(tau) in the
-        denominator, reads as a 10-point repricing.
-
-    Requiring the spot to have moved by more than noise makes the claim being
-    traded the honest one: BTC actually jumped, and the book has not caught up.
+    diagnostics is observability only: every early refusal increments a named
+    counter, but the counter is never read to make a trading decision.
     """
+    _bump(diagnostics, "considered")
     if anchor_price <= 0 or spot <= 0 or not market.strike_known:
+        _bump(diagnostics, "invalid_inputs")
         return None
+
     delta = math.log(spot / anchor_price)
     if abs(delta) < min_move_bps / 10_000.0:
+        _bump(diagnostics, "move_below_bps")
         return None
 
-    # Absolute bps alone means different things in quiet and violent regimes.
-    # Require the impulse to be statistically unusual for the measured tape as
-    # well. This is a regime-normalized displacement, not another predictor.
     elapsed = max(anchor_elapsed, 0.05)
     if fallback_sigma <= 0.0:
+        _bump(diagnostics, "measured_sigma_unavailable")
         return None
     move_z = abs(delta) / (fallback_sigma * math.sqrt(elapsed))
     if move_z < min_move_z:
+        _bump(diagnostics, "move_below_z")
         return None
 
-    # Prefer the volatility belief captured BEFORE the impulse. Re-inferring
-    # sigma from the allegedly stale current quote is circular.
     sigma = anchor_sigma if anchor_sigma is not None and anchor_sigma > 0.0 else None
     if sigma is None:
         sigma = implied_sigma(market, book, spot)
     if sigma is None:
         if require_implied:
+            _bump(diagnostics, "implied_sigma_unavailable")
             return None
         sigma = fallback_sigma
     elif max_vol_ratio > 0.0:
-        # Taking sigma from the quote was supposed to make this strategy immune
-        # to our own estimator being wrong. It does - but only while the quote's
-        # sigma is itself sane. When the two disagree wildly, one of them is
-        # broken and nothing here can tell which, so the honest move is to sit
-        # out. A live session traded a 9.53x disagreement (ours 0.32, market
-        # 0.03 bps/s) and bought 93 contracts on a fabricated edge.
         ratio = vol_agreement(fallback_sigma, sigma)
         if ratio is not None and ratio > max_vol_ratio:
+            _bump(diagnostics, "sigma_disagreement")
             return None
+
     tau = market.effective_tau()
     denom = sigma * math.sqrt(tau)
     if denom <= 0:
+        _bump(diagnostics, "invalid_tau")
         return None
 
-    # The anchor's probability was measured when the contract had MORE time
-    # left, and z is ln(S/K)/(sigma*sqrt(tau)) - so the same moneyness is a
-    # larger z as tau shrinks. Carrying z0 forward unscaled silently assumes
-    # time has not passed, which understates how decided the outcome has
-    # become. The error is small early and large late:
-    #
-    #   tau 800 -> 780 : a 0.70 anchor is really 0.702   (+0.2 points)
-    #   tau 200 -> 150 : a 0.70 anchor is really 0.728   (+2.8 points)
-    #   tau  90 ->  30 : a 0.70 anchor is really 0.818  (+11.8 points)
-    #
-    # Correct transform, from z = ln(S/K)/(sigma*sqrt(tau)):
-    #     z1 = z0*sqrt(tau0/tau1) + delta/(sigma*sqrt(tau1))
-    # Within one contract the clock only runs one way, so an anchor taken
-    # earlier must have had MORE time left than we have now. Less means the
-    # anchor belongs to a different contract - and comparing a fresh
-    # at-the-money market against the mid of one that has just settled is not a
-    # stale quote, it is two unrelated numbers. A live session did exactly this
-    # across a market roll and the decay term below rescued the arithmetic into
-    # something plausible: inv_cdf(0.001) scaled by sqrt(7/831) came back as a
-    # respectable-looking 0.18 fair value, and it was the biggest "edge" of the
-    # run. Refusing here makes that state unexpressible even if some future
-    # caller forgets to clear its anchors.
     if anchor_tau > 0.0 and anchor_tau < tau:
+        _bump(diagnostics, "cross_contract_anchor")
         return None
+
     z0 = _N.inv_cdf(_clamp(anchor_mid))
     if anchor_tau > 0.0 and tau > 0.0:
         z0 *= math.sqrt(anchor_tau / tau)
@@ -414,30 +372,28 @@ def scan_stale(
     else:
         side, ask, fair_side = "NO", book.no_ask, 1.0 - fair_yes
     if ask is None or not (0.0 < ask < 1.0):
+        _bump(diagnostics, "invalid_ask")
         return None
 
-    # Size-aware: Kalshi rounds the fee up on the whole order, so the marginal
-    # rate understates what a small order is actually charged.
     edge = fair_side - ask - fee_at_size(ask, size)
     if edge < min_edge:
+        _bump(diagnostics, "raw_edge_below_min")
         return None
-    # An edge this large on a liquid book is a model error, not an opportunity.
-    # Every one this project has produced turned out to be. The trade that
-    # motivated the cap claimed $19.83 of expected profit against $0.15 of
-    # risk - a 132:1 return that no real market offers.
     if max_edge > 0.0 and edge > max_edge:
+        _bump(diagnostics, "edge_above_sanity_cap")
         return None
 
-    # A point estimate is not enough to risk money. Discount the model by an
-    # uncertainty allowance that grows with the modeled repricing. The LOWER
-    # BOUND, not the headline fair value, must still clear the edge threshold.
+    # Compare probabilities in the same side's coordinate system. The anchor
+    # is stored as YES probability, so a NO trade must compare with 1-anchor.
+    anchor_side = anchor_mid if side == "YES" else 1.0 - anchor_mid
     uncertainty = max(
         uncertainty_floor,
-        min(0.05, abs(fair_side - anchor_mid) * 0.30),
+        min(0.05, abs(fair_side - anchor_side) * 0.30),
     )
     fair_lower = max(0.001, fair_side - uncertainty)
     safe_edge = fair_lower - ask - fee_at_size(ask, size)
     if safe_edge < min_edge:
+        _bump(diagnostics, "safe_edge_below_min")
         return None
 
     move_bps = abs(delta) * 10_000.0
@@ -470,6 +426,7 @@ def scan_stale(
         metrics={
             "move_bps": move_bps,
             "anchor_mid": anchor_mid,
+            "anchor_side": anchor_side,
             "anchor_spot": anchor_price,
             "entry_spot": spot,
             "direction": 1.0 if delta > 0 else -1.0,
@@ -489,6 +446,7 @@ def scan_stale(
             "execution cost consumes the lower-bound edge",
         ],
     )
+    _bump(diagnostics, "proof_generated")
 
     return Signal(
         strategy="STALE",
@@ -653,19 +611,25 @@ def scan_twap_lock(
     min_z: float = 3.5,
     min_edge: float = 0.005,
     max_price: float = 0.99,
+    diagnostics: dict[str, int] | None = None,
 ) -> Signal | None:
-    """Trade only when the settlement window itself supplies the evidence.
+    """Trade only when the realized settlement window supplies the evidence.
 
-    Unlike ENDGAME this function NEVER falls back to a terminal spot/strike
-    model. If the realized settlement slice is unavailable or too sparse, there
-    is no proof and therefore no trade.
+    diagnostics records the exact refusal stage for long-run analysis and is
+    never read back by the strategy to make a decision.
     """
+    _bump(diagnostics, "considered")
     left = market.seconds_remaining()
-    if left <= 0 or spot <= 0 or not market.strike_known or realized is None:
+    if left <= 0 or spot <= 0 or not market.strike_known:
+        _bump(diagnostics, "invalid_inputs")
+        return None
+    if realized is None:
+        _bump(diagnostics, "realized_twap_unavailable")
         return None
 
     implied = implied_sigma(market, book, spot)
     if implied is None:
+        _bump(diagnostics, "implied_sigma_unavailable")
         return None
     sigma_used = max(sigma, implied)
 
@@ -675,7 +639,11 @@ def scan_twap_lock(
         realized,
         reference_error=reference_error,
     )
-    if z is None or abs(z) < min_z:
+    if z is None:
+        _bump(diagnostics, "realized_z_unavailable")
+        return None
+    if abs(z) < min_z:
+        _bump(diagnostics, "z_below_threshold")
         return None
 
     fair_yes = _clamp(_N.cdf(z))
@@ -684,6 +652,7 @@ def scan_twap_lock(
     else:
         side, ask, fair_side = "NO", book.no_ask, 1.0 - fair_yes
     if ask is None or not (0.0 < ask <= max_price):
+        _bump(diagnostics, "favored_price_untradeable")
         return None
 
     uncertainty = max(
@@ -695,6 +664,7 @@ def scan_twap_lock(
     edge = fair_side - ask - fee
     safe_edge = fair_lower - ask - fee
     if safe_edge < min_edge:
+        _bump(diagnostics, "safe_edge_below_min")
         return None
 
     required = market.required_remaining_average(realized)
@@ -738,6 +708,7 @@ def scan_twap_lock(
             "execution cost consumes the lower-bound edge",
         ],
     )
+    _bump(diagnostics, "proof_generated")
 
     return Signal(
         strategy="TWAP_LOCK",
