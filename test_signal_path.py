@@ -1732,6 +1732,7 @@ async def test_strategies() -> None:
         scan_cross,
         scan_endgame,
         scan_stale,
+        scan_twap_lock,
         vol_agreement,
     )
 
@@ -1980,6 +1981,116 @@ async def test_strategies() -> None:
 
 
 
+    # -- proof telemetry and directional symmetry ---------------------------- #
+    # STALE stores its anchor as a YES probability. A NO trade must compare its
+    # conservative uncertainty with 1-anchor_mid, not with the YES coordinate.
+    # Mirrored +9/-9 bps setups should therefore have identical uncertainty and
+    # lower-bound edge.
+    sym_sigma = 1.6e-4
+    sym_anchor = 63_400.0
+    sym_move = 9.0
+    up_diag: dict[str, int] = {}
+    down_diag: dict[str, int] = {}
+    up_sig = scan_stale(
+        live_now,
+        book(0.29, 0.30),
+        sym_anchor,
+        0.40,
+        sym_anchor * _math.exp(sym_move / 10_000.0),
+        20.0,
+        0.01,
+        sym_sigma,
+        anchor_sigma=sym_sigma,
+        anchor_elapsed=1.0,
+        max_vol_ratio=0.0,
+        diagnostics=up_diag,
+    )
+    down_sig = scan_stale(
+        live_now,
+        book(0.70, 0.71),
+        sym_anchor,
+        0.60,
+        sym_anchor * _math.exp(-sym_move / 10_000.0),
+        20.0,
+        0.01,
+        sym_sigma,
+        anchor_sigma=sym_sigma,
+        anchor_elapsed=1.0,
+        max_vol_ratio=0.0,
+        diagnostics=down_diag,
+    )
+    symmetric = (
+        up_sig is not None
+        and down_sig is not None
+        and up_sig.proof is not None
+        and down_sig.proof is not None
+        and abs(
+            up_sig.proof.metrics["uncertainty"]
+            - down_sig.proof.metrics["uncertainty"]
+        ) < 1e-9
+        and abs(
+            up_sig.proof.edge_lower_bound
+            - down_sig.proof.edge_lower_bound
+        ) < 1e-9
+    )
+    check(
+        "STALE uncertainty is symmetric between mirrored YES and NO impulses",
+        symmetric,
+        (
+            f"up={up_sig.proof.metrics['uncertainty']:.6f}, "
+            f"down={down_sig.proof.metrics['uncertainty']:.6f}"
+            if up_sig and down_sig and up_sig.proof and down_sig.proof
+            else "one mirrored signal was unexpectedly absent"
+        ),
+    )
+    check(
+        "STALE diagnostics count considered and generated proofs",
+        up_diag.get("considered") == 1
+        and up_diag.get("proof_generated") == 1
+        and down_diag.get("considered") == 1
+        and down_diag.get("proof_generated") == 1,
+        f"up={up_diag} down={down_diag}",
+    )
+
+    quiet_diag: dict[str, int] = {}
+    scan_stale(
+        live_now,
+        book(0.29, 0.30),
+        sym_anchor,
+        0.40,
+        sym_anchor * _math.exp(1.0 / 10_000.0),
+        20.0,
+        0.01,
+        sym_sigma,
+        anchor_sigma=sym_sigma,
+        anchor_elapsed=1.0,
+        diagnostics=quiet_diag,
+    )
+    check(
+        "STALE diagnostics identify sub-threshold impulses",
+        quiet_diag.get("considered") == 1
+        and quiet_diag.get("move_below_bps") == 1,
+        str(quiet_diag),
+    )
+
+    twap_diag: dict[str, int] = {}
+    scan_twap_lock(
+        live_now,
+        book(0.29, 0.30),
+        sym_anchor,
+        20.0,
+        sym_sigma,
+        realized=None,
+        diagnostics=twap_diag,
+    )
+    check(
+        "TWAP_LOCK diagnostics identify missing realized settlement evidence",
+        twap_diag.get("considered") == 1
+        and twap_diag.get("realized_twap_unavailable") == 1,
+        str(twap_diag),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Credential setup and the confirm-over-time gate
 # --------------------------------------------------------------------------- #
@@ -2051,6 +2162,24 @@ async def test_setup_and_confirmation() -> None:
         mon = Monitor(args)
         mon.ledger = PaperLedger(Path(tmp) / "paper_test.jsonl")
         return mon
+
+    with tempfile.TemporaryDirectory() as tmp:
+        diag_mon = fresh_monitor(0.05, 3, tmp)
+        diag_mon.instruments[0].proof_diagnostics = {
+            "STALE": {"considered": 12, "move_below_bps": 10},
+            "TWAP_LOCK": {"considered": 7, "z_below_threshold": 4},
+        }
+        diag_text = "\n".join(
+            diag_mon._proof_diagnostic_lines(diag_mon.instruments[0])
+        )
+        check(
+            "session summary renders per-strategy proof refusal diagnostics",
+            "STALE" in diag_text
+            and "move_below_bps" in diag_text
+            and "TWAP_LOCK" in diag_text
+            and "z_below_threshold" in diag_text,
+            diag_text,
+        )
 
     def _proof(kind: str = "LATENCY", guaranteed: bool = False) -> TradeProof:
         now = _time.monotonic()
