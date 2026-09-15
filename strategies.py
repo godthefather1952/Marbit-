@@ -303,6 +303,8 @@ def scan_stale(
     max_edge: float = 0.35,
     anchor_tau: float = 0.0,
     anchor_sigma: float | None = None,
+    anchor_elapsed: float = 0.0,
+    min_move_z: float = 1.75,
     uncertainty_floor: float = 0.01,
 ) -> Signal | None:
     """Trade the repricing a spot move implies, not the level.
@@ -342,6 +344,16 @@ def scan_stale(
         return None
     delta = math.log(spot / anchor_price)
     if abs(delta) < min_move_bps / 10_000.0:
+        return None
+
+    # Absolute bps alone means different things in quiet and violent regimes.
+    # Require the impulse to be statistically unusual for the measured tape as
+    # well. This is a regime-normalized displacement, not another predictor.
+    elapsed = max(anchor_elapsed, 0.05)
+    if fallback_sigma <= 0.0:
+        return None
+    move_z = abs(delta) / (fallback_sigma * math.sqrt(elapsed))
+    if move_z < min_move_z:
         return None
 
     # Prefer the volatility belief captured BEFORE the impulse. Re-inferring
@@ -451,6 +463,7 @@ def scan_stale(
         checks={
             "strike_known": market.strike_known,
             "abnormal_move": move_bps >= min_move_bps,
+            "move_z": move_z >= min_move_z,
             "sigma_available": sigma > 0.0,
             "lower_bound_edge": safe_edge >= min_edge,
         },
@@ -460,6 +473,8 @@ def scan_stale(
             "anchor_spot": anchor_price,
             "entry_spot": spot,
             "direction": 1.0 if delta > 0 else -1.0,
+            "move_z": move_z,
+            "elapsed": elapsed,
             "sigma": sigma,
             "uncertainty": uncertainty,
             "fair_side": fair_side,
@@ -489,8 +504,8 @@ def scan_stale(
         sigma_used=sigma,
         proof=proof,
         note=(
-            f"spot {delta * 1e4:+.1f} bps vs anchor, market mid was {anchor_mid:.3f}, "
-            f"implied sigma {sigma * 1e4:.2f} bps/s"
+            f"spot {delta * 1e4:+.1f} bps ({move_z:.2f}z) vs pre-impulse anchor, "
+            f"market mid was {anchor_mid:.3f}, implied sigma {sigma * 1e4:.2f} bps/s"
             + (f", tau {anchor_tau:.0f}->{tau:.0f}s" if anchor_tau > 0.0 else "")
         ),
     )
