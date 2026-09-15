@@ -2958,7 +2958,11 @@ async def test_take_profit() -> None:
     t._orders.append(pos)
     t.open_stake = pos.stake
     res = await t.close_position(pos, 0.72, "take-profit")
-    expected = 20 * (0.72 - 0.32) - trading_fee(0.72, 20)
+    expected = (
+        20 * (0.72 - 0.32)
+        - trading_fee(0.32, 20)
+        - trading_fee(0.72, 20)
+    )
     check("the exit books the realized gain", res.ok
           and abs(t.realized - expected) < 1e-6, f"${t.realized:+.2f}")
     check("the position is flat afterwards", pos.closed
@@ -3038,6 +3042,25 @@ async def test_take_profit() -> None:
           "so it can shrink a position but never create or flip one")
     check("closes are immediate-or-cancel too",
           t.sent["time_in_force"] == "immediate_or_cancel")
+
+    partial = ExitTrader(fill_count="1")
+    partial_pos = held("YES", 0.30, count=3)
+    partial._orders.append(partial_pos)
+    partial.open_stake = (
+        partial_pos.stake + trading_fee(partial_pos.price, partial_pos.count)
+    )
+    partial_result = await partial.close_position(
+        partial_pos, 0.70, "proof-invalidated"
+    )
+    check("a partial IOC exit leaves the unfilled contracts tracked",
+          partial_result.ok and partial_result.count == 1
+          and not partial_pos.closed and partial_pos.count == 2
+          and partial_pos in partial.open_positions("T"),
+          str(partial_pos.count) + " remain")
+    check("partial-exit realized PnL includes both entry and exit fees",
+          partial.realized
+          < 1 * (0.70 - 0.30) - trading_fee(0.70, 1),
+          f"$" + f"{partial.realized:+.4f}")
 
     gone = ExitTrader(fill_count="0")   # nothing left to reduce
     pos2 = held("NO", 0.40, count=3)
