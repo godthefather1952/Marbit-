@@ -957,7 +957,14 @@ class KalshiTrader:
                     # would spam the venue, so stop tracking it and say so.
                     result.error = f"exit did not fill (filled {filled})"
                     order.closed = True
-                    self.open_stake = max(0.0, self.open_stake - order.stake)
+                    entry_fee = (
+                        order.avg_fee_paid * order.count
+                        if order.avg_fee_paid is not None
+                        else trading_fee(order.price, order.count)
+                    )
+                    self.open_stake = max(
+                        0.0, self.open_stake - order.stake - entry_fee
+                    )
                     log.warning(
                         "Exit on %s did not fill. With reduce_only that usually "
                         "means the position is already gone - closed by hand, or "
@@ -967,10 +974,30 @@ class KalshiTrader:
                     )
                     return result
 
-        pnl = gross - fees
-        order.closed = True
+        original_count = order.count
+        closed_count = min(int(result.count), int(original_count))
+        entry_fee = (
+            order.avg_fee_paid * closed_count
+            if order.avg_fee_paid is not None
+            else trading_fee(order.price, closed_count)
+        )
+        # Both sides cost money. Entry fees were included in open_stake but had
+        # never been charged to realized PnL on early exits, which made the
+        # session report too much profit and left fee exposure stranded.
+        pnl = gross - entry_fee - fees
+
+        released_stake = closed_count * order.price + entry_fee
+        self.open_stake = max(0.0, self.open_stake - released_stake)
+
+        if closed_count >= original_count:
+            order.closed = True
+        else:
+            # An IOC close may fill only part of the position. Keep the
+            # unfilled contracts alive and managed instead of silently losing
+            # track of real exposure.
+            order.count = original_count - closed_count
+
         self.realized += pnl
-        self.open_stake = max(0.0, self.open_stake - order.stake)
         self.consecutive_losses = 0 if pnl > 0 else self.consecutive_losses + 1
         self._orders.append(result)
         log.warning(
