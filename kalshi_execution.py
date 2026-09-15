@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import aiohttp
 
@@ -148,6 +148,11 @@ class OrderResult:
     #: Our fair value for THIS outcome at entry. The book reaching it means the
     #: mispricing we bought has closed.
     entry_fair: float = 0.0
+    #: Proof lineage. These fields make every filled position auditable back to
+    #: the exact machine-checkable permission that authorized it.
+    proof_id: str = ""
+    proof_type: str = ""
+    pair_id: str = ""
     #: Best mark seen while the position was open. Reported at settlement so
     #: the take-profit threshold can be set from evidence rather than taste:
     #: "peaked at 4.3x then settled worthless" is the number that tells you
@@ -289,6 +294,34 @@ class KalshiTrader:
         # Leave room for the fee, which peaks near 1.75c per contract.
         per_contract = price + 0.0175
         count = int(math.floor(budget / per_contract))
+        return count if count >= self.limits.min_contracts else 0
+
+    def pair_size_for(self, yes_price: float, no_price: float) -> int:
+        """Largest matched CROSS quantity legal across BOTH legs as one hedge.
+
+        Generic size_for() is intentionally per order. CROSS is different: two
+        legs form one economic position, so the exposure budget must cover the
+        combined pair before the first leg is allowed to move.
+        """
+        if not (0.0 < yes_price < 1.0 and 0.0 < no_price < 1.0):
+            return 0
+
+        per_yes = yes_price + 0.0175
+        per_no = no_price + 0.0175
+        per_pair = per_yes + per_no
+        exposure_left = max(
+            0.0,
+            self.starting_balance * self.limits.max_exposure_pct - self.open_stake,
+        )
+        equity_left = max(0.0, self.equity())
+        if per_pair <= 0.0 or exposure_left <= 0.0 or equity_left <= 0.0:
+            return 0
+
+        by_exposure = int(math.floor(exposure_left / per_pair))
+        by_equity = int(math.floor(equity_left / per_pair))
+        by_yes_trade = int(math.floor(self.max_stake() / per_yes))
+        by_no_trade = int(math.floor(self.max_stake() / per_no))
+        count = min(by_exposure, by_equity, by_yes_trade, by_no_trade)
         return count if count >= self.limits.min_contracts else 0
 
     def check_halt(self) -> str | None:
@@ -576,6 +609,9 @@ class KalshiTrader:
         verification: bool = False,
         strategy: str = "",
         entry_fair: float = 0.0,
+        proof_id: str = "",
+        proof_type: str = "",
+        pair_id: str = "",
     ) -> OrderResult:
         """Buy `count` contracts of `outcome`. Never raises.
 
@@ -599,6 +635,9 @@ class KalshiTrader:
             verification=verification,
             strategy=strategy,
             entry_fair=entry_fair,
+            proof_id=proof_id,
+            proof_type=proof_type,
+            pair_id=pair_id,
         )
 
         if self.halted:
@@ -765,6 +804,25 @@ class KalshiTrader:
             and (ticker is None or o.ticker == ticker)
         ]
 
+    def split_position(self, order: OrderResult, keep_count: int) -> OrderResult | None:
+        """Detach unmatched contracts from a partially hedged CROSS leg.
+
+        The original OrderResult remains the matched position that can settle as
+        part of the pair. The returned slice represents only the excess that
+        must be flattened immediately. open_stake is intentionally unchanged
+        here; closing the returned slice removes exactly that residual stake.
+        """
+        keep = max(0, min(int(keep_count), int(order.count)))
+        extra = int(order.count) - keep
+        if extra <= 0:
+            return None
+
+        residual = replace(order, count=extra, closed=False, closing=False)
+        order.count = keep
+        if keep == 0:
+            order.closed = True
+        return residual
+
     @staticmethod
     def mark(order: OrderResult, book) -> float | None:
         """What the position could be sold for right now, per contract.
@@ -843,6 +901,9 @@ class KalshiTrader:
             outcome=order.outcome, api_side=api_side, price=price,
             api_price=api_price, count=order.count, closing=True,
             strategy=order.strategy,
+            proof_id=order.proof_id,
+            proof_type=order.proof_type,
+            pair_id=order.pair_id,
         )
 
         gross = order.count * (price - order.price)
