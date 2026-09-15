@@ -43,6 +43,7 @@ import io
 import json
 import signal as _signal
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -57,6 +58,31 @@ from run_log import start_run_log
 
 GATE_RECHECK_SECONDS = 300.0
 SETTLE_POLL_SECONDS = 30.0
+
+
+def git_identity() -> tuple[str, str, str]:
+    """Return branch, commit and dirty state without making startup depend on git."""
+    cwd = Path(__file__).resolve().parent
+
+    def run(*args: str) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    branch = run("branch", "--show-current") or "unknown"
+    commit = run("rev-parse", "HEAD") or "unknown"
+    status = run("status", "--porcelain")
+    dirty = "unknown" if status is None else ("true" if status else "false")
+    return branch, commit, dirty
 
 
 # --------------------------------------------------------------------------- #
@@ -417,6 +443,7 @@ def main() -> int:
     margs = monitor_parse_args(["--env-file", args.env_file, *extra])
     monitor = Monitor(margs)
 
+    git_branch, git_commit, git_dirty = git_identity()
     run_log = start_run_log(
         log,
         directory=margs.log_dir,
@@ -430,6 +457,9 @@ def main() -> int:
             f"min edge : {margs.min_edge:+.4f}/contract net of fees",
             f"confirm  : {margs.confirm_seconds:.1f}s / {margs.confirm_passes} passes, "
             f"book every {margs.book_interval:.2f}s",
+            f"git branch: {git_branch}",
+            f"git commit: {git_commit}",
+            f"git dirty : {git_dirty}",
         ],
     )
     monitor.run_log = run_log
