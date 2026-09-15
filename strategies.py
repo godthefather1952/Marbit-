@@ -458,6 +458,8 @@ def scan_stale(
             "move_bps": move_bps,
             "anchor_mid": anchor_mid,
             "anchor_spot": anchor_price,
+            "entry_spot": spot,
+            "direction": 1.0 if delta > 0 else -1.0,
             "sigma": sigma,
             "uncertainty": uncertainty,
             "fair_side": fair_side,
@@ -695,7 +697,7 @@ def scan_twap_lock(
         edge_lower_bound=safe_edge,
         failure_probability=max(0.0, 1.0 - fair_lower),
         created_mono=now_mono,
-        expires_mono=now_mono + 1.0,
+        expires_mono=now_mono + 2.0,
         checks={
             "realized_window_available": True,
             "coverage_positive": covered > 0.0,
@@ -881,6 +883,10 @@ class PaperLedger:
         detail: str = "",
         signal_price: float | None = None,
         elapsed_ms: float | None = None,
+        side: str = "",
+        leg_id: str = "",
+        pair_id: str = "",
+        proof_id: str = "",
     ) -> None:
         """Record what actually happened to a signal when it reached the venue.
 
@@ -912,6 +918,10 @@ class PaperLedger:
             "detail": detail,
             "signal_price": signal_price,
             "elapsed_ms": elapsed_ms,
+            "side": side,
+            "leg_id": leg_id,
+            "pair_id": pair_id,
+            "proof_id": proof_id,
         }
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
