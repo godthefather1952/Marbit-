@@ -1600,6 +1600,74 @@ class Monitor:
             return False
         return True
 
+    def _signal_proof_context_problem(self, sig, inst) -> str | None:
+        """Re-check non-book evidence immediately before any directional order.
+
+        ProofGate.revalidate() reprices the latest book. This companion check
+        verifies the external evidence that cannot be inferred from that book:
+        impulse persistence, reference quorum, stream health and realized TWAP.
+        """
+        proof = getattr(sig, "proof", None)
+        if proof is None:
+            return "signal has no TradeProof"
+        market, book = inst.market, inst.book
+        tick = inst.buffer.last()
+        if market is None or book is None or tick is None:
+            return "proof context is incomplete"
+
+        if proof.proof_type == "LATENCY":
+            if (
+                self._book_stream is None
+                or not self._book_stream.connected
+                or inst.book_source != "ws"
+            ):
+                return "latency proof lost the websocket book"
+            if inst.basis is None or inst.basis.venues < 2:
+                return "latency proof lost independent reference quorum"
+            if time.monotonic() - tick.mono > self._args.stale_max_spot_age:
+                return "latency proof spot tick is too old"
+
+            m = proof.metrics
+            anchor = float(m.get("anchor_spot") or 0.0)
+            entry_spot = float(m.get("entry_spot") or 0.0)
+            direction = float(m.get("direction") or 0.0)
+            if anchor <= 0.0 or entry_spot <= 0.0 or direction == 0.0:
+                return "latency proof is missing impulse geometry"
+            original = (entry_spot - anchor) / anchor
+            current = (tick.price - anchor) / anchor
+            if direction * current <= 0.0:
+                return "latency impulse reversed before execution"
+            # Entry should still retain most of the displacement that created
+            # the proof. After entry the looser 70%-retracement invalidation
+            # protects the already-open position.
+            if abs(original) > 0.0 and abs(current) < abs(original) * 0.70:
+                return "latency impulse retraced >30% before execution"
+
+        elif proof.proof_type == "TWAP_LOCK":
+            realized = self._realized_twap(inst, market, time.monotonic())
+            if realized is None:
+                return "TWAP proof lost realized settlement coverage"
+            implied = implied_sigma(market, book, tick.price)
+            if implied is None:
+                return "TWAP proof volatility is no longer validated"
+            sigma = max(inst.buffer.sigma_per_sqrt_second(), implied)
+            z = market.realized_z(
+                tick.price,
+                sigma,
+                realized,
+                reference_error=self._reference_error(inst),
+            )
+            direction = float(proof.metrics.get("direction") or 0.0)
+            threshold = max(self._args.endgame_z, 3.5)
+            if z is None:
+                return "TWAP proof can no longer be recomputed"
+            if direction * z <= 0.0:
+                return "TWAP settlement lock flipped before execution"
+            if abs(z) < threshold:
+                return f"TWAP settlement lock fell to {abs(z):.2f}z"
+
+        return None
+
     async def _execute_cross_pair(self, sig) -> None:
         """Execute CROSS as one economic position, never two unrelated bets."""
         trader = self.trader
@@ -1713,6 +1781,14 @@ class Monitor:
         if not first.ok:
             return
         self._funnel["filled"] += 1
+        first_leg_obj = next(l for l in sig.legs if l.side == first_side)
+        self._track_strategy(
+            sig,
+            first_outcome,
+            first_leg_obj,
+            first,
+            max(time.time() - sig.ts, 0.0) * 1000.0,
+        )
 
         second_count = first.count
         latest = inst.book
@@ -1733,11 +1809,17 @@ class Monitor:
             - trading_fee(first.price, second_count)
             - trading_fee(second_limit, second_count)
         )
-        if prospective <= 0.0:
+        if prospective < self._args.min_profit:
             residual = trader.split_position(first, 0)
             if residual is not None:
                 await self._repair_cross_residual(
-                    sig, residual, inst, "second leg would destroy locked spread"
+                    sig,
+                    residual,
+                    inst,
+                    (
+                        f"second leg leaves only {prospective:+.4f}, below "
+                        f"minimum locked profit {self._args.min_profit:+.4f}"
+                    ),
                 )
             self._committed.get(sig.ticker, set()).discard("YES")
             self._committed.get(sig.ticker, set()).discard("NO")
@@ -1775,6 +1857,14 @@ class Monitor:
         matched_filled = second.count if second.ok else 0
         if second.ok:
             self._funnel["filled"] += 1
+            second_leg_obj = next(l for l in sig.legs if l.side == second_side)
+            self._track_strategy(
+                sig,
+                second_outcome,
+                second_leg_obj,
+                second,
+                max(time.time() - sig.ts, 0.0) * 1000.0,
+            )
 
         if matched_filled < first.count:
             residual = trader.split_position(first, matched_filled)
@@ -1868,6 +1958,15 @@ class Monitor:
                         self._record_execution(sig, "skipped", detail="no current book")
                         continue
                     proof_edge = 0.0 if sig.strategy == "CROSS" else self._args.min_fill_edge
+                    context_problem = self._signal_proof_context_problem(sig, inst)
+                    if context_problem is not None:
+                        self._funnel["proof_rejected"] += 1
+                        self._record_execution(
+                            sig,
+                            "skipped",
+                            detail=f"execution proof context: {context_problem}",
+                        )
+                        continue
                     execution_proof = self._proof_gate.revalidate(
                         sig, inst.book, min_edge=proof_edge
                     )
