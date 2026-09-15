@@ -68,7 +68,7 @@ def _execution_index(
                 "outcome": "",
                 "count": 0.0,
                 "price": 0.0,
-                "exit_price": None,
+                "closes": [],
                 "signal_price": None,
                 "fill_ms": None,
                 "entry_ts": None,
@@ -80,7 +80,11 @@ def _execution_index(
         )
         outcome = str(row.get("outcome") or "")
         if outcome == "closed":
-            rec["exit_price"] = row.get("price")
+            rec["closes"].append({
+                "count": float(row.get("count") or 0.0),
+                "price": float(row.get("price") or 0.0),
+                "ts": row.get("ts"),
+            })
             rec["exit_ts"] = row.get("ts")
             continue
         if outcome in ("filled", "simulated", "rejected"):
@@ -198,16 +202,29 @@ def score(
             cost += size * price
             fees += trading_fee(price, size)
 
-            exit_price = rec.get("exit_price") if rec else None
-            if exit_price is not None:
+            # An IOC exit can itself be partial. Account for each closed slice,
+            # then settle only the quantity that remained open. This is
+            # essential for CROSS repair: 6 first-leg fills, 5 hedge fills and
+            # a 1-contract emergency flatten must score as 5 paired + 1 closed,
+            # never as all 6 closed or all 6 held.
+            remaining = size
+            for close in (rec.get("closes", []) if rec else []):
+                close_count = min(float(close.get("count") or 0.0), remaining)
+                close_price = float(close.get("price") or 0.0)
+                if close_count <= 0.0 or not (0.0 < close_price < 1.0):
+                    continue
                 exited_any = True
-                gross += size * float(exit_price)
-                fees += trading_fee(float(exit_price), size)
-            else:
+                gross += close_count * close_price
+                fees += trading_fee(close_price, close_count)
+                remaining -= close_count
+                if remaining <= 1e-9:
+                    break
+
+            if remaining > 1e-9:
                 won = (side == "YES" and result == "yes") or (
                     side == "NO" and result == "no"
                 )
-                gross += size * (1.0 if won else 0.0)
+                gross += remaining * (1.0 if won else 0.0)
 
         note = str(row.get("note") or "")
         asset = note[1:note.index("]")] if note.startswith("[") and "]" in note else ""
