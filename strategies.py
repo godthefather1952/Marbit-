@@ -721,6 +721,8 @@ def scan_twap_lock(
         },
         metrics={
             "z": abs(z),
+            "direction": 1.0 if z > 0 else -1.0,
+            "entry_spot": spot,
             "observed_mean": observed_mean,
             "covered_seconds": covered,
             "required_remaining_average": required or 0.0,
