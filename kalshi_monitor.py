@@ -28,13 +28,14 @@ from collections import deque
 
 from run_log import run_log_name, start_run_log
 from kalshi_execution import KalshiTrader, RiskLimits
+from proof_gate import ProofGate
 from strategies import (
     PaperLedger,
     ReplayLog,
     implied_sigma,
     scan_cross,
-    scan_endgame,
     scan_stale,
+    scan_twap_lock,
     vol_agreement,
 )
 from btc_polymarket_arb import (
@@ -276,9 +277,10 @@ class Instrument:
         self.stream = None
         self.market: KalshiMarket | None = None
         self.book: KalshiBook | None = None
-        #: (monotonic, spot, market mid, effective tau) - tau is needed because
-        #: the anchor's probability was measured with more time on the clock.
-        self.anchors: deque[tuple[float, float, float, float]] = deque(maxlen=600)
+        #: (monotonic, spot, market mid, effective tau, implied sigma).
+        #: Capturing sigma WITH the anchor avoids circularly inferring it later
+        #: from the very quote STALE is testing for underreaction.
+        self.anchors: deque[tuple[float, float, float, float, float]] = deque(maxlen=600)
         # Per-instrument diagnostics, so the summary can say which underlying
         # the numbers came from rather than blending two different markets.
         self.observations = 0
@@ -364,8 +366,9 @@ class Monitor:
         #: is losing them: a session with 47 sightings and 0 fills was one
         #: execution bug, but nothing in the summary said which stage failed.
         self._funnel: dict[str, int] = {
-            "sighted": 0, "confirmed": 0, "conflicted": 0,
-            "attempted": 0, "filled": 0, "unpriceable": 0,
+            "sighted": 0, "confirmed": 0, "proof_rejected": 0,
+            "conflicted": 0, "attempted": 0, "filled": 0,
+            "unpriceable": 0,
         }
         #: Websocket order book, when the session can sign for one. None means
         #: every book in this run came from REST polling.
@@ -377,6 +380,10 @@ class Monitor:
         self._entry_mono: dict[tuple[str, str], float] = {}
         #: Structured replay record. None when recording is off.
         self._replay: ReplayLog | None = None
+        #: One fail-closed authority between strategy opinions and money.
+        self._proof_gate = ProofGate()
+        #: Proofs retained for open-position thesis revalidation.
+        self._proof_by_id: dict[str, object] = {}
 
     async def run(self) -> None:
         self._start_mono = time.monotonic()
@@ -721,11 +728,19 @@ class Monitor:
             fair=fair, realized=realized,
         )
 
-        # Keep a rolling (time, spot, market mid) anchor for the STALE model.
+        # Keep a rolling PRE-IMPULSE anchor for STALE.  Sigma belongs to the
+        # anchor as well: using a later allegedly-stale quote to infer it would
+        # let the object under test define the ruler used to judge itself.
         mid = book.yes_mid
         if mid is not None:
             inst.anchors.append(
-                (now_mono, tick.price, mid, market.effective_tau())
+                (
+                    now_mono,
+                    tick.price,
+                    mid,
+                    market.effective_tau(),
+                    sigma_implied or 0.0,
+                )
             )
         self._run_strategies(inst, market, book, tick.price, sigma, now_mono, vol_ok)
 
@@ -1027,12 +1042,11 @@ class Monitor:
         return lines
 
     def _run_strategies(self, inst, market, book, spot, sigma, now_mono, vol_ok: bool) -> None:
-        """Run every enabled strategy and record what each would have traded.
+        """Run proof-producing strategies.
 
-        `vol_ok` gates the two model-dependent strategies. CROSS is exempt: it
-        reads only the two bids and locks its profit at settlement, so it is
-        the one strategy that cannot be wrong about volatility because it never
-        forms an opinion about it.
+        CROSS is mechanical. STALE must prove a conservative latency residual.
+        TWAP_LOCK is allowed only when the realized settlement slice itself can
+        speak; the old terminal ENDGAME fallback is intentionally not run.
         """
         args = self._args
         found = []
@@ -1045,21 +1059,27 @@ class Monitor:
         model_ok = vol_ok or args.allow_unvalidated_vol
 
         if not args.no_stale:
-            # An anchor from `--anchor-age` seconds ago: the market's mid and
-            # our spot at the same moment, so only the CHANGE is used.
-            cutoff = now_mono - args.anchor_age
+            # Event-driven anchor: use the market state immediately BEFORE the
+            # largest spot impulse inside the short lookback. This turns STALE
+            # from "20-second momentum" into "Kalshi underreacted to THIS move".
+            move = inst.buffer.largest_move(args.anchor_age)
             anchor = None
-            for ts, price, mid, atau in inst.anchors:
-                if ts <= cutoff:
-                    anchor = (price, mid, atau)
-                else:
-                    break
-            if anchor:
-                # STALE takes sigma from the quote itself, so it needs no
-                # agreement check - it is already using the market's number.
+            if move is not None:
+                for ts, price, mid, atau, asigma in inst.anchors:
+                    if ts <= move.from_mono:
+                        anchor = (price, mid, atau, asigma, ts)
+                    else:
+                        break
+            if anchor and move is not None:
                 sig = scan_stale(
-                    market, book, anchor[0], anchor[1], spot, args.size,
-                    args.min_edge, sigma,
+                    market,
+                    book,
+                    anchor[0],
+                    anchor[1],
+                    spot,
+                    args.size,
+                    args.min_edge,
+                    sigma,
                     require_implied=not args.allow_unvalidated_vol,
                     min_move_bps=args.stale_min_move,
                     max_vol_ratio=(
@@ -1067,20 +1087,48 @@ class Monitor:
                     ),
                     max_edge=args.max_edge,
                     anchor_tau=anchor[2],
+                    anchor_sigma=anchor[3] if anchor[3] > 0.0 else None,
+                    anchor_elapsed=max(now_mono - anchor[4], 0.05),
+                    min_move_z=args.stale_min_z,
                 )
-                if sig:
-                    found.append(sig)
+                if sig and sig.proof is not None:
+                    # Latency trades need independent reference quorum and the
+                    # low-latency websocket book. REST fallback remains valid
+                    # for other strategies but cannot prove who moved first.
+                    basis = inst.basis
+                    quorum = basis is not None and basis.venues >= 2
+                    streamed = (
+                        inst.book_source == "ws"
+                        and self._book_stream is not None
+                        and self._book_stream.connected
+                    )
+                    tick = inst.buffer.last()
+                    spot_fresh = (
+                        tick is not None
+                        and now_mono - tick.mono <= args.stale_max_spot_age
+                    )
+                    sig.proof.checks["reference_quorum"] = quorum
+                    sig.proof.checks["streamed_book"] = streamed
+                    sig.proof.checks["spot_subsecond_fresh"] = spot_fresh
+                    sig.proof.metrics["reference_venues"] = float(
+                        basis.venues if basis is not None else 0
+                    )
+                    sig.proof.metrics["reference_error"] = self._reference_error(inst)
+                    if quorum and streamed and spot_fresh:
+                        found.append(sig)
 
         if not args.no_endgame and model_ok:
-            # Measured sigma, deliberately: see scan_endgame. Feeding it the
-            # implied value would make its edge identically negative.
-            sig = scan_endgame(
-                market, book, spot, args.size, sigma,
-                max_seconds_left=args.endgame_window,
-                min_z=args.endgame_z,
-                require_implied=not args.allow_unvalidated_vol,
-                realized=self._realized_twap(inst, market, now_mono),
+            realized = self._realized_twap(inst, market, now_mono)
+            sig = scan_twap_lock(
+                market,
+                book,
+                spot,
+                args.size,
+                sigma,
+                realized=realized,
                 reference_error=self._reference_error(inst),
+                min_z=max(args.endgame_z, 3.5),
+                min_edge=args.min_edge,
             )
             if sig:
                 found.append(sig)
@@ -1369,81 +1417,103 @@ class Monitor:
         self._candidates.clear()
         self._committed.clear()
         self._conflicts_seen.clear()
+        self._proof_by_id.clear()
         if self.ledger is not None:
             self.ledger.reset_dedupe()
 
     def _emit(self, sig, inst=None) -> None:
-        """Hold a signal until it has been confirmed over time, then queue it.
-
-        One evaluation pass is one glance at one book snapshot: a stale poll, a
-        fleeting quote, or a single bad tick all look identical to a real edge
-        for 200ms. Requiring the same signal to recur across passes spanning
-        `--confirm-seconds` filters those out. The trade-off is honest and
-        deliberate: a real edge that vanishes inside the window was never
-        capturable at our polling cadence anyway - the book updates at
-        `--book-interval`, so an edge we cannot see twice is an edge we would
-        have been filled on late or not at all.
-
-        The queued signal is the LATEST sighting, so execution prices at the
-        current ask rather than the one from the start of the window.
-        """
+        """Proof-gate, strategy-confirm, then queue the latest valid signal."""
         if sig is None:
             return
-        # Tag with the underlying and the preset, so a graded ledger can answer
-        # "did ETH pay?" and "did aggressive settings pay?" separately rather
-        # than blending two experiments into one unreadable number.
+
         if inst is not None and not sig.note.startswith("["):
             sig.note = f"[{inst.name}] {sig.note}"
         key = f"{inst.name}:{sig.strategy}" if inst is not None else sig.strategy
         self._strategy_hits[key] = self._strategy_hits.get(key, 0) + 1
         self._funnel["sighted"] += 1
+
+        # A strategy opinion without a proof never reaches the ledger as a
+        # trade. CROSS uses its locked pair edge; directional strategies must
+        # clear the normal conservative edge threshold.
+        proof_edge = 0.0 if sig.strategy == "CROSS" else self._args.min_edge
+        verdict = self._proof_gate.validate(sig, min_edge=proof_edge)
+        if not verdict.allowed:
+            self._funnel["proof_rejected"] += 1
+            log.info(
+                " proof gate: [%s] %s refused: %s",
+                sig.strategy, sig.ticker, verdict.reason,
+            )
+            self._record_execution(sig, "skipped", detail=f"proof: {verdict.reason}")
+            return
+
         now = time.monotonic()
-        need_s = self._args.confirm_seconds
-        need_n = max(self._args.confirm_passes, 1)
+
+        # Confirmation is STRATEGY-SPECIFIC. A CROSS arb is perishable and is
+        # re-priced at execution; waiting only makes it disappear. STALE wants
+        # repeated proof that the external impulse persists while Kalshi has
+        # not caught up, so an unchanged book is evidence rather than a failed
+        # confirmation. TWAP_LOCK wants several consistent settlement reads.
+        if sig.strategy == "CROSS":
+            need_s, need_n, count_distinct_books = 0.0, 1, False
+        elif sig.strategy == "STALE":
+            need_s = min(max(self._args.confirm_seconds, 0.0), 0.75)
+            need_n, count_distinct_books = 2, False
+        elif sig.strategy == "TWAP_LOCK":
+            need_s = 1.0
+            need_n, count_distinct_books = 3, False
+        else:
+            need_s = self._args.confirm_seconds
+            need_n, count_distinct_books = max(self._args.confirm_passes, 1), True
 
         if need_s > 0.0 or need_n > 1:
             ckey = (sig.strategy, sig.ticker, tuple(leg.side for leg in sig.legs))
             cand = self._candidates.get(ckey)
-            # A gap longer than the window means the edge closed and reopened;
-            # that is a new candidate, not a continuation of the old one.
             if cand is None or now - cand["last"] > max(need_s, 2.0):
                 self._candidates[ckey] = {
-                    "first": now, "last": now, "passes": 1,
+                    "first": now,
+                    "last": now,
+                    "passes": 1,
                     "version": getattr(sig, "book_version", None),
                 }
-                log.info(
-                    "candidate [%s] %s: confirming over %.1fs (%d passes)...",
-                    sig.strategy, sig.ticker, need_s, need_n,
-                )
                 return
+
             cand["last"] = now
-            # A confirmation must require NEW market information. The evaluator
-            # runs every --eval-interval (0.1s) while the book refreshes every
-            # --book-interval (0.4s), so counting passes counted the SAME
-            # snapshot up to four times - a live log read "confirmed over 1.0s /
-            # 11 passes" on roughly two distinct books. Versions make the
-            # requirement honest: three confirmations means three books.
             version = getattr(sig, "book_version", None)
-            if version is not None and version != cand.get("version"):
-                cand["version"] = version
+            if count_distinct_books:
+                if version is not None and version != cand.get("version"):
+                    cand["version"] = version
+                    cand["passes"] += 1
+                elif version is None:
+                    cand["passes"] += 1
+            else:
                 cand["passes"] += 1
-            elif version is None:
-                cand["passes"] += 1  # no version available; fall back to passes
+
             if now - cand["first"] < need_s or cand["passes"] < need_n:
                 return
-            held = now - cand["first"]
             sig.note = (
-                f"{sig.note} | confirmed over {held:.1f}s / "
-                f"{cand['passes']} distinct books"
+                f"{sig.note} | proof confirmed over {now - cand['first']:.2f}s / "
+                f"{cand['passes']} sightings"
             )
 
-        ckey_conflict = (sig.strategy, sig.ticker,
-                         tuple(leg.side for leg in sig.legs))
+        # Reprice once more before queueing. This is the first defense against a
+        # proof which was true at discovery but false by the time confirmation
+        # completed.
+        if inst is not None and inst.book is not None:
+            latest = self._proof_gate.revalidate(sig, inst.book, min_edge=proof_edge)
+            if not latest.allowed:
+                self._funnel["proof_rejected"] += 1
+                self._record_execution(
+                    sig, "skipped", detail=f"proof revalidation: {latest.reason}"
+                )
+                return
+
+        ckey_conflict = (
+            sig.strategy,
+            sig.ticker,
+            tuple(leg.side for leg in sig.legs),
+        )
         conflict = self._conflicts(sig)
         if conflict is not None:
-            # Once per (strategy, market, side): a persisting signal is
-            # re-evaluated several times a second, and logging each one wrote
-            # 548 identical lines in a single session.
             if ckey_conflict not in self._conflicts_seen:
                 self._conflicts_seen.add(ckey_conflict)
                 self._funnel["conflicted"] += 1
@@ -1454,25 +1524,397 @@ class Monitor:
         if self.ledger is not None and self.ledger.record(sig):
             for leg in sig.legs:
                 self._committed.setdefault(sig.ticker, set()).add(leg.side)
+            if sig.proof is not None:
+                self._proof_by_id[sig.proof.proof_id] = sig.proof
             self._pending_orders.append(sig)
             self._funnel["confirmed"] += 1
             self._work.set()
             self._replay_event(
-                "signal", ticker=sig.ticker, strategy=sig.strategy,
-                legs=[{"side": l.side, "price": l.price, "size": l.size}
-                      for l in sig.legs],
-                fair_yes=sig.fair_yes, expected_net=sig.expected_net,
-                spot=sig.spot, strike=sig.strike,
+                "signal",
+                ticker=sig.ticker,
+                strategy=sig.strategy,
+                legs=[
+                    {"side": l.side, "price": l.price, "size": l.size}
+                    for l in sig.legs
+                ],
+                fair_yes=sig.fair_yes,
+                expected_net=sig.expected_net,
+                spot=sig.spot,
+                strike=sig.strike,
                 seconds_left=round(sig.seconds_left, 1),
-                sigma_used=sig.sigma_used, book_version=sig.book_version,
+                sigma_used=sig.sigma_used,
+                book_version=sig.book_version,
+                proof_id=sig.proof.proof_id if sig.proof else "",
+                proof_type=sig.proof.proof_type if sig.proof else "",
+                proof_score=sig.proof.score if sig.proof else 0.0,
+                edge_lower_bound=sig.proof.edge_lower_bound if sig.proof else 0.0,
                 note=sig.note,
             )
             log.warning(
-                "\n---- PAPER TRADE ----\n %s\n %s\n"
-                " fair(YES) %.4f | risk $%.2f | recorded for settlement scoring\n"
-                "---------------------",
-                sig.describe(), sig.note, sig.fair_yes, sig.max_loss,
+                "\n---- PROOF-APPROVED TRADE ----\n %s\n %s\n"
+                " proof %s %.1f | lower edge %+.4f | risk $%.2f\n"
+                "------------------------------",
+                sig.describe(),
+                sig.note,
+                sig.proof.proof_type if sig.proof else "NONE",
+                sig.proof.score if sig.proof else 0.0,
+                sig.proof.edge_lower_bound if sig.proof else 0.0,
+                sig.max_loss,
             )
+
+    async def _repair_cross_residual(self, sig, residual, inst, reason: str) -> bool:
+        """Flatten an unmatched CROSS slice immediately; halt if we cannot."""
+        trader = self.trader
+        book = inst.book if inst is not None else None
+        if trader is None or book is None:
+            if trader is not None:
+                trader.halted = True
+                trader.halt_reason = "unhedged CROSS residual with no live book"
+            return False
+
+        mark = trader.mark(residual, book)
+        if mark is None:
+            trader.halted = True
+            trader.halt_reason = "unhedged CROSS residual has no executable exit"
+            log.error("TRADING HALTED: %s", trader.halt_reason)
+            return False
+
+        before = trader.realized
+        result = await trader.close_position(residual, mark, "cross-repair")
+        booked = trader.realized - before
+        if result.ok:
+            self._track_close(residual, result.price, booked)
+        self._record_execution(
+            sig,
+            "closed" if result.ok else "exit_failed",
+            count=result.count if result.ok else residual.count,
+            price=result.price if result.ok else mark,
+            detail=reason,
+            signal_price=residual.price,
+            side=residual.outcome,
+            pair_id=residual.pair_id,
+            proof_id=residual.proof_id,
+        )
+        if not result.ok:
+            trader.halted = True
+            trader.halt_reason = (
+                "CROSS hedge incomplete and emergency flatten did not fill"
+            )
+            log.error("TRADING HALTED: %s", trader.halt_reason)
+            return False
+
+        if not residual.closed and residual.count > 0:
+            # close_position correctly leaves a partially-exited position open.
+            # This residual was detached from the original matched leg, so put
+            # it back into the trader's tracked set before halting; otherwise a
+            # second partial fill would create invisible directional exposure.
+            if residual not in trader._orders:
+                trader._orders.append(residual)
+            trader.halted = True
+            trader.halt_reason = (
+                f"CROSS emergency flatten was partial; {residual.count} "
+                "unmatched contract(s) remain tracked"
+            )
+            log.error("TRADING HALTED: %s", trader.halt_reason)
+            return False
+        return True
+
+    def _signal_proof_context_problem(self, sig, inst) -> str | None:
+        """Re-check non-book evidence immediately before any directional order.
+
+        ProofGate.revalidate() reprices the latest book. This companion check
+        verifies the external evidence that cannot be inferred from that book:
+        impulse persistence, reference quorum, stream health and realized TWAP.
+        """
+        proof = getattr(sig, "proof", None)
+        if proof is None:
+            return "signal has no TradeProof"
+        market, book = inst.market, inst.book
+        tick = inst.buffer.last()
+        if market is None or book is None or tick is None:
+            return "proof context is incomplete"
+
+        if proof.proof_type == "LATENCY":
+            if (
+                self._book_stream is None
+                or not self._book_stream.connected
+                or inst.book_source != "ws"
+            ):
+                return "latency proof lost the websocket book"
+            if inst.basis is None or inst.basis.venues < 2:
+                return "latency proof lost independent reference quorum"
+            if time.monotonic() - tick.mono > self._args.stale_max_spot_age:
+                return "latency proof spot tick is too old"
+
+            m = proof.metrics
+            anchor = float(m.get("anchor_spot") or 0.0)
+            entry_spot = float(m.get("entry_spot") or 0.0)
+            direction = float(m.get("direction") or 0.0)
+            if anchor <= 0.0 or entry_spot <= 0.0 or direction == 0.0:
+                return "latency proof is missing impulse geometry"
+            original = (entry_spot - anchor) / anchor
+            current = (tick.price - anchor) / anchor
+            if direction * current <= 0.0:
+                return "latency impulse reversed before execution"
+            # Entry should still retain most of the displacement that created
+            # the proof. After entry the looser 70%-retracement invalidation
+            # protects the already-open position.
+            if abs(original) > 0.0 and abs(current) < abs(original) * 0.70:
+                return "latency impulse retraced >30% before execution"
+
+        elif proof.proof_type == "TWAP_LOCK":
+            realized = self._realized_twap(inst, market, time.monotonic())
+            if realized is None:
+                return "TWAP proof lost realized settlement coverage"
+            implied = implied_sigma(market, book, tick.price)
+            if implied is None:
+                return "TWAP proof volatility is no longer validated"
+            sigma = max(inst.buffer.sigma_per_sqrt_second(), implied)
+            z = market.realized_z(
+                tick.price,
+                sigma,
+                realized,
+                reference_error=self._reference_error(inst),
+            )
+            direction = float(proof.metrics.get("direction") or 0.0)
+            threshold = max(self._args.endgame_z, 3.5)
+            if z is None:
+                return "TWAP proof can no longer be recomputed"
+            if direction * z <= 0.0:
+                return "TWAP settlement lock flipped before execution"
+            if abs(z) < threshold:
+                return f"TWAP settlement lock fell to {abs(z):.2f}z"
+
+        return None
+
+    async def _execute_cross_pair(self, sig) -> None:
+        """Execute CROSS as one economic position, never two unrelated bets."""
+        trader = self.trader
+        if trader is None or sig.proof is None:
+            return
+        inst = next(
+            (
+                i for i in self.instruments
+                if i.market is not None and i.market.ticker == sig.ticker
+            ),
+            None,
+        )
+        if inst is None or inst.book is None:
+            self._record_execution(sig, "skipped", detail="CROSS has no current book")
+            return
+
+        verdict = self._proof_gate.revalidate(sig, inst.book, min_edge=0.0)
+        if not verdict.allowed:
+            self._funnel["proof_rejected"] += 1
+            self._record_execution(
+                sig, "skipped", detail=f"CROSS revalidation: {verdict.reason}"
+            )
+            return
+
+        matched = int(verdict.metrics.get("matched_size", 0.0))
+        if matched < 1:
+            self._record_execution(sig, "skipped", detail="CROSS matched size is zero")
+            return
+
+        yes_q = inst.book.take_quote("YES", matched)
+        no_q = inst.book.take_quote("NO", matched)
+        if yes_q is None or no_q is None:
+            self._record_execution(sig, "skipped", detail="CROSS depth disappeared")
+            return
+        yes_vwap, yes_avail, yes_limit = yes_q
+        no_vwap, no_avail, no_limit = no_q
+        matched = min(
+            matched,
+            int(yes_avail),
+            int(no_avail),
+            trader.pair_size_for(yes_limit, no_limit),
+        )
+        if matched < 1:
+            self._record_execution(sig, "skipped", detail="CROSS has no legal paired size")
+            return
+
+        # Requote exact risk-approved size.
+        yes_q = inst.book.take_quote("YES", matched)
+        no_q = inst.book.take_quote("NO", matched)
+        if yes_q is None or no_q is None:
+            return
+        yes_vwap, _, yes_limit = yes_q
+        no_vwap, _, no_limit = no_q
+        locked_floor = (
+            matched * (1.0 - yes_limit - no_limit)
+            - trading_fee(yes_limit, matched)
+            - trading_fee(no_limit, matched)
+        )
+        if locked_floor < self._args.min_profit:
+            self._record_execution(
+                sig,
+                "skipped",
+                detail=(
+                    f"CROSS worst-level profit {locked_floor:+.4f} below "
+                    f"{self._args.min_profit:+.4f}"
+                ),
+            )
+            return
+
+        # Put the shallower top level first. If it only partially fills, the
+        # second leg is requested for exactly that quantity.
+        yes_top = inst.book.no_levels[-1][1] if inst.book.no_levels else 0.0
+        no_top = inst.book.yes_levels[-1][1] if inst.book.yes_levels else 0.0
+        legs = (
+            [("YES", yes_vwap, yes_limit), ("NO", no_vwap, no_limit)]
+            if yes_top <= no_top
+            else [("NO", no_vwap, no_limit), ("YES", yes_vwap, yes_limit)]
+        )
+        pair_id = sig.proof.proof_id
+        first_side, first_signal_price, first_limit = legs[0]
+        second_side, second_signal_price, _ = legs[1]
+
+        self._funnel["attempted"] += 1
+        first = await trader.place(
+            sig.ticker,
+            first_side,
+            first_limit,
+            matched,
+            strategy="CROSS",
+            entry_fair=1.0,
+            proof_id=pair_id,
+            proof_type="ARBITRAGE",
+            pair_id=pair_id,
+        )
+        first_outcome = (
+            "simulated" if first.dry_run else ("filled" if first.ok else "rejected")
+        )
+        self._record_execution(
+            sig,
+            first_outcome,
+            count=first.count if first.ok else 0.0,
+            price=first.price,
+            detail=first.error or "",
+            signal_price=first_signal_price,
+            elapsed_ms=max(time.time() - sig.ts, 0.0) * 1000.0,
+            side=first_side,
+            leg_id="A",
+            pair_id=pair_id,
+            proof_id=pair_id,
+        )
+        if not first.ok:
+            return
+        self._funnel["filled"] += 1
+        first_leg_obj = next(l for l in sig.legs if l.side == first_side)
+        self._track_strategy(
+            sig,
+            first_outcome,
+            first_leg_obj,
+            first,
+            max(time.time() - sig.ts, 0.0) * 1000.0,
+        )
+
+        second_count = first.count
+        latest = inst.book
+        second_q = latest.take_quote(second_side, second_count) if latest else None
+        if second_q is None or second_q[1] < second_count:
+            residual = trader.split_position(first, 0)
+            if residual is not None:
+                await self._repair_cross_residual(
+                    sig, residual, inst, "second CROSS leg lost executable depth"
+                )
+            self._committed.get(sig.ticker, set()).discard("YES")
+            self._committed.get(sig.ticker, set()).discard("NO")
+            return
+
+        second_vwap, _, second_limit = second_q
+        prospective = (
+            second_count * (1.0 - first.price - second_limit)
+            - trading_fee(first.price, second_count)
+            - trading_fee(second_limit, second_count)
+        )
+        if prospective < self._args.min_profit:
+            residual = trader.split_position(first, 0)
+            if residual is not None:
+                await self._repair_cross_residual(
+                    sig,
+                    residual,
+                    inst,
+                    (
+                        f"second leg leaves only {prospective:+.4f}, below "
+                        f"minimum locked profit {self._args.min_profit:+.4f}"
+                    ),
+                )
+            self._committed.get(sig.ticker, set()).discard("YES")
+            self._committed.get(sig.ticker, set()).discard("NO")
+            return
+
+        self._funnel["attempted"] += 1
+        second = await trader.place(
+            sig.ticker,
+            second_side,
+            second_limit,
+            second_count,
+            strategy="CROSS",
+            entry_fair=1.0,
+            proof_id=pair_id,
+            proof_type="ARBITRAGE",
+            pair_id=pair_id,
+        )
+        second_outcome = (
+            "simulated" if second.dry_run else ("filled" if second.ok else "rejected")
+        )
+        self._record_execution(
+            sig,
+            second_outcome,
+            count=second.count if second.ok else 0.0,
+            price=second.price,
+            detail=second.error or "",
+            signal_price=second_signal_price,
+            elapsed_ms=max(time.time() - sig.ts, 0.0) * 1000.0,
+            side=second_side,
+            leg_id="B",
+            pair_id=pair_id,
+            proof_id=pair_id,
+        )
+
+        matched_filled = second.count if second.ok else 0
+        if second.ok:
+            self._funnel["filled"] += 1
+            second_leg_obj = next(l for l in sig.legs if l.side == second_side)
+            self._track_strategy(
+                sig,
+                second_outcome,
+                second_leg_obj,
+                second,
+                max(time.time() - sig.ts, 0.0) * 1000.0,
+            )
+
+        if matched_filled < first.count:
+            residual = trader.split_position(first, matched_filled)
+            if residual is not None:
+                await self._repair_cross_residual(
+                    sig,
+                    residual,
+                    inst,
+                    f"CROSS second leg filled {matched_filled}/{first.count}",
+                )
+
+        if matched_filled < 1:
+            self._committed.get(sig.ticker, set()).discard("YES")
+            self._committed.get(sig.ticker, set()).discard("NO")
+            return
+
+        self._replay_event(
+            "cross_pair",
+            ticker=sig.ticker,
+            pair_id=pair_id,
+            matched=matched_filled,
+            first_side=first_side,
+            first_price=first.price,
+            second_side=second_side,
+            second_price=second.price,
+            locked_net=(
+                matched_filled * (1.0 - first.price - second.price)
+                - trading_fee(first.price, matched_filled)
+                - trading_fee(second.price, matched_filled)
+            ),
+        )
 
     async def _execution_loop(self) -> None:
         """Turn recorded signals into orders, and settle finished markets."""
@@ -1524,7 +1966,43 @@ class Monitor:
                                 detail="side mapping probe inconclusive",
                             )
                             continue
-                    for leg in sig.legs:
+                    inst = next(
+                        (
+                            i for i in self.instruments
+                            if i.market is not None and i.market.ticker == sig.ticker
+                        ),
+                        None,
+                    )
+                    if inst is None or inst.book is None:
+                        self._record_execution(sig, "skipped", detail="no current book")
+                        continue
+                    proof_edge = 0.0 if sig.strategy == "CROSS" else self._args.min_fill_edge
+                    context_problem = self._signal_proof_context_problem(sig, inst)
+                    if context_problem is not None:
+                        self._funnel["proof_rejected"] += 1
+                        self._record_execution(
+                            sig,
+                            "skipped",
+                            detail=f"execution proof context: {context_problem}",
+                        )
+                        continue
+                    execution_proof = self._proof_gate.revalidate(
+                        sig, inst.book, min_edge=proof_edge
+                    )
+                    if not execution_proof.allowed:
+                        self._funnel["proof_rejected"] += 1
+                        self._record_execution(
+                            sig,
+                            "skipped",
+                            detail=f"execution proof: {execution_proof.reason}",
+                        )
+                        continue
+
+                    if sig.strategy == "CROSS":
+                        await self._execute_cross_pair(sig)
+                        continue
+
+                    for leg_index, leg in enumerate(sig.legs):
                         count = trader.size_for(leg.price)
                         if count < 1:
                             log.warning(
@@ -1540,8 +2018,12 @@ class Monitor:
                         # fair_yes is the model's YES probability; the exit
                         # target for a NO leg is its complement.
                         fair_leg = (
-                            sig.fair_yes if leg.side == "YES"
-                            else 1.0 - sig.fair_yes
+                            sig.proof.fair_lower_bound
+                            if sig.proof is not None
+                            else (
+                                sig.fair_yes if leg.side == "YES"
+                                else 1.0 - sig.fair_yes
+                            )
                         )
                         limit = self._marketable_limit(sig, leg, fair_leg)
                         if limit is None:
@@ -1577,6 +2059,9 @@ class Monitor:
                         result = await trader.place(
                             sig.ticker, leg.side, limit, count,
                             strategy=sig.strategy, entry_fair=fair_leg,
+                            proof_id=sig.proof.proof_id if sig.proof else "",
+                            proof_type=sig.proof.proof_type if sig.proof else "",
+                            pair_id="",
                         )
                         if result.ok:
                             self._funnel["filled"] += 1
@@ -1593,6 +2078,9 @@ class Monitor:
                             detail=result.error or "",
                             signal_price=leg.price,
                             elapsed_ms=elapsed_ms,
+                            side=leg.side,
+                            leg_id=str(leg_index),
+                            proof_id=sig.proof.proof_id if sig.proof else "",
                         )
                         self._track_strategy(
                             sig, outcome, leg, result, elapsed_ms
@@ -1616,6 +2104,81 @@ class Monitor:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._work.wait(), timeout=1.0)
 
+    def _proof_exit_reason(self, order, inst, market, book):
+        """Exit when the machine-checkable reason for owning the position dies."""
+        trader = self.trader
+        if trader is None or not order.proof_id:
+            return None
+        proof = self._proof_by_id.get(order.proof_id)
+        if proof is None:
+            return None
+
+        mark = trader.mark(order, book)
+        if mark is None:
+            return None
+
+        if getattr(proof, "proof_type", "") == "LATENCY":
+            metrics = getattr(proof, "metrics", {})
+            anchor = float(metrics.get("anchor_spot") or 0.0)
+            entry = float(metrics.get("entry_spot") or 0.0)
+            direction = float(metrics.get("direction") or 0.0)
+            tick = inst.buffer.last()
+
+            # The latency thesis needs the same evidence after entry that it
+            # needed before entry: live external spot, reference quorum and a
+            # healthy streamed book.
+            stream_ok = (
+                self._book_stream is not None
+                and self._book_stream.connected
+                and inst.book_source == "ws"
+            )
+            quorum_ok = inst.basis is not None and inst.basis.venues >= 2
+            spot_ok = (
+                tick is not None
+                and time.monotonic() - tick.mono <= self._args.stale_max_spot_age
+            )
+            if not (stream_ok and quorum_ok and spot_ok):
+                return ("proof-invalidated: latency evidence degraded", mark)
+
+            if anchor > 0.0 and entry > 0.0 and tick is not None:
+                original = (entry - anchor) / anchor
+                current = (tick.price - anchor) / anchor
+                if direction * current <= 0.0:
+                    return ("proof-invalidated: impulse reversed", mark)
+                if abs(original) > 0.0 and abs(current) < abs(original) * 0.30:
+                    return ("proof-invalidated: impulse retraced >70%", mark)
+
+        elif getattr(proof, "proof_type", "") == "TWAP_LOCK":
+            realized = self._realized_twap(inst, market, time.monotonic())
+            tick = inst.buffer.last()
+            if realized is None or tick is None:
+                return ("proof-invalidated: settlement evidence unavailable", mark)
+
+            implied = implied_sigma(market, book, tick.price)
+            if implied is None:
+                return ("proof-invalidated: settlement volatility unvalidated", mark)
+
+            sigma = max(inst.buffer.sigma_per_sqrt_second(), implied)
+            z = market.realized_z(
+                tick.price,
+                sigma,
+                realized,
+                reference_error=self._reference_error(inst),
+            )
+            direction = float(getattr(proof, "metrics", {}).get("direction") or 0.0)
+            threshold = max(self._args.endgame_z, 3.5)
+            if z is None:
+                return ("proof-invalidated: settlement lock cannot be recomputed", mark)
+            if direction * z <= 0.0:
+                return ("proof-invalidated: settlement lock flipped", mark)
+            if abs(z) < threshold:
+                return (
+                    f"proof-invalidated: settlement lock fell to {abs(z):.2f}z",
+                    mark,
+                )
+
+        return None
+
     async def _manage_exits(self) -> None:
         """Mark open positions against the live book and take profits.
 
@@ -1628,7 +2191,7 @@ class Monitor:
         those into settlement.
         """
         trader = self.trader
-        if trader is None or trader.limits.take_profit_multiple <= 0:
+        if trader is None:
             return
         # Books are per-instrument, so a position can only be marked against
         # the instrument that owns its ticker.
@@ -1638,7 +2201,13 @@ class Monitor:
                 continue
             left = market.seconds_remaining()
             for order in trader.open_positions(market.ticker):
-                decision = trader.exit_reason(order, book, left)
+                # A completed CROSS pair already owns the fixed $1 settlement
+                # payout. Selling one side independently destroys the hedge.
+                if order.strategy == "CROSS":
+                    continue
+                decision = self._proof_exit_reason(order, inst, market, book)
+                if decision is None:
+                    decision = trader.exit_reason(order, book, left)
                 if decision is None:
                     continue
                 reason, price = decision
@@ -1677,6 +2246,9 @@ class Monitor:
                                     f"{reason} at {price:.4f} did not fill; "
                                     f"position untracked from here"
                                 ),
+                                side=order.outcome,
+                                pair_id=order.pair_id,
+                                proof_id=order.proof_id,
                             )
                     continue
 
@@ -1699,6 +2271,9 @@ class Monitor:
                                 f"from {order.price:.4f}"
                             ),
                             signal_price=order.price,
+                            side=order.outcome,
+                            pair_id=order.pair_id,
+                            proof_id=order.proof_id,
                         )
 
     async def _settle_finished(self) -> None:
@@ -1818,7 +2393,7 @@ AGGRESSIVE_PRESET: dict[str, float] = {
     "endgame_z": 2.5,
     "min_edge": 0.01,
     "stale_min_move": 6.0,
-    "max_stake_pct": 12.0,
+    "max_stake_pct": 5.0,
     "cooldown": 2.0,
 }
 
@@ -1960,9 +2535,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "one book snapshot is not a verified edge.")
     p.add_argument("--confirm-passes", type=int, default=3,
                    help="minimum number of sightings inside --confirm-seconds")
-    p.add_argument("--max-stake-pct", type=float, default=8.0,
+    p.add_argument("--max-stake-pct", type=float, default=3.0,
                    help="percent of starting balance staked per trade")
-    p.add_argument("--max-exposure-pct", type=float, default=25.0,
+    p.add_argument("--max-exposure-pct", type=float, default=10.0,
                    help="percent of balance open across all positions at once")
     p.add_argument("--daily-loss-pct", type=float, default=20.0,
                    help="session loss that halts trading, percent of balance")
@@ -1989,8 +2564,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "book thins to nothing there")
     p.add_argument("--min-profit", type=float, default=0.01,
                    help="CROSS: minimum locked dollar profit per pair")
-    p.add_argument("--anchor-age", type=float, default=20.0,
-                   help="STALE: how far back the market anchor is taken, seconds")
+    p.add_argument("--anchor-age", type=float, default=3.0,
+                   help="STALE: impulse lookback in seconds; anchor is the last "
+                        "market state before the largest move in this window")
+    p.add_argument("--stale-min-z", type=float, default=1.75,
+                   help="STALE: minimum volatility-normalized impulse z-score")
+    p.add_argument("--stale-max-spot-age", type=float, default=0.50,
+                   help="STALE: maximum age of the external spot tick, seconds")
     p.add_argument("--min-fill-edge", type=float, default=0.005,
                    help="edge per contract that must SURVIVE crossing the spread. "
                         "Distinct from --min-edge, which decides whether a signal "
@@ -2042,7 +2622,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "project has found came from exactly that. Diagnostics only.")
     p.add_argument("--no-cross", action="store_true", help="disable the CROSS strategy")
     p.add_argument("--no-stale", action="store_true", help="disable the STALE strategy")
-    p.add_argument("--no-endgame", action="store_true", help="disable the ENDGAME strategy")
+    p.add_argument("--no-endgame", "--no-twap-lock", dest="no_endgame",
+                   action="store_true",
+                   help="disable strict realized-settlement TWAP_LOCK (legacy --no-endgame alias)")
     p.add_argument("--no-basis", action="store_true",
                    help="do not correct the tape toward the USD composite. The raw "
                         "venue carries a persistent premium/discount worth several "

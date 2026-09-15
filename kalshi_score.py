@@ -45,32 +45,46 @@ async def settlement(client: KalshiClient, tickers: list[str]) -> dict[str, dict
     return out
 
 
-def _execution_index(executions: list[dict]) -> dict[tuple[str, str], dict]:
-    """What actually happened per (strategy, ticker): outcome, size, prices.
+def _execution_index(
+    executions: list[dict],
+) -> dict[tuple[str, str, str], dict]:
+    """Execution truth per (strategy, ticker, side).
 
-    Two things this has to carry beyond the outcome, because grading from the
-    SIGNAL alone was wrong in both directions:
-
-    `count`/`price` - the signal names a nominal size (--size, 20 by default)
-    and the ask it saw. What we actually got was 3 contracts at a crossed
-    limit. Scoring the nominal size overstated a real +$1.75 session as
-    +$52.72, roughly thirtyfold, on an account that only holds $23.
-
-    `exit_price` - a position closed early does not settle. Grading it as
-    held-to-expiry can invert the result: a contract bought at 0.963 and sold
-    at 0.974 made 1.1c whatever the market did afterwards.
+    CROSS has two legs. Collapsing both into (strategy, ticker) can make a
+    one-legged fill look like a completed hedge, so side is part of the key.
+    Old ledgers without side remain readable through the empty-side fallback.
     """
     rank = {"filled": 3, "rejected": 2, "simulated": 1, "skipped": 0}
-    out: dict[tuple[str, str], dict] = {}
+    out: dict[tuple[str, str, str], dict] = {}
     for row in executions:
-        key = (row.get("strategy", ""), row.get("ticker", ""))
-        rec = out.setdefault(key, {"outcome": "", "count": 0.0, "price": 0.0,
-                                   "exit_price": None, "signal_price": None,
-                                   "fill_ms": None, "entry_ts": None,
-                                   "exit_ts": None, "attempts": 0})
+        key = (
+            row.get("strategy", ""),
+            row.get("ticker", ""),
+            str(row.get("side") or "").upper(),
+        )
+        rec = out.setdefault(
+            key,
+            {
+                "outcome": "",
+                "count": 0.0,
+                "price": 0.0,
+                "closes": [],
+                "signal_price": None,
+                "fill_ms": None,
+                "entry_ts": None,
+                "exit_ts": None,
+                "attempts": 0,
+                "pair_id": row.get("pair_id") or "",
+                "proof_id": row.get("proof_id") or "",
+            },
+        )
         outcome = str(row.get("outcome") or "")
         if outcome == "closed":
-            rec["exit_price"] = row.get("price")
+            rec["closes"].append({
+                "count": float(row.get("count") or 0.0),
+                "price": float(row.get("price") or 0.0),
+                "ts": row.get("ts"),
+            })
             rec["exit_ts"] = row.get("ts")
             continue
         if outcome in ("filled", "simulated", "rejected"):
@@ -83,6 +97,8 @@ def _execution_index(executions: list[dict]) -> dict[tuple[str, str], dict]:
                 rec["signal_price"] = row.get("signal_price")
                 rec["fill_ms"] = row.get("elapsed_ms")
                 rec["entry_ts"] = row.get("ts")
+                rec["pair_id"] = row.get("pair_id") or rec["pair_id"]
+                rec["proof_id"] = row.get("proof_id") or rec["proof_id"]
     return out
 
 
@@ -114,59 +130,141 @@ def score(
         if not market:
             pending += 1
             continue
-        result = str(market.get("result", "")).lower()  # "yes" | "no"
-        rec = executed.get((row["strategy"], row["ticker"]))
+        result = str(market.get("result", "")).lower()
+        strategy = row["strategy"]
+        ticker = row["ticker"]
+        legs = row["legs"]
+
+        leg_records = []
+        for leg in legs:
+            side = str(leg["side"]).upper()
+            rec = executed.get((strategy, ticker, side))
+            if rec is None:
+                rec = executed.get((strategy, ticker, ""))
+            leg_records.append(rec)
+
+        any_actual_fill = any(
+            rec and rec.get("outcome") in ("filled", "simulated")
+            for rec in leg_records
+        )
+        any_real_fill = any(
+            rec and rec.get("outcome") == "filled" for rec in leg_records
+        )
+        all_real_filled = bool(legs) and all(
+            rec and rec.get("outcome") == "filled" and rec.get("count", 0) > 0
+            for rec in leg_records
+        )
+        all_sim_filled = bool(legs) and all(
+            rec and rec.get("outcome") == "simulated" and rec.get("count", 0) > 0
+            for rec in leg_records
+        )
 
         gross = 0.0
         cost = 0.0
         fees = 0.0
-        exit_price = rec.get("exit_price") if rec else None
-        for leg in row["legs"]:
-            # Prefer what actually filled over what the signal proposed.
-            size = rec["count"] if rec and rec.get("count") else leg["size"]
-            price = rec["price"] if rec and rec.get("price") else leg["price"]
-            side = leg["side"]
+        contracts = 0.0
+        attempts = 0
+        slips: list[float] = []
+        fill_times: list[float] = []
+        entry_times: list[float] = []
+        exit_times: list[float] = []
+        exited_any = False
+
+        for leg, rec in zip(legs, leg_records):
+            side = str(leg["side"]).upper()
+            rec_filled = rec and rec.get("outcome") in ("filled", "simulated")
+            if any_actual_fill:
+                # Once any leg actually moved, never invent the missing leg.
+                size = float(rec.get("count") or 0.0) if rec_filled else 0.0
+                price = float(rec.get("price") or 0.0) if rec_filled else 0.0
+            else:
+                # No money moved at all: retain the historical hypothetical
+                # score so rejected/skipped signals can still be researched.
+                size = float(leg["size"])
+                price = float(leg["price"])
+
+            if rec:
+                attempts += int(rec.get("attempts") or 0)
+                if rec.get("fill_ms") is not None:
+                    fill_times.append(float(rec["fill_ms"]))
+                if rec.get("entry_ts") is not None:
+                    entry_times.append(float(rec["entry_ts"]))
+                if rec.get("exit_ts") is not None:
+                    exit_times.append(float(rec["exit_ts"]))
+                if rec.get("price") and rec.get("signal_price"):
+                    slips.append(
+                        (float(rec["price"]) - float(rec["signal_price"])) * 100.0
+                    )
+
+            if size <= 0.0:
+                continue
+            contracts += size
             cost += size * price
             fees += trading_fee(price, size)
-            if exit_price is not None:
-                # Sold before expiry: the exit price IS the outcome, and the
-                # sale pays its own fee.
-                gross += size * float(exit_price)
-                fees += trading_fee(float(exit_price), size)
-            else:
+
+            # An IOC exit can itself be partial. Account for each closed slice,
+            # then settle only the quantity that remained open. This is
+            # essential for CROSS repair: 6 first-leg fills, 5 hedge fills and
+            # a 1-contract emergency flatten must score as 5 paired + 1 closed,
+            # never as all 6 closed or all 6 held.
+            remaining = size
+            for close in (rec.get("closes", []) if rec else []):
+                close_count = min(float(close.get("count") or 0.0), remaining)
+                close_price = float(close.get("price") or 0.0)
+                if close_count <= 0.0 or not (0.0 < close_price < 1.0):
+                    continue
+                exited_any = True
+                gross += close_count * close_price
+                fees += trading_fee(close_price, close_count)
+                remaining -= close_count
+                if remaining <= 1e-9:
+                    break
+
+            if remaining > 1e-9:
                 won = (side == "YES" and result == "yes") or (
                     side == "NO" and result == "no"
                 )
-                gross += size * (1.0 if won else 0.0)
+                gross += remaining * (1.0 if won else 0.0)
+
         note = str(row.get("note") or "")
         asset = note[1:note.index("]")] if note.startswith("[") and "]" in note else ""
-        key = f"{asset}/{row['strategy']}" if asset else row["strategy"]
-        outcome = rec["outcome"] if rec else "unknown"
-        if outcome == "filled":
+        key = f"{asset}/{strategy}" if asset else strategy
+        if all_real_filled:
+            outcome = "filled"
+        elif any_real_fill:
+            outcome = "partial-filled"
+        elif all_sim_filled:
+            outcome = "simulated"
+        else:
+            outcomes = [rec.get("outcome") for rec in leg_records if rec]
+            outcome = outcomes[0] if outcomes else "unknown"
+
+        if any_real_fill:
             real_keys.add(key)
+
+        proof = row.get("proof") or {}
         by_strategy[key].append(
             {
-                "ticker": row["ticker"],
+                "ticker": ticker,
                 "net": gross - cost - fees,
                 "cost": cost,
                 "fees": fees,
                 "won": gross > cost,
-                "exited": exit_price is not None,
+                "exited": exited_any,
                 "result": result,
                 "fair_yes": row.get("fair_yes"),
                 "expected": row.get("expected_net", 0.0),
-                "legs": row["legs"],
+                "legs": legs,
                 "outcome": outcome,
-                "contracts": sum(
-                    (rec["count"] if rec and rec.get("count") else leg["size"])
-                    for leg in row["legs"]
-                ),
-                "attempts": (rec or {}).get("attempts", 0),
-                "signal_price": (rec or {}).get("signal_price"),
-                "fill_price": (rec or {}).get("price"),
-                "fill_ms": (rec or {}).get("fill_ms"),
-                "entry_ts": (rec or {}).get("entry_ts"),
-                "exit_ts": (rec or {}).get("exit_ts"),
+                "contracts": contracts,
+                "attempts": attempts,
+                "slips": slips,
+                "fill_ms_values": fill_times,
+                "entry_ts": min(entry_times) if entry_times else None,
+                "exit_ts": max(exit_times) if exit_times else None,
+                "proof_type": proof.get("proof_type", ""),
+                "proof_score": proof.get("score"),
+                "edge_lower_bound": proof.get("edge_lower_bound"),
             }
         )
 
@@ -196,7 +294,7 @@ def score(
         total_wins += wins
 
         outcomes = collections.Counter(t["outcome"] for t in trades)
-        real = outcomes.get("filled", 0)
+        real = outcomes.get("filled", 0) + outcomes.get("partial-filled", 0)
         tag = "REAL MONEY" if real else "PAPER ONLY - no money moved"
         print(f"\n {strategy}   [{tag}]")
         if real and real < len(trades):
@@ -213,6 +311,23 @@ def score(
         print(f"   ACTUAL net      ${net:+,.2f}   ({net / cost * 100:+.1f}% on stake)"
               if cost else f"   ACTUAL net      ${net:+,.2f}")
         print(f"   model predicted ${expected:+,.2f}")
+        proof_scores = [
+            float(t["proof_score"]) for t in trades
+            if t.get("proof_score") is not None
+        ]
+        safe_edges = [
+            float(t["edge_lower_bound"]) for t in trades
+            if t.get("edge_lower_bound") is not None
+        ]
+        if proof_scores:
+            print(
+                f"   proof score      median {_median(proof_scores):.1f} "
+                f"(n={len(proof_scores)})"
+            )
+        if safe_edges:
+            print(
+                f"   lower-bound edge median {_median(safe_edges):+.4f}/contract"
+            )
 
         # Execution quality, separate from whether the thesis was right. A
         # strategy can call direction correctly on every trade and still lose,
@@ -223,15 +338,13 @@ def score(
         if attempts:
             print(f"   fill rate       {got}/{attempts} attempts "
                   f"({got / attempts * 100:.0f}%), {contracts:g} contracts")
-        slips = [
-            (t["fill_price"] - t["signal_price"]) * 100.0
-            for t in trades
-            if t.get("fill_price") and t.get("signal_price")
-        ]
+        slips = [s for t in trades for s in t.get("slips", [])]
         if slips:
             print(f"   slippage        {sum(slips) / len(slips):+.2f}c/contract "
                   f"vs the quote that produced the signal (n={len(slips)})")
-        fill_ms = _median([t["fill_ms"] for t in trades if t.get("fill_ms")])
+        fill_ms = _median([
+            ms for t in trades for ms in t.get("fill_ms_values", [])
+        ])
         if fill_ms is not None:
             print(f"   time to fill    {fill_ms / 1000.0:.1f}s median")
         holds = _median([
@@ -254,7 +367,10 @@ def score(
             print(f"   -> {verdict}")
 
     if total_n:
-        real_trades = [t for ts in by_strategy.values() for t in ts if t["outcome"] == "filled"]
+        real_trades = [
+            t for ts in by_strategy.values() for t in ts
+            if t["outcome"] in ("filled", "partial-filled")
+        ]
         real_net = sum(t["net"] for t in real_trades)
         real_cost = sum(t["cost"] for t in real_trades)
         print("\n" + "=" * 72)

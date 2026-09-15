@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import NormalDist
@@ -57,6 +58,33 @@ class Leg:
 
 
 @dataclass(slots=True)
+class TradeProof:
+    """Machine-checkable reason a signal is allowed to risk money.
+
+    A model opinion is not an execution permission. The proof records the
+    conservative value, executable economics, every critical predicate, and
+    known ways the thesis can fail. The monitor revalidates this immediately
+    before an order is sent.
+    """
+
+    proof_type: str
+    score: float
+    guaranteed: bool
+    fair_estimate: float
+    fair_lower_bound: float
+    executable_price: float
+    edge_estimate: float
+    edge_lower_bound: float
+    failure_probability: float | None
+    created_mono: float
+    expires_mono: float
+    checks: dict[str, bool] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict)
+    failure_modes: list[str] = field(default_factory=list)
+    proof_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+
+@dataclass(slots=True)
 class Signal:
     strategy: str
     ticker: str
@@ -71,6 +99,9 @@ class Signal:
     strike: float
     seconds_left: float
     sigma_used: float
+    #: The proof which authorizes execution. Legacy/test signals may omit it;
+    #: live execution fails closed when proof enforcement is active.
+    proof: TradeProof | None = None
     #: Which book snapshot produced this signal. The confirmation gate counts
     #: DISTINCT books rather than evaluation passes, so an unchanged snapshot
     #: cannot confirm itself repeatedly.
@@ -163,38 +194,92 @@ def vol_agreement(measured: float, implied: float | None) -> float | None:
 def scan_cross(
     market: KalshiMarket, book: KalshiBook, size: float, min_profit: float = 0.01
 ) -> Signal | None:
-    """Buy YES and NO together when the pair costs less than the $1 they pay.
+    """Build a matched, depth-aware YES+NO arbitrage proof.
 
-    On Kalshi both ladders are bids, so the YES ask is `1 - best NO bid`. The
-    pair costs `2 - (yes_bid + no_bid)`, which drops below $1 exactly when the
-    two bids cross. Settlement always pays one side $1, so the profit is locked
-    the moment both fills happen - no view on BTC, no volatility estimate, no
-    reliance on our spot feed being right.
-
-    The fee is what makes this rare: at the money it costs ~1.75c per contract
-    per leg, so the bids must cross by more than ~3.5c to be worth taking.
+    The old scanner proved only that the top quotes crossed. Live execution can
+    consume several levels and, more importantly, two independently sized legs
+    are not an arbitrage. This scanner proposes only a quantity visible on BOTH
+    ladders and proves locked profit at that exact matched quantity. Execution
+    still revalidates the pair immediately before sending either leg.
     """
-    if book.yes_ask is None or book.no_ask is None:
+    if book.yes_ask is None or book.no_ask is None or size < 1:
         return None
-    cost_per_pair = book.yes_ask + book.no_ask
-    fees = trading_fee(book.yes_ask, size) + trading_fee(book.no_ask, size)
-    profit = size * (1.0 - cost_per_pair) - fees
-    if profit < min_profit:
+
+    yes_probe = book.cost_for("YES", size)
+    no_probe = book.cost_for("NO", size)
+    if yes_probe is None or no_probe is None:
         return None
+
+    matched = int(min(size, yes_probe[1], no_probe[1]))
+    if matched < 1:
+        return None
+
+    yes_quote = book.cost_for("YES", matched)
+    no_quote = book.cost_for("NO", matched)
+    if yes_quote is None or no_quote is None:
+        return None
+    yes_vwap, yes_avail = yes_quote
+    no_vwap, no_avail = no_quote
+    if yes_avail < matched or no_avail < matched:
+        return None
+
+    pair_cost = yes_vwap + no_vwap
+    fees = trading_fee(yes_vwap, matched) + trading_fee(no_vwap, matched)
+    locked_profit = matched * (1.0 - pair_cost) - fees
+    if locked_profit < min_profit:
+        return None
+
+    now = time.monotonic()
+    per_pair = locked_profit / matched
+    proof = TradeProof(
+        proof_type="ARBITRAGE",
+        score=100.0,
+        guaranteed=True,
+        fair_estimate=1.0,
+        fair_lower_bound=1.0,
+        executable_price=pair_cost,
+        edge_estimate=per_pair,
+        edge_lower_bound=per_pair,
+        failure_probability=0.0,
+        created_mono=now,
+        expires_mono=now + 0.75,
+        checks={
+            "matched_quantity": True,
+            "yes_depth": yes_avail >= matched,
+            "no_depth": no_avail >= matched,
+            "locked_after_fees": locked_profit > 0.0,
+        },
+        metrics={
+            "matched_size": float(matched),
+            "yes_vwap": yes_vwap,
+            "no_vwap": no_vwap,
+            "pair_cost": pair_cost,
+            "locked_profit": locked_profit,
+        },
+        failure_modes=[
+            "one leg fills without the other",
+            "depth disappears before the hedge completes",
+            "execution price consumes the locked spread",
+        ],
+    )
 
     return Signal(
         strategy="CROSS",
         ticker=market.ticker,
         book_version=book.version,
-        legs=[Leg("YES", book.yes_ask, size), Leg("NO", book.no_ask, size)],
+        legs=[Leg("YES", yes_vwap, matched), Leg("NO", no_vwap, matched)],
         fair_yes=book.yes_mid or 0.5,
-        expected_net=profit,
-        max_loss=0.0,  # one side always pays $1
+        expected_net=locked_profit,
+        max_loss=0.0,
         spot=0.0,
         strike=market.strike,
         seconds_left=market.seconds_remaining(),
         sigma_used=0.0,
-        note=f"pair costs {cost_per_pair:.4f}, pays 1.0000",
+        proof=proof,
+        note=(
+            f"matched {matched} pairs cost {pair_cost:.4f}/pair; "
+            f"locked USD {locked_profit:.4f} after fees"
+        ),
     )
 
 
@@ -217,6 +302,10 @@ def scan_stale(
     max_vol_ratio: float = 0.0,
     max_edge: float = 0.35,
     anchor_tau: float = 0.0,
+    anchor_sigma: float | None = None,
+    anchor_elapsed: float = 0.0,
+    min_move_z: float = 1.75,
+    uncertainty_floor: float = 0.01,
 ) -> Signal | None:
     """Trade the repricing a spot move implies, not the level.
 
@@ -257,7 +346,21 @@ def scan_stale(
     if abs(delta) < min_move_bps / 10_000.0:
         return None
 
-    sigma = implied_sigma(market, book, spot)
+    # Absolute bps alone means different things in quiet and violent regimes.
+    # Require the impulse to be statistically unusual for the measured tape as
+    # well. This is a regime-normalized displacement, not another predictor.
+    elapsed = max(anchor_elapsed, 0.05)
+    if fallback_sigma <= 0.0:
+        return None
+    move_z = abs(delta) / (fallback_sigma * math.sqrt(elapsed))
+    if move_z < min_move_z:
+        return None
+
+    # Prefer the volatility belief captured BEFORE the impulse. Re-inferring
+    # sigma from the allegedly stale current quote is circular.
+    sigma = anchor_sigma if anchor_sigma is not None and anchor_sigma > 0.0 else None
+    if sigma is None:
+        sigma = implied_sigma(market, book, spot)
     if sigma is None:
         if require_implied:
             return None
@@ -325,6 +428,68 @@ def scan_stale(
     if max_edge > 0.0 and edge > max_edge:
         return None
 
+    # A point estimate is not enough to risk money. Discount the model by an
+    # uncertainty allowance that grows with the modeled repricing. The LOWER
+    # BOUND, not the headline fair value, must still clear the edge threshold.
+    uncertainty = max(
+        uncertainty_floor,
+        min(0.05, abs(fair_side - anchor_mid) * 0.30),
+    )
+    fair_lower = max(0.001, fair_side - uncertainty)
+    safe_edge = fair_lower - ask - fee_at_size(ask, size)
+    if safe_edge < min_edge:
+        return None
+
+    move_bps = abs(delta) * 10_000.0
+    score = min(
+        99.0,
+        94.0
+        + min(3.0, move_bps / max(min_move_bps, 1e-9))
+        + min(2.0, safe_edge * 50.0),
+    )
+    now_mono = time.monotonic()
+    proof = TradeProof(
+        proof_type="LATENCY",
+        score=score,
+        guaranteed=False,
+        fair_estimate=fair_side,
+        fair_lower_bound=fair_lower,
+        executable_price=ask,
+        edge_estimate=edge,
+        edge_lower_bound=safe_edge,
+        failure_probability=None,
+        created_mono=now_mono,
+        expires_mono=now_mono + 1.0,
+        checks={
+            "strike_known": market.strike_known,
+            "abnormal_move": move_bps >= min_move_bps,
+            "move_z": move_z >= min_move_z,
+            "sigma_available": sigma > 0.0,
+            "lower_bound_edge": safe_edge >= min_edge,
+        },
+        metrics={
+            "move_bps": move_bps,
+            "anchor_mid": anchor_mid,
+            "anchor_spot": anchor_price,
+            "entry_spot": spot,
+            "direction": 1.0 if delta > 0 else -1.0,
+            "move_z": move_z,
+            "elapsed": elapsed,
+            "sigma": sigma,
+            "uncertainty": uncertainty,
+            "fair_side": fair_side,
+            "fair_lower": fair_lower,
+            "safe_edge": safe_edge,
+        },
+        failure_modes=[
+            "spot impulse retraces",
+            "Kalshi reprices before execution",
+            "reference venues disagree",
+            "book or spot data becomes stale",
+            "execution cost consumes the lower-bound edge",
+        ],
+    )
+
     return Signal(
         strategy="STALE",
         ticker=market.ticker,
@@ -337,9 +502,10 @@ def scan_stale(
         strike=market.strike,
         seconds_left=market.seconds_remaining(),
         sigma_used=sigma,
+        proof=proof,
         note=(
-            f"spot {delta * 1e4:+.1f} bps vs anchor, market mid was {anchor_mid:.3f}, "
-            f"implied sigma {sigma * 1e4:.2f} bps/s"
+            f"spot {delta * 1e4:+.1f} bps ({move_z:.2f}z) vs pre-impulse anchor, "
+            f"market mid was {anchor_mid:.3f}, implied sigma {sigma * 1e4:.2f} bps/s"
             + (f", tau {anchor_tau:.0f}->{tau:.0f}s" if anchor_tau > 0.0 else "")
         ),
     )
@@ -467,6 +633,132 @@ def scan_endgame(
             + (f", ours {sigma * 1e4:.2f}, market {implied * 1e4:.2f}"
                if implied is not None else "")
             + ")"
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# TWAP LOCK - realized-settlement proof, no terminal fallback
+# --------------------------------------------------------------------------- #
+
+
+def scan_twap_lock(
+    market: KalshiMarket,
+    book: KalshiBook,
+    spot: float,
+    size: float,
+    sigma: float,
+    realized: tuple[float, float] | None,
+    reference_error: float = 0.0,
+    min_z: float = 3.5,
+    min_edge: float = 0.005,
+    max_price: float = 0.99,
+) -> Signal | None:
+    """Trade only when the settlement window itself supplies the evidence.
+
+    Unlike ENDGAME this function NEVER falls back to a terminal spot/strike
+    model. If the realized settlement slice is unavailable or too sparse, there
+    is no proof and therefore no trade.
+    """
+    left = market.seconds_remaining()
+    if left <= 0 or spot <= 0 or not market.strike_known or realized is None:
+        return None
+
+    implied = implied_sigma(market, book, spot)
+    if implied is None:
+        return None
+    sigma_used = max(sigma, implied)
+
+    z = market.realized_z(
+        spot,
+        sigma_used,
+        realized,
+        reference_error=reference_error,
+    )
+    if z is None or abs(z) < min_z:
+        return None
+
+    fair_yes = _clamp(_N.cdf(z))
+    if z > 0:
+        side, ask, fair_side = "YES", book.yes_ask, fair_yes
+    else:
+        side, ask, fair_side = "NO", book.no_ask, 1.0 - fair_yes
+    if ask is None or not (0.0 < ask <= max_price):
+        return None
+
+    uncertainty = max(
+        0.005,
+        min(0.03, abs(reference_error) / max(spot, 1.0) * 25.0),
+    )
+    fair_lower = max(0.001, fair_side - uncertainty)
+    fee = fee_at_size(ask, size)
+    edge = fair_side - ask - fee
+    safe_edge = fair_lower - ask - fee
+    if safe_edge < min_edge:
+        return None
+
+    required = market.required_remaining_average(realized)
+    observed_mean, covered = realized
+    now_mono = time.monotonic()
+    score = min(99.9, 97.0 + max(0.0, abs(z) - min_z))
+    proof = TradeProof(
+        proof_type="TWAP_LOCK",
+        score=score,
+        guaranteed=False,
+        fair_estimate=fair_side,
+        fair_lower_bound=fair_lower,
+        executable_price=ask,
+        edge_estimate=edge,
+        edge_lower_bound=safe_edge,
+        failure_probability=max(0.0, 1.0 - fair_lower),
+        created_mono=now_mono,
+        expires_mono=now_mono + 2.0,
+        checks={
+            "realized_window_available": True,
+            "coverage_positive": covered > 0.0,
+            "settlement_distance": abs(z) >= min_z,
+            "lower_bound_edge": safe_edge >= min_edge,
+        },
+        metrics={
+            "z": abs(z),
+            "direction": 1.0 if z > 0 else -1.0,
+            "entry_spot": spot,
+            "observed_mean": observed_mean,
+            "covered_seconds": covered,
+            "required_remaining_average": required or 0.0,
+            "sigma_used": sigma_used,
+            "reference_error": reference_error,
+            "uncertainty": uncertainty,
+            "safe_edge": safe_edge,
+        },
+        failure_modes=[
+            "remaining settlement path reverses the realized advantage",
+            "reference error widens",
+            "volatility rises beyond the conservative assumption",
+            "execution cost consumes the lower-bound edge",
+        ],
+    )
+
+    return Signal(
+        strategy="TWAP_LOCK",
+        ticker=market.ticker,
+        book_version=book.version,
+        legs=[Leg(side, ask, size)],
+        fair_yes=fair_yes,
+        expected_net=edge * size,
+        max_loss=size * ask + trading_fee(ask, size),
+        spot=spot,
+        strike=market.strike,
+        seconds_left=left,
+        sigma_used=sigma_used,
+        proof=proof,
+        note=(
+            f"{abs(z):.2f} sigma settlement lock; realized mean "
+            f"{observed_mean:.2f} over {covered:.0f}s"
+            + (
+                f", remaining mean must cross {required:.2f}"
+                if required is not None else ""
+            )
         ),
     )
 
@@ -608,6 +900,10 @@ class PaperLedger:
         detail: str = "",
         signal_price: float | None = None,
         elapsed_ms: float | None = None,
+        side: str = "",
+        leg_id: str = "",
+        pair_id: str = "",
+        proof_id: str = "",
     ) -> None:
         """Record what actually happened to a signal when it reached the venue.
 
@@ -639,6 +935,10 @@ class PaperLedger:
             "detail": detail,
             "signal_price": signal_price,
             "elapsed_ms": elapsed_ms,
+            "side": side,
+            "leg_id": leg_id,
+            "pair_id": pair_id,
+            "proof_id": proof_id,
         }
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")

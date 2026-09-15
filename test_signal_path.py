@@ -1996,7 +1996,7 @@ async def test_setup_and_confirmation() -> None:
     from pathlib import Path
 
     from kalshi_setup import PEM_FILE, save_credentials
-    from strategies import Leg, PaperLedger, Signal
+    from strategies import Leg, PaperLedger, Signal, TradeProof
 
     # -- .env persistence ---------------------------------------------------- #
     with tempfile.TemporaryDirectory() as tmp:
@@ -2038,8 +2038,9 @@ async def test_setup_and_confirmation() -> None:
             min_seconds_left=20.0, book_interval=1.0, discovery_interval=10.0,
             cooldown=5.0, heartbeat=15.0, binance=False, live=False,
             max_stake_pct=8.0, max_exposure_pct=25.0, daily_loss_pct=20.0,
-            max_trades=40, min_profit=0.01, anchor_age=20.0, stale_min_move=8.0, aggressive=False,
-            assets=None, eval_interval=0.2, take_profit=1.5,
+            max_trades=40, min_profit=0.01, anchor_age=3.0,
+            stale_min_move=8.0, stale_min_z=1.75, stale_max_spot_age=0.5,
+            aggressive=False, assets=None, eval_interval=0.2, take_profit=1.5,
             stop_loss=0.0, min_exit_seconds=45.0, no_fair_exit=False,
             max_edge=0.35, max_slippage=0.03, min_fill_edge=0.005,
             endgame_window=120.0, endgame_z=3.0, vol_ratio_max=1.5,
@@ -2051,18 +2052,35 @@ async def test_setup_and_confirmation() -> None:
         mon.ledger = PaperLedger(Path(tmp) / "paper_test.jsonl")
         return mon
 
+    def _proof(kind: str = "LATENCY", guaranteed: bool = False) -> TradeProof:
+        now = _time.monotonic()
+        return TradeProof(
+            proof_type=kind,
+            score=100.0 if guaranteed else 99.0,
+            guaranteed=guaranteed,
+            fair_estimate=0.60,
+            fair_lower_bound=0.56,
+            executable_price=0.40,
+            edge_estimate=0.10,
+            edge_lower_bound=0.05,
+            failure_probability=0.01,
+            created_mono=now,
+            expires_mono=now + 60.0,
+            checks={"test_fixture": True},
+            metrics={"matched_size": 20.0} if guaranteed else {},
+        )
+
     def sig(side: str = "YES") -> Signal:
         return Signal(
             strategy="STALE", ticker="KXBTC15M-TEST-15",
             legs=[Leg(side, 0.40, 20.0)], fair_yes=0.48, expected_net=0.60,
             max_loss=8.0, spot=63_400.0, strike=63_380.0, seconds_left=500.0,
-            sigma_used=1.2e-4,
+            sigma_used=1.2e-4, proof=_proof(),
         )
 
-    # -- a confirmation must be NEW market data, not another loop pass ------ #
-    # The evaluator runs every 0.1s while the book refreshes every 0.4s, so
-    # counting passes counted the same snapshot ~4 times. A live log read
-    # "confirmed over 1.0s / 11 passes" on roughly two distinct books.
+    # -- confirmation is strategy-specific ---------------------------------- #
+    # STALE is a latency thesis: an unchanged Kalshi book while the external
+    # impulse persists is supporting evidence, not a failed confirmation.
     def versioned(v):
         s = sig()
         s.book_version = v
@@ -2071,14 +2089,11 @@ async def test_setup_and_confirmation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.05, 3, tmp)
         for _ in range(30):
-            mon._emit(versioned(1021))       # the SAME book, thirty times
+            mon._emit(versioned(1021))
             _time.sleep(0.003)
-        check("an unchanged book cannot confirm itself, however many passes",
-              not mon._pending_orders, "book 1021 x30")
-        mon._emit(versioned(1024))
-        mon._emit(versioned(1027))
-        check("three DISTINCT books do confirm it",
-              len(mon._pending_orders) == 1, "1021 -> 1024 -> 1027")
+        check("STALE can confirm while the book remains unchanged",
+              len(mon._pending_orders) == 1,
+              "persistence of the external proof is what matters")
 
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.05, 3, tmp)
@@ -2117,8 +2132,30 @@ async def test_setup_and_confirmation() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.0, 1, tmp)
         mon._emit(sig())
-        check("confirm-seconds 0 restores immediate recording",
+        check("STALE still requires a second proof sighting with zero time delay",
+              not mon._pending_orders)
+        mon._emit(sig())
+        check("the second persistent STALE proof can queue immediately",
               len(mon._pending_orders) == 1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        no_proof = Signal(
+            strategy="STALE", ticker="NO-PROOF", legs=[Leg("YES", 0.40, 1.0)],
+            fair_yes=0.60, expected_net=0.10, max_loss=0.40, spot=1.0,
+            strike=1.0, seconds_left=100.0, sigma_used=1e-4,
+        )
+        mon._emit(no_proof)
+        check("a strategy opinion without TradeProof fails closed",
+              not mon._pending_orders)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mon = fresh_monitor(0.0, 1, tmp)
+        wrong = sig()
+        wrong.proof = _proof("TWAP_LOCK")
+        mon._emit(wrong)
+        check("a strategy cannot borrow another strategy's proof type",
+              not mon._pending_orders)
 
     # -- two strategies must not take opposite sides of one market ---------- #
     # L_081726_031221 bought ENDGAME NO @ 0.975 and, 32s later, STALE YES @
@@ -2126,23 +2163,41 @@ async def test_setup_and_confirmation() -> None:
     # guaranteed loss of both fees plus the gap - and it meant two of our own
     # strategies flatly disagreed while we funded both opinions.
     def named(strategy: str, side: str, price: float) -> Signal:
+        kind = "TWAP_LOCK" if strategy == "TWAP_LOCK" else "LATENCY"
         return Signal(
             strategy=strategy, ticker="KXBTC15M-SAME", legs=[Leg(side, price, 20.0)],
             fair_yes=0.5, expected_net=0.4, max_loss=8.0, spot=63_300.0,
             strike=63_337.0, seconds_left=100.0, sigma_used=2.5e-5,
+            proof=_proof(kind),
         )
 
     with tempfile.TemporaryDirectory() as tmp:
         mon = fresh_monitor(0.0, 1, tmp)
-        mon._emit(named("ENDGAME", "NO", 0.975))
+        # STALE needs two persistent proof sightings even with zero time delay.
+        mon._emit(named("STALE", "NO", 0.975))
+        mon._emit(named("STALE", "NO", 0.975))
         check("the first side is taken", len(mon._pending_orders) == 1)
-        mon._emit(named("STALE", "YES", 0.820))
+
+        # TWAP_LOCK requires sustained evidence for one second / three reads.
+        mon._emit(named("TWAP_LOCK", "YES", 0.820))
+        _time.sleep(1.01)
+        mon._emit(named("TWAP_LOCK", "YES", 0.820))
+        mon._emit(named("TWAP_LOCK", "YES", 0.820))
         check("a second strategy cannot buy the opposing side of the same market",
               len(mon._pending_orders) == 1,
               "settlement pays one of them; holding both is a guaranteed loss")
-        mon._emit(named("STALE", "NO", 0.970))
+
+        # Same-side disagreement is not a hedge conflict. Use a fresh monitor
+        # because the prior TWAP_LOCK key was already conflict-tested.
+        mon2 = fresh_monitor(0.0, 1, tmp)
+        mon2._emit(named("STALE", "NO", 0.975))
+        mon2._emit(named("STALE", "NO", 0.975))
+        mon2._emit(named("TWAP_LOCK", "NO", 0.970))
+        _time.sleep(1.01)
+        mon2._emit(named("TWAP_LOCK", "NO", 0.970))
+        mon2._emit(named("TWAP_LOCK", "NO", 0.970))
         check("the SAME side from another strategy is still allowed",
-              len(mon._pending_orders) == 2)
+              len(mon2._pending_orders) == 2)
 
         rows = [json.loads(l) for l in
                 (mon.ledger.path).read_text().splitlines() if l.strip()]
@@ -2161,6 +2216,7 @@ async def test_setup_and_confirmation() -> None:
             legs=[Leg("YES", 0.48, 20.0), Leg("NO", 0.49, 20.0)],
             fair_yes=0.5, expected_net=0.4, max_loss=0.0, spot=0.0,
             strike=63_337.0, seconds_left=100.0, sigma_used=0.0,
+            proof=_proof("ARBITRAGE", guaranteed=True),
         )
         mon._emit(both)
         check("CROSS may still hold both sides at once", len(mon._pending_orders) == 1)
@@ -2455,8 +2511,8 @@ async def test_autopilot() -> None:
     failed_rows[1].update(count=1, price=0.65)
     idx = _execution_index(failed_rows)
     check("an exit that did not fill is not an exit price",
-          idx[("STALE", "M7")]["exit_price"] is None
-          and idx[("STALE", "M7")]["outcome"] == "filled",
+          not idx[("STALE", "M7", "")]["closes"]
+          and idx[("STALE", "M7", "")]["outcome"] == "filled",
           "the position rode to settlement and must be graded there")
     buf = _io.StringIO()
     with redirect_stdout(buf):
@@ -2468,15 +2524,16 @@ async def test_autopilot() -> None:
 
     idx = _execution_index(exit_rows)
     check("the exit price is carried alongside the entry",
-          abs(idx[("STALE", "M2")]["exit_price"] - 0.919) < 1e-9
-          and idx[("STALE", "M2")]["count"] == 2)
+          abs(idx[("STALE", "M2", "")]["closes"][0]["price"] - 0.919) < 1e-9
+          and idx[("STALE", "M2", "")]["count"] == 2)
 
     # "filled" must win over an earlier "skipped" on the same market.
     idx = _execution_index([_exe("STALE", "M1", "skipped"), _exe("STALE", "M1", "filled")])
     check("a later fill outranks an earlier skip",
-          idx[("STALE", "M1")]["outcome"] == "filled")
+          idx[("STALE", "M1", "")]["outcome"] == "filled")
     idx = _execution_index([_exe("STALE", "M1", "filled"), _exe("STALE", "M1", "skipped")])
-    check("and order does not matter", idx[("STALE", "M1")]["outcome"] == "filled")
+    check("and order does not matter",
+          idx[("STALE", "M1", "")]["outcome"] == "filled")
 
     # The ledger must actually write these rows.
     with tempfile.TemporaryDirectory() as tmp:
@@ -2643,7 +2700,7 @@ async def test_autopilot() -> None:
     miss_rows[2].update(count=10, price=0.40, signal_price=0.40, ts=1000.0)
     idx = _execution_index(miss_rows)
     check("attempts count every order sent, not just the one that filled",
-          idx[("STALE", "M8")]["attempts"] == 3,
+          idx[("STALE", "M8", "")]["attempts"] == 3,
           "a strategy that fills one order in three is not a 100% fill rate")
 
     # -- the probe's three outcomes ------------------------------------------- #
@@ -2902,7 +2959,11 @@ async def test_take_profit() -> None:
     t._orders.append(pos)
     t.open_stake = pos.stake
     res = await t.close_position(pos, 0.72, "take-profit")
-    expected = 20 * (0.72 - 0.32) - trading_fee(0.72, 20)
+    expected = (
+        20 * (0.72 - 0.32)
+        - trading_fee(0.32, 20)
+        - trading_fee(0.72, 20)
+    )
     check("the exit books the realized gain", res.ok
           and abs(t.realized - expected) < 1e-6, f"${t.realized:+.2f}")
     check("the position is flat afterwards", pos.closed
@@ -2982,6 +3043,25 @@ async def test_take_profit() -> None:
           "so it can shrink a position but never create or flip one")
     check("closes are immediate-or-cancel too",
           t.sent["time_in_force"] == "immediate_or_cancel")
+
+    partial = ExitTrader(fill_count="1")
+    partial_pos = held("YES", 0.30, count=3)
+    partial._orders.append(partial_pos)
+    partial.open_stake = (
+        partial_pos.stake + trading_fee(partial_pos.price, partial_pos.count)
+    )
+    partial_result = await partial.close_position(
+        partial_pos, 0.70, "proof-invalidated"
+    )
+    check("a partial IOC exit leaves the unfilled contracts tracked",
+          partial_result.ok and partial_result.count == 1
+          and not partial_pos.closed and partial_pos.count == 2
+          and partial_pos in partial.open_positions("T"),
+          str(partial_pos.count) + " remain")
+    check("partial-exit realized PnL includes both entry and exit fees",
+          partial.realized
+          < 1 * (0.70 - 0.30) - trading_fee(0.70, 1),
+          f"$" + f"{partial.realized:+.4f}")
 
     gone = ExitTrader(fill_count="0")   # nothing left to reduce
     pos2 = held("NO", 0.40, count=3)
